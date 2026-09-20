@@ -14,6 +14,8 @@ final class VoiceGateway {
     private let token: String
     private let session: URLSession
     private let daveVersion: Int
+    private let channelId: String
+    private var dave: DaveSession?
 
     private var task: URLSessionWebSocketTask?
     private var seq: Int = -1
@@ -23,8 +25,9 @@ final class VoiceGateway {
     var onLog: ((String) -> Void)?
     var onState: ((String) -> Void)?
 
-    init(endpoint: String, serverId: String, userId: String, sessionId: String, token: String,
+    init(endpoint: String, serverId: String, channelId: String, userId: String, sessionId: String, token: String,
          session: URLSession, daveVersion: Int) {
+        self.channelId = channelId
         self.endpoint = endpoint
         self.serverId = serverId
         self.userId = userId
@@ -43,6 +46,17 @@ final class VoiceGateway {
             log("Некорректный endpoint: \(endpoint)")
             return
         }
+        if daveVersion > 0 {
+            if let d = DaveSession(selfUserId: userId, channelId: channelId) {
+                d.log = { [weak self] s in self?.log(s) }
+                d.sendBinary = { [weak self] data in self?.task?.send(.data(data)) { _ in } }
+                d.sendJSON = { [weak self] obj in self?.send(obj) }
+                d.onEncryptionReady = { [weak self] _ in self?.onState?("Подключено, E2EE установлено") }
+                dave = d
+            } else {
+                log("DAVE недоступна: библиотека не подключена к этой сборке")
+            }
+        }
         log("Voice WS: подключаюсь к \(ep)")
         let t = session.webSocketTask(with: url)
         t.maximumMessageSize = 16 * 1024 * 1024
@@ -52,6 +66,7 @@ final class VoiceGateway {
     }
 
     func stop() {
+        dave = nil
         heartbeatTask?.cancel()
         heartbeatTask = nil
         udp?.cancel()
@@ -74,9 +89,7 @@ final class VoiceGateway {
                 case .string(let s):
                     self.handle(s)
                 case .data(let d):
-                    let op = d.count > 2 ? Int(d[2]) : -1
-                    let head = d.prefix(12).map { String(format: "%02x", $0) }.joined()
-                    self.log("Бинарное сообщение: \(d.count) байт, op \(op), начало \(head)")
+                    self.handleBinary(d)
                 @unknown default:
                     break
                 }
@@ -130,10 +143,33 @@ final class VoiceGateway {
             log("op 5 Speaking: \(d["user_id"] as? String ?? "?")")
         case 9:
             log("op 9 Resumed")
-        case 11, 13, 18, 20:
+        case 11:
+            let ids = d["user_ids"] as? [String] ?? []
+            log("op 11: в канал вошли \(ids.joined(separator: ", "))")
+            dave?.userConnected(ids)
+        case 13:
+            if let id = d["user_id"] as? String {
+                log("op 13: вышел \(id)")
+                dave?.userDisconnected(id)
+            }
+        case 18, 20:
             log("op \(op): \(d)")
-        case 21, 22, 24, 31:
-            log("DAVE op \(op): \(d)")
+        case 21:
+            let tid = d["transition_id"] as? Int ?? -1
+            let ver = d["protocol_version"] as? Int ?? 0
+            log("DAVE op 21 (prepare transition): id \(tid), версия \(ver)")
+            dave?.onPrepareTransition(id: tid, version: ver)
+        case 22:
+            let tid = d["transition_id"] as? Int ?? -1
+            log("DAVE op 22 (execute transition): id \(tid)")
+            dave?.onExecuteTransition(id: tid)
+        case 24:
+            let ver = d["protocol_version"] as? Int ?? 0
+            let epoch = (d["epoch"] as? Int) ?? Int((d["epoch"] as? String) ?? "") ?? -1
+            log("DAVE op 24 (prepare epoch): эпоха \(epoch), версия \(ver)")
+            dave?.onPrepareEpoch(epoch: epoch, version: ver)
+        case 31:
+            log("DAVE op 31: \(d)")
         default:
             log("op \(op): \(d)")
         }
@@ -245,11 +281,50 @@ final class VoiceGateway {
     private func handleSessionDescription(_ d: [String: Any]) {
         let mode = d["mode"] as? String ?? "?"
         let keyLen = (d["secret_key"] as? [Any])?.count ?? 0
-        let dave = d["dave_protocol_version"] as? Int
-        let daveText = dave.map { String($0) } ?? "нет"
+        let daveVer = d["dave_protocol_version"] as? Int
+        let daveText = daveVer.map { String($0) } ?? "нет"
         log("op 4 Session Description: режим \(mode), ключ \(keyLen) байт, DAVE: \(daveText)")
-        log("ГОТОВО: Discord принял подключение.")
-        onState?("Подключено (без звука)")
+        log("Discord принял подключение.")
+        onState?("Подключено, обмен ключами DAVE…")
+        if daveVersion > 0 {
+            dave?.onSessionDescription(version: daveVer ?? 0)
+        }
+    }
+
+    /// Бинарные сообщения сервера: [seq (2 байта)] [opcode (1 байт)] [данные].
+    private func handleBinary(_ d: Data) {
+        guard d.count >= 3 else {
+            log("Короткое бинарное сообщение: \(d.count) байт")
+            return
+        }
+        seq = Int(d[d.startIndex]) << 8 | Int(d[d.startIndex + 1])
+        let op = Int(d[d.startIndex + 2])
+        let payload = Data(d.dropFirst(3))
+
+        switch op {
+        case 25:
+            log("DAVE op 25 (внешний отправитель): \(payload.count) байт")
+            dave?.onExternalSender(payload)
+        case 27:
+            log("DAVE op 27 (proposals): \(payload.count) байт")
+            dave?.onProposals(payload)
+        case 29, 30:
+            guard payload.count >= 2 else {
+                log("DAVE op \(op): слишком короткое сообщение")
+                return
+            }
+            let tid = Int(payload[payload.startIndex]) << 8 | Int(payload[payload.startIndex + 1])
+            let rest = Data(payload.dropFirst(2))
+            if op == 29 {
+                log("DAVE op 29 (commit): transition \(tid), \(rest.count) байт")
+                dave?.onAnnounceCommit(id: tid, commit: rest)
+            } else {
+                log("DAVE op 30 (welcome): transition \(tid), \(rest.count) байт")
+                dave?.onWelcome(id: tid, welcome: rest)
+            }
+        default:
+            log("Бинарное сообщение op \(op), \(payload.count) байт")
+        }
     }
 
     private func send(_ obj: [String: Any]) {
@@ -430,6 +505,7 @@ final class VoiceSpike: ObservableObject {
         let vg = VoiceGateway(
             endpoint: server.endpoint,
             serverId: guildId ?? channelId,
+            channelId: channelId,
             userId: userId,
             sessionId: sid,
             token: server.token,
