@@ -7,6 +7,13 @@ struct ProxySettings: Codable, Equatable {
     var socks = true
 }
 
+struct UploadFile: Identifiable {
+    let id = UUID()
+    let name: String
+    let mime: String
+    let data: Data
+}
+
 enum APIError: LocalizedError {
     case badResponse
     case http(Int, String)
@@ -16,6 +23,12 @@ enum APIError: LocalizedError {
         case .badResponse: return "Некорректный ответ сервера"
         case .http(let code, let body): return "Ошибка \(code): \(body.prefix(200))"
         }
+    }
+}
+
+extension Data {
+    mutating func appendString(_ s: String) {
+        append(Data(s.utf8))
     }
 }
 
@@ -29,7 +42,7 @@ final class API {
     init(token: String, proxy: ProxySettings) {
         self.token = token
         let cfg = URLSessionConfiguration.default
-        cfg.timeoutIntervalForRequest = 30
+        cfg.timeoutIntervalForRequest = 60
         if proxy.enabled {
             if proxy.socks {
                 cfg.connectionProxyDictionary = [
@@ -47,22 +60,31 @@ final class API {
         session = URLSession(configuration: cfg)
     }
 
-    func send<T: Decodable>(_ method: String, _ path: String, body: [String: Any]? = nil) async throws -> T {
+    private func baseRequest(_ method: String, _ path: String) throws -> URLRequest {
         guard let url = URL(string: "https://discord.com/api/v9" + path) else { throw APIError.badResponse }
         var req = URLRequest(url: url)
         req.httpMethod = method
         req.setValue(token, forHTTPHeaderField: "Authorization")
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.setValue(API.userAgent, forHTTPHeaderField: "User-Agent")
-        if let body {
-            req.httpBody = try JSONSerialization.data(withJSONObject: body)
-        }
-        let (data, resp) = try await session.data(for: req)
+        return req
+    }
+
+    private func decodeResponse<T: Decodable>(_ data: Data, _ resp: URLResponse) throws -> T {
         guard let http = resp as? HTTPURLResponse else { throw APIError.badResponse }
         guard (200..<300).contains(http.statusCode) else {
             throw APIError.http(http.statusCode, String(data: data, encoding: .utf8) ?? "")
         }
         return try JSONDecoder().decode(T.self, from: data)
+    }
+
+    func send<T: Decodable>(_ method: String, _ path: String, body: [String: Any]? = nil) async throws -> T {
+        var req = try baseRequest(method, path)
+        if let body {
+            req.httpBody = try JSONSerialization.data(withJSONObject: body)
+        }
+        let (data, resp) = try await session.data(for: req)
+        return try decodeResponse(data, resp)
     }
 
     func get<T: Decodable>(_ path: String) async throws -> T {
@@ -71,5 +93,50 @@ final class API {
 
     func post<T: Decodable>(_ path: String, body: [String: Any]) async throws -> T {
         try await send("POST", path, body: body)
+    }
+
+    private func nonce() -> String {
+        String(Int(Date().timeIntervalSince1970 * 1000))
+    }
+
+    /// Отправка сообщения, при необходимости с файлами (multipart).
+    func sendMessage(channelId: String, content: String, files: [UploadFile]) async throws -> Message {
+        let path = "/channels/\(channelId)/messages"
+        if files.isEmpty {
+            return try await post(path, body: ["content": content, "tts": false, "nonce": nonce()])
+        }
+
+        let boundary = "Boundary-\(UUID().uuidString)"
+        var attachmentsJSON: [[String: Any]] = []
+        for (i, f) in files.enumerated() {
+            attachmentsJSON.append(["id": i, "filename": f.name])
+        }
+        let payload: [String: Any] = [
+            "content": content,
+            "nonce": nonce(),
+            "attachments": attachmentsJSON
+        ]
+        let json = try JSONSerialization.data(withJSONObject: payload)
+
+        var body = Data()
+        body.appendString("--\(boundary)\r\n")
+        body.appendString("Content-Disposition: form-data; name=\"payload_json\"\r\n")
+        body.appendString("Content-Type: application/json\r\n\r\n")
+        body.append(json)
+        body.appendString("\r\n")
+        for (i, f) in files.enumerated() {
+            let safeName = f.name.replacingOccurrences(of: "\"", with: "_")
+            body.appendString("--\(boundary)\r\n")
+            body.appendString("Content-Disposition: form-data; name=\"files[\(i)]\"; filename=\"\(safeName)\"\r\n")
+            body.appendString("Content-Type: \(f.mime)\r\n\r\n")
+            body.append(f.data)
+            body.appendString("\r\n")
+        }
+        body.appendString("--\(boundary)--\r\n")
+
+        var req = try baseRequest("POST", path)
+        req.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
+        let (data, resp) = try await session.upload(for: req, from: body)
+        return try decodeResponse(data, resp)
     }
 }

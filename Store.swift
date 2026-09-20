@@ -6,6 +6,7 @@ final class Store: ObservableObject {
     @Published var me: User?
     @Published var guilds: [Guild] = []
     @Published var dms: [Channel] = []
+    @Published var guildChannels: [String: [Channel]] = [:]
     @Published var messages: [String: [Message]] = [:]
     @Published var error: String?
     @Published var isLoading = false
@@ -48,6 +49,7 @@ final class Store: ObservableObject {
             self.me = me
             self.guilds = g
             self.dms = d.sorted { (UInt64($0.last_message_id ?? "0") ?? 0) > (UInt64($1.last_message_id ?? "0") ?? 0) }
+            ImageLoader.shared.session = api.session
             Keychain.save(clean)
             startGateway(token: clean, session: api.session)
         } catch {
@@ -62,6 +64,7 @@ final class Store: ObservableObject {
         me = nil
         guilds = []
         dms = []
+        guildChannels = [:]
         messages = [:]
         Keychain.delete()
     }
@@ -79,41 +82,77 @@ final class Store: ObservableObject {
         gateway = gw
     }
 
-    func loadChannels(guildId: String) async -> [Channel] {
-        guard let api else { return [] }
+    /// Каналы сервера с учётом прав: скрываем то, что тебе недоступно.
+    func loadGuildChannels(_ guild: Guild) async {
+        guard let api, let me else { return }
+        if guildChannels[guild.id] != nil { return }
         do {
-            let all: [Channel] = try await api.get("/guilds/\(guildId)/channels")
-            return all
-                .filter { $0.type == 0 || $0.type == 5 }
-                .sorted { ($0.position ?? 0) < ($1.position ?? 0) }
+            let all: [Channel] = try await api.get("/guilds/\(guild.id)/channels")
+            var result = all
+            if let member: GuildMember = try? await api.get("/users/@me/guilds/\(guild.id)/member") {
+                result = Store.visible(all, guild: guild, roles: Set(member.roles), meId: me.id)
+            }
+            guildChannels[guild.id] = result
         } catch {
             self.error = error.localizedDescription
-            return []
         }
     }
 
-    func loadMessages(_ channelId: String) async {
+    private static func visible(_ all: [Channel], guild: Guild, roles: Set<String>, meId: String) -> [Channel] {
+        guard let permStr = guild.permissions, let base = UInt64(permStr) else { return all }
+        let admin: UInt64 = 1 << 3
+        let view: UInt64 = 1 << 10
+        if guild.owner == true || (base & admin) != 0 { return all }
+
+        func canView(_ ch: Channel) -> Bool {
+            var perms = base
+            let ows = ch.permission_overwrites ?? []
+            if let e = ows.first(where: { !$0.isMember && $0.id == guild.id }) {
+                perms &= ~e.deny
+                perms |= e.allow
+            }
+            var allow: UInt64 = 0
+            var deny: UInt64 = 0
+            for o in ows where !o.isMember && roles.contains(o.id) {
+                allow |= o.allow
+                deny |= o.deny
+            }
+            perms &= ~deny
+            perms |= allow
+            if let m = ows.first(where: { $0.isMember && $0.id == meId }) {
+                perms &= ~m.deny
+                perms |= m.allow
+            }
+            return (perms & view) != 0
+        }
+
+        let visibleChannels = all.filter { !$0.isCategory && canView($0) }
+        let visibleIDs = Set(visibleChannels.map { $0.id })
+        let parents = Set(visibleChannels.compactMap { $0.parent_id })
+        return all.filter { ch in
+            ch.isCategory ? parents.contains(ch.id) : visibleIDs.contains(ch.id)
+        }
+    }
+
+    func loadMessages(_ channelId: String, silent: Bool = false) async {
         guard let api else { return }
         do {
             let list: [Message] = try await api.get("/channels/\(channelId)/messages?limit=50")
             merge(list, into: channelId)
         } catch {
-            self.error = error.localizedDescription
+            if !silent { self.error = error.localizedDescription }
         }
     }
 
-    func send(_ text: String, to channelId: String) async {
-        guard let api else { return }
-        let body: [String: Any] = [
-            "content": text,
-            "tts": false,
-            "nonce": String(Int(Date().timeIntervalSince1970 * 1000))
-        ]
+    func send(_ text: String, files: [UploadFile], to channelId: String) async -> Bool {
+        guard let api else { return false }
         do {
-            let m: Message = try await api.post("/channels/\(channelId)/messages", body: body)
+            let m = try await api.sendMessage(channelId: channelId, content: text, files: files)
             merge([m], into: channelId)
+            return true
         } catch {
             self.error = error.localizedDescription
+            return false
         }
     }
 
