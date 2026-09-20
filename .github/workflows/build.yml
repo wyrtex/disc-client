@@ -59,7 +59,19 @@ jobs:
         run: xcodegen generate
 
       - name: Build
-        run: xcodebuild -project DiscClient.xcodeproj -scheme DiscClient -configuration Release -sdk iphoneos -derivedDataPath build CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" build
+        run: |
+          set -o pipefail
+          xcodebuild -project DiscClient.xcodeproj -scheme DiscClient -configuration Release -sdk iphoneos -derivedDataPath build CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" build 2>&1 | tee build.log
+
+      - name: Build errors summary
+        if: failure()
+        run: |
+          {
+            echo "### Ошибки сборки приложения"
+            echo '```'
+            grep -E "error:" build.log | sort -u | head -40
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Package IPA
         run: |
