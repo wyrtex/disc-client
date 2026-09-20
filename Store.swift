@@ -105,7 +105,13 @@ final class Store: ObservableObject {
         gw.onEvent = { [weak self] t, d in
             Task { @MainActor in self?.voice.handle(t, d) }
         }
-        voice.sendGateway = { [weak gw] obj in gw?.sendRaw(obj) }
+        gw.onDispatchName = { [weak self] t in
+            Task { @MainActor in self?.voice.noteEvent(t) }
+        }
+        gw.onLog = { [weak self] s in
+            Task { @MainActor in self?.voice.addGateway(s) }
+        }
+        voice.sendGateway = { [weak gw] obj in gw?.sendRaw(obj) ?? false }
         gw.start()
         gateway = gw
     }

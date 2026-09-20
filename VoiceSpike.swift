@@ -260,8 +260,9 @@ final class VoiceSpike: ObservableObject {
     @Published var log: [String] = []
     @Published var status = "Не подключено"
     @Published var activeChannelId: String?
+    @Published var gwLog: [String] = []
 
-    var sendGateway: (([String: Any]) -> Void)?
+    var sendGateway: (([String: Any]) -> Bool)?
     var userId = ""
     var session: URLSession = .shared
 
@@ -278,6 +279,25 @@ final class VoiceSpike: ObservableObject {
 
     func add(_ s: String) {
         log.append(VoiceSpike.timeFormatter.string(from: Date()) + "  " + s)
+    }
+
+    /// Состояние основного шлюза (последние строки показываются на экране диагностики).
+    func addGateway(_ s: String) {
+        gwLog.append(VoiceSpike.timeFormatter.string(from: Date()) + "  " + s)
+        if gwLog.count > 30 { gwLog.removeFirst(gwLog.count - 30) }
+        if activeChannelId != nil { add(s) }
+    }
+
+    private static let noisyEvents: Set<String> = [
+        "MESSAGE_CREATE", "MESSAGE_UPDATE", "MESSAGE_DELETE", "MESSAGE_ACK", "TYPING_START",
+        "PRESENCE_UPDATE", "CHANNEL_UNREAD_UPDATE", "MESSAGE_REACTION_ADD", "MESSAGE_REACTION_REMOVE",
+        "GUILD_MEMBER_UPDATE", "GUILD_MEMBER_LIST_UPDATE", "SESSIONS_REPLACE"
+    ]
+
+    /// Пока идёт подключение к каналу, пишем в лог названия приходящих событий.
+    func noteEvent(_ t: String) {
+        guard activeChannelId != nil, !t.isEmpty, !VoiceSpike.noisyEvents.contains(t) else { return }
+        add("Событие Gateway: \(t)")
     }
 
     private func voiceStatePacket(channelId: String?) -> [String: Any] {
@@ -300,14 +320,22 @@ final class VoiceSpike: ObservableObject {
         activeChannelId = channelId
         status = "Подключаюсь…"
         add("Запрашиваю вход в канал (op 4)")
-        sendGateway?(voiceStatePacket(channelId: channelId))
+        let sent = sendGateway?(voiceStatePacket(channelId: channelId)) ?? false
+        add(sent ? "op 4 отправлен" : "op 4 НЕ отправлен: основной шлюз не подключён")
+
+        Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 8_000_000_000)
+            guard let self, self.activeChannelId == channelId, self.server == nil else { return }
+            self.add("За 8 секунд не пришло VOICE_SERVER_UPDATE. Discord не выдал голосовой сервер.")
+        }
     }
 
     func leave(silent: Bool = false) {
         gateway?.stop()
         gateway = nil
         if activeChannelId != nil {
-            sendGateway?(voiceStatePacket(channelId: nil))
+            let sent = sendGateway?(voiceStatePacket(channelId: nil)) ?? false
+            if !silent { add(sent ? "op 4 (выход) отправлен" : "op 4 (выход) НЕ отправлен: шлюз не подключён") }
         }
         activeChannelId = nil
         status = "Не подключено"
@@ -385,10 +413,17 @@ struct VoiceDebugView: View {
                     .foregroundStyle(Theme.muted)
             }
 
-            Text("Диагностика подключения к голосу. Звука пока нет. Ты появишься в списке участников канала, лучше проверять на своём сервере.")
+            Text("Диагностика подключения к голосу. Звука пока нет. Ты появишься в списке участников канала, лучше проверять на своём сервере. При закрытии экрана приложение выйдет из канала.")
                 .font(.system(size: 12))
                 .foregroundStyle(Theme.muted)
                 .frame(maxWidth: .infinity, alignment: .leading)
+
+            if !voice.gwLog.isEmpty {
+                Text("Основной шлюз:\n" + voice.gwLog.suffix(3).joined(separator: "\n"))
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundStyle(Theme.muted)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
 
             ScrollViewReader { proxy in
                 ScrollView {
@@ -439,5 +474,8 @@ struct VoiceDebugView: View {
         .presentationDetents([.large])
         .presentationDragIndicator(.visible)
         .presentationBackground(Theme.panel)
+        .onDisappear {
+            if isActive { voice.leave() }
+        }
     }
 }

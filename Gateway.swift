@@ -1,6 +1,6 @@
 import Foundation
 
-/// Подключение к Discord Gateway для получения новых сообщений в реальном времени.
+/// Подключение к Discord Gateway: новые сообщения и голосовые события в реальном времени.
 final class Gateway {
     private let token: String
     private let session: URLSession
@@ -8,15 +8,22 @@ final class Gateway {
     private var seq: Int?
     private var heartbeatTask: Task<Void, Never>?
     private var stopped = false
+    private var retryDelay: Double = 3
+    private(set) var isReady = false
 
     var onMessage: ((Message) -> Void)?
-    /// Прочие события (сейчас только VOICE_*).
+    /// Голосовые события (VOICE_*).
     var onEvent: ((String, [String: Any]) -> Void)?
+    /// Имя любого пришедшего события (для диагностики).
+    var onDispatchName: ((String) -> Void)?
+    var onLog: ((String) -> Void)?
 
     init(token: String, session: URLSession) {
         self.token = token
         self.session = session
     }
+
+    private func log(_ s: String) { onLog?(s) }
 
     func start() {
         stopped = false
@@ -28,13 +35,19 @@ final class Gateway {
         heartbeatTask?.cancel()
         task?.cancel(with: .goingAway, reason: nil)
         task = nil
+        isReady = false
     }
 
     private func connect() {
         guard let url = URL(string: "wss://gateway.discord.gg/?v=9&encoding=json") else { return }
         let t = session.webSocketTask(with: url)
+        // Первое сообщение (READY) у пользовательского аккаунта на несколько мегабайт,
+        // стандартный лимит iOS в 1 МБ обрывает соединение.
+        t.maximumMessageSize = 64 * 1024 * 1024
         task = t
         seq = nil
+        isReady = false
+        log("Gateway: подключаюсь")
         t.resume()
         receive(on: t)
     }
@@ -43,7 +56,8 @@ final class Gateway {
         t.receive { [weak self] result in
             guard let self, t === self.task else { return }
             switch result {
-            case .failure:
+            case .failure(let err):
+                self.log("Gateway: соединение оборвалось (код \(t.closeCode.rawValue)): \(err.localizedDescription)")
                 self.reconnect()
             case .success(let message):
                 if case .string(let s) = message { self.handle(s) }
@@ -57,7 +71,11 @@ final class Gateway {
         heartbeatTask?.cancel()
         task?.cancel(with: .goingAway, reason: nil)
         task = nil
-        DispatchQueue.global().asyncAfter(deadline: .now() + 3) { [weak self] in
+        isReady = false
+        let delay = retryDelay
+        retryDelay = min(retryDelay * 2, 60)
+        log("Gateway: переподключение через \(Int(delay)) с")
+        DispatchQueue.global().asyncAfter(deadline: .now() + delay) { [weak self] in
             guard let self, !self.stopped else { return }
             self.connect()
         }
@@ -73,14 +91,25 @@ final class Gateway {
         case 10:
             let d = obj["d"] as? [String: Any]
             let interval = (d?["heartbeat_interval"] as? Double) ?? 41250
+            log("Gateway: Hello, отправляю Identify")
             startHeartbeat(interval: interval)
             identify()
         case 1:
             sendHeartbeat()
-        case 7, 9:
+        case 7:
+            log("Gateway: сервер просит переподключиться (op 7)")
+            reconnect()
+        case 9:
+            log("Gateway: сессия недействительна (op 9)")
             reconnect()
         case 0:
             let t = obj["t"] as? String ?? ""
+            onDispatchName?(t)
+            if t == "READY" {
+                isReady = true
+                retryDelay = 3
+                log("Gateway: READY получен (\(text.utf8.count / 1024) КБ)")
+            }
             if t == "MESSAGE_CREATE",
                let d = obj["d"],
                let raw = try? JSONSerialization.data(withJSONObject: d),
@@ -121,9 +150,16 @@ final class Gateway {
         send(["op": 1, "d": value])
     }
 
-    /// Отправка произвольного пакета в основной Gateway (например, вход в голосовой канал).
-    func sendRaw(_ obj: [String: Any]) {
+    /// Отправка произвольного пакета (например, вход в голосовой канал). Возвращает false, если шлюз не готов.
+    @discardableResult
+    func sendRaw(_ obj: [String: Any]) -> Bool {
+        guard task != nil else {
+            log("Gateway: не подключён, пакет не отправлен")
+            return false
+        }
+        if !isReady { log("Gateway: READY ещё не получен, отправляю всё равно") }
         send(obj)
+        return true
     }
 
     private func send(_ obj: [String: Any]) {
