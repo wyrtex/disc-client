@@ -70,11 +70,15 @@ final class API {
         return req
     }
 
-    private func decodeResponse<T: Decodable>(_ data: Data, _ resp: URLResponse) throws -> T {
+    private func check(_ data: Data, _ resp: URLResponse) throws {
         guard let http = resp as? HTTPURLResponse else { throw APIError.badResponse }
         guard (200..<300).contains(http.statusCode) else {
             throw APIError.http(http.statusCode, String(data: data, encoding: .utf8) ?? "")
         }
+    }
+
+    private func decodeResponse<T: Decodable>(_ data: Data, _ resp: URLResponse) throws -> T {
+        try check(data, resp)
         return try JSONDecoder().decode(T.self, from: data)
     }
 
@@ -85,6 +89,13 @@ final class API {
         }
         let (data, resp) = try await session.data(for: req)
         return try decodeResponse(data, resp)
+    }
+
+    /// Запрос, у которого нет тела в ответе (реакции и т.п.).
+    func noContent(_ method: String, _ path: String) async throws {
+        let req = try baseRequest(method, path)
+        let (data, resp) = try await session.data(for: req)
+        try check(data, resp)
     }
 
     func get<T: Decodable>(_ path: String) async throws -> T {
@@ -99,25 +110,25 @@ final class API {
         String(Int(Date().timeIntervalSince1970 * 1000))
     }
 
-    /// Отправка сообщения, при необходимости с файлами (multipart).
-    func sendMessage(channelId: String, content: String, files: [UploadFile]) async throws -> Message {
+    /// Отправка сообщения: текст, ответ на сообщение, файлы (multipart).
+    func sendMessage(channelId: String, content: String, files: [UploadFile], replyTo: String? = nil) async throws -> Message {
         let path = "/channels/\(channelId)/messages"
+        var payload: [String: Any] = ["content": content, "nonce": nonce(), "tts": false]
+        if let replyTo {
+            payload["message_reference"] = ["message_id": replyTo, "channel_id": channelId]
+        }
         if files.isEmpty {
-            return try await post(path, body: ["content": content, "tts": false, "nonce": nonce()])
+            return try await post(path, body: payload)
         }
 
-        let boundary = "Boundary-\(UUID().uuidString)"
         var attachmentsJSON: [[String: Any]] = []
         for (i, f) in files.enumerated() {
             attachmentsJSON.append(["id": i, "filename": f.name])
         }
-        let payload: [String: Any] = [
-            "content": content,
-            "nonce": nonce(),
-            "attachments": attachmentsJSON
-        ]
+        payload["attachments"] = attachmentsJSON
         let json = try JSONSerialization.data(withJSONObject: payload)
 
+        let boundary = "Boundary-\(UUID().uuidString)"
         var body = Data()
         body.appendString("--\(boundary)\r\n")
         body.appendString("Content-Disposition: form-data; name=\"payload_json\"\r\n")

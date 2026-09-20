@@ -7,7 +7,7 @@ struct MainView: View {
     @State private var confirmLogout = false
 
     var body: some View {
-        NavigationStack {
+        NavigationStack(path: $store.path) {
             ZStack {
                 Theme.rail.ignoresSafeArea()
                 HStack(spacing: 0) {
@@ -20,7 +20,11 @@ struct MainView: View {
                 }
             }
             .navigationDestination(for: Channel.self) { ch in
-                ChatView(channel: ch)
+                if ch.type == 15 {
+                    ForumView(channel: ch)
+                } else {
+                    ChatView(channel: ch)
+                }
             }
             .toolbar(.hidden, for: .navigationBar)
         }
@@ -107,6 +111,9 @@ struct ChannelPanel: View {
     @Binding var collapsed: Set<String>
     let onUserTap: () -> Void
 
+    @State private var showServer = false
+    @State private var showVoiceInfo = false
+
     private var guild: Guild? {
         store.guilds.first { $0.id == selection }
     }
@@ -132,25 +139,87 @@ struct ChannelPanel: View {
             topTrailingRadius: 0
         ))
         .ignoresSafeArea(edges: .bottom)
+        .simultaneousGesture(openLastChatSwipe)
         .task(id: selection) {
-            if let g = guild { await store.loadGuildChannels(g) }
+            if let g = guild {
+                await store.loadGuildChannels(g)
+                _ = await store.loadGuildDetail(g.id)
+            }
+        }
+        .sheet(isPresented: $showServer) {
+            if let g = guild {
+                ServerProfileSheet(guild: g)
+                    .environmentObject(store)
+            }
+        }
+        .alert("Голосовые каналы", isPresented: $showVoiceInfo) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text("Голосовые каналы и трибуны будут следующим этапом. Пока их нельзя открыть.")
         }
     }
 
+    /// Свайп влево по списку каналов возвращает в последний открытый чат.
+    private var openLastChatSwipe: some Gesture {
+        DragGesture(minimumDistance: 40)
+            .onEnded { v in
+                if v.translation.width < -90,
+                   abs(v.translation.height) < 70,
+                   store.path.isEmpty,
+                   let last = store.lastChannel {
+                    store.path.append(last)
+                }
+            }
+    }
+
+    // MARK: Шапка
+
     private var header: some View {
-        HStack {
-            Text(guild?.name ?? "Сообщения")
-                .font(.system(size: 17, weight: .bold))
-                .foregroundStyle(Theme.text)
-                .lineLimit(1)
-            Spacer()
+        Button {
+            if guild != nil { showServer = true }
+        } label: {
+            headerLabel
         }
-        .padding(.horizontal, 16)
-        .frame(height: 48)
+        .buttonStyle(.plain)
+    }
+
+    private var headerLabel: some View {
+        let banner = guild.flatMap { store.guildDetails[$0.id]?.bannerURL }
+        return ZStack(alignment: .bottomLeading) {
+            if let banner {
+                RemoteImage(url: banner) { Theme.panel }
+                    .frame(maxWidth: .infinity)
+                    .frame(height: 110)
+                    .clipped()
+                LinearGradient(
+                    colors: [Color.clear, Color.black.opacity(0.65)],
+                    startPoint: .top,
+                    endPoint: .bottom
+                )
+                .frame(height: 110)
+            }
+            HStack(spacing: 6) {
+                Text(guild?.name ?? "Сообщения")
+                    .font(.system(size: 17, weight: .bold))
+                    .foregroundStyle(Theme.text)
+                    .lineLimit(1)
+                if guild != nil {
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 11, weight: .bold))
+                        .foregroundStyle(Theme.muted)
+                }
+                Spacer()
+            }
+            .padding(.horizontal, 16)
+            .frame(height: 48)
+        }
+        .frame(maxWidth: .infinity)
         .overlay(alignment: .bottom) {
             Rectangle().fill(Color.black.opacity(0.25)).frame(height: 1)
         }
     }
+
+    // MARK: Личные сообщения
 
     private var dmContent: some View {
         LazyVStack(spacing: 2) {
@@ -174,6 +243,8 @@ struct ChannelPanel: View {
         .padding(.top, 8)
     }
 
+    // MARK: Каналы сервера
+
     @ViewBuilder
     private func guildContent(_ g: Guild) -> some View {
         if let all = store.guildChannels[g.id] {
@@ -191,7 +262,7 @@ struct ChannelPanel: View {
                     }
                     if isOpen {
                         ForEach(grp.channels) { ch in
-                            channelRow(ch)
+                            channelRow(ch, guildId: g.id)
                         }
                     }
                 }
@@ -223,18 +294,22 @@ struct ChannelPanel: View {
     }
 
     @ViewBuilder
-    private func channelRow(_ ch: Channel) -> some View {
-        if ch.type == 0 || ch.type == 5 {
-            NavigationLink(value: ch) { rowLabel(ch) }
+    private func channelRow(_ ch: Channel, guildId: String) -> some View {
+        let locked = store.isLocked(ch, guildId: guildId)
+        if locked {
+            rowLabel(ch, locked: true).opacity(0.4)
+        } else if ch.type == 0 || ch.type == 5 || ch.type == 15 {
+            NavigationLink(value: ch) { rowLabel(ch, locked: false) }
                 .buttonStyle(.plain)
         } else {
-            rowLabel(ch).opacity(0.45)
+            Button { showVoiceInfo = true } label: { rowLabel(ch, locked: false) }
+                .buttonStyle(.plain)
         }
     }
 
-    private func rowLabel(_ ch: Channel) -> some View {
+    private func rowLabel(_ ch: Channel, locked: Bool) -> some View {
         HStack(spacing: 8) {
-            Image(systemName: ch.icon)
+            Image(systemName: locked ? "lock.fill" : ch.icon)
                 .font(.system(size: 15))
                 .frame(width: 22)
             Text(ch.title)

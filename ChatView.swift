@@ -15,16 +15,23 @@ struct ViewerItem: Identifiable {
 
 struct ChatView: View {
     @EnvironmentObject var store: Store
+    @Environment(\.dismiss) private var dismiss
     let channel: Channel
 
     @State private var text = ""
     @State private var pending: [PendingFile] = []
+    @State private var replyTo: Message?
     @State private var showAttachMenu = false
     @State private var showPhotos = false
     @State private var showFiles = false
+    @State private var showEmoji = false
     @State private var photoItems: [PhotosPickerItem] = []
     @State private var sending = false
     @State private var viewer: ViewerItem?
+    @State private var actionMessage: Message?
+    @State private var profileUser: User?
+
+    private var guildId: String? { store.guildID(of: channel) }
 
     private var canSend: Bool {
         !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !pending.isEmpty
@@ -32,12 +39,29 @@ struct ChatView: View {
 
     var body: some View {
         let msgs = store.messages[channel.id] ?? []
+        withAttachments(chatCore(msgs))
+            .sheet(item: $actionMessage) { m in actionSheet(m) }
+            .sheet(item: $profileUser) { u in
+                UserProfileSheet(user: u, guildId: guildId)
+                    .environmentObject(store)
+            }
+            .sheet(isPresented: $showEmoji) { emojiSheet }
+            .fullScreenCover(item: $viewer) { item in viewerCover(item) }
+            .task { await poll() }
+            .onAppear { store.lastChannel = channel }
+    }
+
+    // MARK: - Каркас
+
+    private func chatCore(_ msgs: [Message]) -> some View {
         VStack(spacing: 0) {
             messageList(msgs)
+            if let r = replyTo { replyBar(r) }
             if !pending.isEmpty { pendingStrip }
             inputBar
         }
         .background(Theme.chat)
+        .simultaneousGesture(backSwipe)
         .navigationBarTitleDisplayMode(.inline)
         .toolbarBackground(Theme.chat, for: .navigationBar)
         .toolbarBackground(.visible, for: .navigationBar)
@@ -55,60 +79,81 @@ struct ChatView: View {
                 }
             }
         }
-        .confirmationDialog("Прикрепить", isPresented: $showAttachMenu, titleVisibility: .hidden) {
-            Button("Фото и видео") { showPhotos = true }
-            Button("Файл") { showFiles = true }
-            Button("Отмена", role: .cancel) {}
+    }
+
+    /// Свайп вправо из любого места чата возвращает к списку каналов.
+    private var backSwipe: some Gesture {
+        DragGesture(minimumDistance: 40)
+            .onEnded { v in
+                if v.translation.width > 90, abs(v.translation.height) < 70 {
+                    dismiss()
+                }
+            }
+    }
+
+    private func withAttachments<V: View>(_ content: V) -> some View {
+        content
+            .confirmationDialog("Прикрепить", isPresented: $showAttachMenu, titleVisibility: .hidden) {
+                Button("Фото и видео") { showPhotos = true }
+                Button("Файл") { showFiles = true }
+                Button("Отмена", role: .cancel) {}
+            }
+            .photosPicker(
+                isPresented: $showPhotos,
+                selection: $photoItems,
+                maxSelectionCount: 10,
+                matching: .any(of: [.images, .videos])
+            )
+            .onChange(of: photoItems) { _, items in
+                guard !items.isEmpty else { return }
+                Task { await loadPhotos(items) }
+            }
+            .fileImporter(isPresented: $showFiles, allowedContentTypes: [.item], allowsMultipleSelection: true) { result in
+                importFiles(result)
+            }
+    }
+
+    private func poll() async {
+        await store.loadMessages(channel.id)
+        // Запасное обновление на случай, если Gateway не доставил сообщение.
+        while !Task.isCancelled {
+            try? await Task.sleep(nanoseconds: 4_000_000_000)
+            await store.loadMessages(channel.id, silent: true)
         }
-        .photosPicker(
-            isPresented: $showPhotos,
-            selection: $photoItems,
-            maxSelectionCount: 10,
-            matching: .any(of: [.images, .videos])
+    }
+
+    // MARK: - Листы
+
+    private func actionSheet(_ m: Message) -> some View {
+        MessageActionSheet(
+            message: m,
+            channel: channel,
+            guildId: guildId,
+            onReply: { replyTo = m }
         )
-        .onChange(of: photoItems) { _, items in
-            guard !items.isEmpty else { return }
-            Task { await loadPhotos(items) }
+        .environmentObject(store)
+        .presentationDetents([.medium, .large])
+        .presentationDragIndicator(.visible)
+        .presentationBackground(Theme.panel)
+    }
+
+    private var emojiSheet: some View {
+        EmojiPickerView(guildId: guildId) { ref in
+            text += ref.inlineText
         }
-        .fileImporter(isPresented: $showFiles, allowedContentTypes: [.item], allowsMultipleSelection: true) { result in
-            guard case .success(let urls) = result else { return }
-            for url in urls {
-                let ok = url.startAccessingSecurityScopedResource()
-                defer { if ok { url.stopAccessingSecurityScopedResource() } }
-                guard let data = try? Data(contentsOf: url) else { continue }
-                let mime = UTType(filenameExtension: url.pathExtension)?.preferredMIMEType ?? "application/octet-stream"
-                let thumb = mime.hasPrefix("image/") ? UIImage(data: data) : nil
-                pending.append(PendingFile(
-                    file: UploadFile(name: url.lastPathComponent, mime: mime, data: data),
-                    thumb: thumb
-                ))
-            }
+        .environmentObject(store)
+        .presentationDetents([.medium, .large])
+        .presentationDragIndicator(.visible)
+        .presentationBackground(Theme.panel)
+    }
+
+    private func viewerCover(_ item: ViewerItem) -> some View {
+        ImageViewer(url: item.url) {
+            var t = Transaction()
+            t.disablesAnimations = true
+            withTransaction(t) { viewer = nil }
         }
-        .fullScreenCover(item: $viewer) { item in
-            ZStack(alignment: .topTrailing) {
-                Color.black.ignoresSafeArea()
-                RemoteImage(url: item.url, contentMode: .fit) {
-                    ProgressView().tint(.white)
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                Button {
-                    viewer = nil
-                } label: {
-                    Image(systemName: "xmark.circle.fill")
-                        .font(.largeTitle)
-                        .foregroundStyle(.white.opacity(0.85))
-                }
-                .padding()
-            }
-        }
-        .task {
-            await store.loadMessages(channel.id)
-            // Запасное обновление на случай, если Gateway не доставил сообщение.
-            while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 4_000_000_000)
-                await store.loadMessages(channel.id, silent: true)
-            }
-        }
+        .presentationBackground(.clear)
     }
 
     // MARK: - Список сообщений
@@ -119,9 +164,15 @@ struct ChatView: View {
                 LazyVStack(alignment: .leading, spacing: 0) {
                     ForEach(Array(msgs.enumerated()), id: \.element.id) { i, m in
                         let header = needsHeader(i, msgs)
-                        MessageRow(message: m, showHeader: header) { url in
-                            viewer = ViewerItem(url: url)
-                        }
+                        MessageRow(
+                            message: m,
+                            showHeader: header,
+                            onImage: { url in viewer = ViewerItem(url: url) },
+                            onProfile: { u in profileUser = u },
+                            onReply: { replyTo = m },
+                            onMenu: { actionMessage = m },
+                            onReact: { ref in Task { await store.toggleReaction(ref, on: m) } }
+                        )
                         .padding(.top, header ? 14 : 2)
                         .id(m.id)
                     }
@@ -140,13 +191,37 @@ struct ChatView: View {
         guard i > 0 else { return true }
         let prev = msgs[i - 1]
         let cur = msgs[i]
-        if cur.reply != nil { return true }
+        if cur.reply != nil || cur.forwarded != nil { return true }
         if prev.author.id != cur.author.id { return true }
         guard let a = prev.date, let b = cur.date else { return true }
         return b.timeIntervalSince(a) > 7 * 60
     }
 
-    // MARK: - Вложения перед отправкой
+    // MARK: - Ответ и вложения перед отправкой
+
+    private func replyBar(_ r: Message) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: "arrowshape.turn.up.left.fill")
+                .font(.system(size: 13))
+                .foregroundStyle(Theme.muted)
+            Text("Ответ для")
+                .font(.system(size: 13))
+                .foregroundStyle(Theme.muted)
+            Text(r.author.displayName)
+                .font(.system(size: 13, weight: .bold))
+                .foregroundStyle(Theme.text)
+            Spacer()
+            Button {
+                replyTo = nil
+            } label: {
+                Image(systemName: "xmark.circle.fill")
+                    .foregroundStyle(Theme.muted)
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .background(Theme.panel)
+    }
 
     private var pendingStrip: some View {
         ScrollView(.horizontal, showsIndicators: false) {
@@ -217,7 +292,15 @@ struct ChatView: View {
                 .foregroundStyle(Theme.text)
                 .padding(.vertical, 10)
                 .padding(.leading, 14)
-                .padding(.trailing, canSend ? 0 : 14)
+
+                Button {
+                    showEmoji = true
+                } label: {
+                    Image(systemName: "face.smiling")
+                        .font(.system(size: 20))
+                        .foregroundStyle(Theme.muted)
+                        .frame(width: 32, height: 40)
+                }
 
                 if canSend {
                     Button(action: submit) {
@@ -233,8 +316,11 @@ struct ChatView: View {
                         .frame(width: 32, height: 32)
                         .background(Theme.blurple, in: Circle())
                     }
-                    .padding(4)
+                    .padding(.trailing, 4)
+                    .padding(.bottom, 4)
                     .disabled(sending)
+                } else {
+                    Color.clear.frame(width: 6, height: 1)
                 }
             }
             .background(Theme.input, in: RoundedRectangle(cornerRadius: 20))
@@ -249,13 +335,30 @@ struct ChatView: View {
         guard !t.isEmpty || !pending.isEmpty, !sending else { return }
         sending = true
         let files = pending.map { $0.file }
+        let replyId = replyTo?.id
         Task {
-            let ok = await store.send(t, files: files, to: channel.id)
+            let ok = await store.send(t, files: files, to: channel.id, replyTo: replyId)
             sending = false
             if ok {
                 text = ""
                 pending = []
+                replyTo = nil
             }
+        }
+    }
+
+    private func importFiles(_ result: Result<[URL], Error>) {
+        guard case .success(let urls) = result else { return }
+        for url in urls {
+            let ok = url.startAccessingSecurityScopedResource()
+            defer { if ok { url.stopAccessingSecurityScopedResource() } }
+            guard let data = try? Data(contentsOf: url) else { continue }
+            let mime = UTType(filenameExtension: url.pathExtension)?.preferredMIMEType ?? "application/octet-stream"
+            let thumb = mime.hasPrefix("image/") ? UIImage(data: data) : nil
+            pending.append(PendingFile(
+                file: UploadFile(name: url.lastPathComponent, mime: mime, data: data),
+                thumb: thumb
+            ))
         }
     }
 
@@ -295,8 +398,55 @@ struct MessageRow: View {
     let message: Message
     let showHeader: Bool
     let onImage: (URL) -> Void
+    let onProfile: (User) -> Void
+    let onReply: () -> Void
+    let onMenu: () -> Void
+    let onReact: (EmojiRef) -> Void
+
+    @State private var dragX: CGFloat = 0
 
     var body: some View {
+        ZStack(alignment: .trailing) {
+            Image(systemName: "arrowshape.turn.up.left.fill")
+                .foregroundStyle(Theme.muted)
+                .padding(.trailing, 22)
+                .opacity(min(1, Double(-dragX) / 50))
+                .scaleEffect(min(1, 0.6 + Double(-dragX) / 100))
+            content
+                .offset(x: dragX)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .contentShape(Rectangle())
+        .simultaneousGesture(replySwipe)
+        .onLongPressGesture(minimumDuration: 0.4) {
+            UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+            onMenu()
+        }
+    }
+
+    /// Свайп сообщения влево = ответить.
+    private var replySwipe: some Gesture {
+        DragGesture(minimumDistance: 20)
+            .onChanged { v in
+                if abs(v.translation.width) > abs(v.translation.height) * 1.5, v.translation.width < 0 {
+                    dragX = max(-90, v.translation.width)
+                } else if dragX != 0 && v.translation.width >= 0 {
+                    dragX = 0
+                }
+            }
+            .onEnded { _ in
+                let trigger = dragX <= -60
+                withAnimation(.spring(response: 0.3, dampingFraction: 0.75)) {
+                    dragX = 0
+                }
+                if trigger {
+                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                    onReply()
+                }
+            }
+    }
+
+    private var content: some View {
         VStack(alignment: .leading, spacing: 4) {
             if let r = message.reply, showHeader {
                 replyLine(r)
@@ -304,20 +454,26 @@ struct MessageRow: View {
             HStack(alignment: .top, spacing: 12) {
                 if showHeader {
                     AvatarView(user: message.author, size: 40)
+                        .onTapGesture { onProfile(message.author) }
                 } else {
                     Color.clear.frame(width: 40, height: 1)
                 }
-                VStack(alignment: .leading, spacing: 3) {
+                VStack(alignment: .leading, spacing: 4) {
                     if showHeader { header }
                     if !message.content.isEmpty {
-                        Text(DiscordText.attributed(message.content, mentions: message.mentions))
-                            .font(.system(size: 16))
-                            .foregroundStyle(Theme.normalText)
-                            .tint(Theme.link)
-                            .textSelection(.enabled)
+                        RichText(raw: message.content, mentions: message.mentions)
                     }
+                    if let f = message.forwarded { forwardedBlock(f) }
                     ForEach(message.attachments) { a in
                         AttachmentView(attachment: a, onImage: onImage)
+                    }
+                    if !message.reactions.isEmpty {
+                        FlowLayout(spacing: 6) {
+                            ForEach(message.reactions) { r in
+                                ReactionChip(reaction: r) { onReact(r.emoji) }
+                            }
+                        }
+                        .padding(.top, 2)
                     }
                 }
                 Spacer(minLength: 0)
@@ -333,6 +489,7 @@ struct MessageRow: View {
                 .font(.system(size: 16, weight: .semibold))
                 .foregroundStyle(.white)
                 .lineLimit(1)
+                .onTapGesture { onProfile(message.author) }
             if message.author.bot == true {
                 Text("APP")
                     .font(.system(size: 10, weight: .bold))
@@ -362,6 +519,29 @@ struct MessageRow: View {
                 .lineLimit(1)
         }
         .padding(.leading, 14)
+    }
+
+    private func forwardedBlock(_ f: ForwardedContent) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 4) {
+                Image(systemName: "arrowshape.turn.up.right.fill")
+                Text("Переслано")
+            }
+            .font(.system(size: 12))
+            .foregroundStyle(Theme.muted)
+            if !f.content.isEmpty {
+                RichText(raw: f.content, mentions: [])
+            }
+            ForEach(f.attachments) { a in
+                AttachmentView(attachment: a, onImage: onImage)
+            }
+        }
+        .padding(.leading, 10)
+        .overlay(alignment: .leading) {
+            Rectangle()
+                .fill(Theme.muted.opacity(0.6))
+                .frame(width: 3)
+        }
     }
 }
 

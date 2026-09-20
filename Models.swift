@@ -1,11 +1,34 @@
 import Foundation
 
+// MARK: - Хелперы
+
+func snowflakeDate(_ id: String) -> Date? {
+    guard let v = UInt64(id) else { return nil }
+    return Date(timeIntervalSince1970: Double(v >> 22) / 1000 + 1_420_070_400)
+}
+
+func formatDate(_ d: Date?) -> String {
+    guard let d else { return "—" }
+    let f = DateFormatter()
+    f.dateStyle = .medium
+    f.timeStyle = .none
+    return f.string(from: d)
+}
+
+func relativeString(_ d: Date) -> String {
+    RelativeDateTimeFormatter().localizedString(for: d, relativeTo: Date())
+}
+
+// MARK: - Пользователи и серверы
+
 struct User: Decodable, Identifiable {
     let id: String
     let username: String
     let global_name: String?
     let avatar: String?
     let bot: Bool?
+    let banner: String?
+    let accent_color: Int?
 
     var displayName: String { global_name ?? username }
 
@@ -15,6 +38,11 @@ struct User: Decodable, Identifiable {
         }
         let idx = Int((UInt64(id) ?? 0) >> 22) % 6
         return URL(string: "https://cdn.discordapp.com/embed/avatars/\(idx).png")
+    }
+
+    func bannerURL(size: Int = 600) -> URL? {
+        guard let banner, !banner.isEmpty else { return nil }
+        return URL(string: "https://cdn.discordapp.com/banners/\(id)/\(banner).png?size=\(size)")
     }
 }
 
@@ -36,9 +64,86 @@ struct Guild: Decodable, Identifiable {
     }
 }
 
+struct GuildDetail: Decodable {
+    let id: String
+    let name: String
+    let icon: String?
+    let banner: String?
+    let description: String?
+    let approximate_member_count: Int?
+    let approximate_presence_count: Int?
+    let premium_subscription_count: Int?
+    let premium_tier: Int?
+
+    var bannerURL: URL? {
+        guard let banner, !banner.isEmpty else { return nil }
+        return URL(string: "https://cdn.discordapp.com/banners/\(id)/\(banner).png?size=600")
+    }
+}
+
+struct GuildRole: Decodable, Identifiable {
+    let id: String
+    let name: String
+    let color: Int?
+    let position: Int?
+}
+
 struct GuildMember: Decodable {
     let roles: [String]
 }
+
+struct GuildEmoji: Decodable, Identifiable {
+    let id: String
+    let name: String
+    let animated: Bool?
+    var ref: EmojiRef { EmojiRef(id: id, name: name, animated: animated) }
+}
+
+// MARK: - Профиль пользователя
+
+struct UserProfileInfo: Decodable {
+    let bio: String?
+    let pronouns: String?
+}
+
+struct MutualGuild: Decodable {
+    let id: String
+}
+
+struct GuildMemberInfo: Decodable {
+    let roles: [String]?
+    let joined_at: String?
+
+    var joinedDate: Date? {
+        guard let joined_at else { return nil }
+        let f1 = ISO8601DateFormatter()
+        f1.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let f2 = ISO8601DateFormatter()
+        f2.formatOptions = [.withInternetDateTime]
+        return f1.date(from: joined_at) ?? f2.date(from: joined_at)
+    }
+}
+
+struct ProfileResponse: Decodable {
+    let user: User?
+    let user_profile: UserProfileInfo?
+    let mutual_guilds: [MutualGuild]?
+    let guild_member: GuildMemberInfo?
+
+    enum CodingKeys: String, CodingKey {
+        case user, user_profile, mutual_guilds, guild_member
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        user = try? c.decode(User.self, forKey: .user)
+        user_profile = try? c.decode(UserProfileInfo.self, forKey: .user_profile)
+        mutual_guilds = try? c.decode([MutualGuild].self, forKey: .mutual_guilds)
+        guild_member = try? c.decode(GuildMemberInfo.self, forKey: .guild_member)
+    }
+}
+
+// MARK: - Каналы
 
 struct Overwrite: Decodable {
     let id: String
@@ -73,6 +178,9 @@ struct Channel: Decodable, Identifiable, Hashable {
     let last_message_id: String?
     let recipients: [User]?
     let parent_id: String?
+    let guild_id: String?
+    let owner_id: String?
+    let message_count: Int?
     let permission_overwrites: [Overwrite]?
 
     static func == (l: Channel, r: Channel) -> Bool { l.id == r.id }
@@ -86,17 +194,32 @@ struct Channel: Decodable, Identifiable, Hashable {
 
     var isCategory: Bool { type == 4 }
     var isVoice: Bool { type == 2 || type == 13 }
-    var canOpen: Bool { type == 0 || type == 5 || type == 1 || type == 3 }
 
     var icon: String {
         switch type {
         case 1, 3: return "at"
         case 2: return "speaker.wave.2.fill"
         case 5: return "megaphone.fill"
+        case 10, 11, 12: return "text.bubble.fill"
         case 13: return "person.wave.2.fill"
-        case 15: return "text.bubble.fill"
+        case 15: return "bubble.left.and.bubble.right.fill"
         default: return "number"
         }
+    }
+}
+
+struct ThreadSearchResult: Decodable {
+    let threads: [Channel]
+    let first_messages: [Message]
+    let has_more: Bool
+
+    enum CodingKeys: String, CodingKey { case threads, first_messages, has_more }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        threads = (try? c.decode([Channel].self, forKey: .threads)) ?? []
+        first_messages = (try? c.decode([Message].self, forKey: .first_messages)) ?? []
+        has_more = (try? c.decode(Bool.self, forKey: .has_more)) ?? false
     }
 }
 
@@ -131,6 +254,8 @@ struct ChannelGroup: Identifiable {
     }
 }
 
+// MARK: - Сообщения
+
 struct Attachment: Decodable, Identifiable {
     let id: String
     let filename: String
@@ -150,6 +275,75 @@ struct Attachment: Decodable, Identifiable {
 
     var sizeText: String {
         ByteCountFormatter.string(fromByteCount: Int64(size ?? 0), countStyle: .file)
+    }
+}
+
+struct EmojiRef: Decodable, Hashable {
+    let id: String?
+    let name: String?
+    let animated: Bool?
+
+    init(id: String?, name: String?, animated: Bool? = nil) {
+        self.id = id
+        self.name = name
+        self.animated = animated
+    }
+
+    static func == (l: EmojiRef, r: EmojiRef) -> Bool {
+        if l.id != nil || r.id != nil { return l.id == r.id }
+        return l.name == r.name
+    }
+
+    func hash(into hasher: inout Hasher) {
+        if let id { hasher.combine(id) } else { hasher.combine(name) }
+    }
+
+    var apiPath: String {
+        let raw: String
+        if let id { raw = "\(name ?? "e"):\(id)" } else { raw = name ?? "" }
+        return raw.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? raw
+    }
+
+    var inlineText: String {
+        if let id { return "<\(animated == true ? "a" : ""):\(name ?? "e"):\(id)>" }
+        return name ?? ""
+    }
+
+    var imageURL: URL? {
+        guard let id else { return nil }
+        return URL(string: "https://cdn.discordapp.com/emojis/\(id).png?size=64")
+    }
+}
+
+struct Reaction: Decodable, Identifiable {
+    let count: Int
+    let me: Bool
+    let emoji: EmojiRef
+
+    var id: String { emoji.apiPath }
+
+    enum CodingKeys: String, CodingKey { case count, me, emoji }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        count = (try? c.decode(Int.self, forKey: .count)) ?? 0
+        me = (try? c.decode(Bool.self, forKey: .me)) ?? false
+        emoji = try c.decode(EmojiRef.self, forKey: .emoji)
+    }
+}
+
+struct ForwardedContent: Decodable {
+    let content: String
+    let attachments: [Attachment]
+
+    enum CodingKeys: String, CodingKey { case message }
+    enum InnerKeys: String, CodingKey { case content, attachments }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let inner = try c.nestedContainer(keyedBy: InnerKeys.self, forKey: .message)
+        content = (try? inner.decode(String.self, forKey: .content)) ?? ""
+        attachments = (try? inner.decode([Attachment].self, forKey: .attachments)) ?? []
     }
 }
 
@@ -177,10 +371,13 @@ struct Message: Decodable, Identifiable {
     let attachments: [Attachment]
     let mentions: [User]
     let reply: ReplyRef?
+    let reactions: [Reaction]
+    let forwarded: ForwardedContent?
     let date: Date?
 
     enum CodingKeys: String, CodingKey {
-        case id, channel_id, content, author, timestamp, attachments, mentions, referenced_message
+        case id, channel_id, content, author, timestamp, attachments, mentions
+        case referenced_message, reactions, message_snapshots
     }
 
     init(from decoder: Decoder) throws {
@@ -194,6 +391,8 @@ struct Message: Decodable, Identifiable {
         attachments = (try? c.decode([Attachment].self, forKey: .attachments)) ?? []
         mentions = (try? c.decode([User].self, forKey: .mentions)) ?? []
         reply = try? c.decode(ReplyRef.self, forKey: .referenced_message)
+        reactions = (try? c.decode([Reaction].self, forKey: .reactions)) ?? []
+        forwarded = (try? c.decode([ForwardedContent].self, forKey: .message_snapshots))?.first
         date = Message.iso1.date(from: ts) ?? Message.iso2.date(from: ts)
     }
 
