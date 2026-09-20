@@ -310,11 +310,16 @@ struct ChannelPanel: View {
             NavigationLink(value: ch) { rowLabel(ch, locked: false) }
                 .buttonStyle(.plain)
         } else {
-            Button {
-                store.voice.join(guildId: guildId, channel: ch)
-                onOpenVoice()
-            } label: { rowLabel(ch, locked: false) }
-                .buttonStyle(.plain)
+            VStack(alignment: .leading, spacing: 0) {
+                Button {
+                    store.voice.join(guildId: guildId, channel: ch)
+                    onOpenVoice()
+                } label: { rowLabel(ch, locked: false) }
+                    .buttonStyle(.plain)
+                ForEach(store.members(in: ch.id, guildId: guildId), id: \.userId) { m in
+                    VoiceMemberRow(state: m)
+                }
+            }
         }
     }
 

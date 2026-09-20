@@ -123,6 +123,9 @@ final class VoiceMedia {
     private var firstEncryptFailLogged = false
 
     var log: ((String) -> Void)?
+    /// Распознавание речи (необязательно) и наш id для подписи собственной речи.
+    var transcriber: VoiceTranscriber?
+    var ownUserId = ""
     /// Пришёл звук от пользователя (не чаще 10 раз в секунду на пользователя).
     var onAudio: ((String) -> Void)?
     /// Мы начали или закончили говорить.
@@ -259,6 +262,7 @@ final class VoiceMedia {
         }
         stats.played += 1
         audio.play(ssrc: packetSsrc, interleaved: pcm.samples, frames: pcm.frames)
+        transcriber?.feed(userId: user, interleaved: pcm.samples, channels: 2, frames: pcm.frames)
 
         let now = Date()
         if now.timeIntervalSince(lastAudioReport[user] ?? .distantPast) > 0.1 {
@@ -342,6 +346,7 @@ final class VoiceMedia {
             return
         }
         guard speakingNow else { return }
+        transcriber?.feed(userId: ownUserId, interleaved: frame, channels: 1, frames: frame.count)
         sendFrame(frame, timestamp: ts)
     }
 

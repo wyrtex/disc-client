@@ -24,6 +24,9 @@ struct VoiceView: View {
                 } else {
                     participants
                 }
+                if voice.captionsEnabled {
+                    CaptionsPanel(voice: voice)
+                }
                 controls
             }
         }
@@ -98,7 +101,7 @@ struct VoiceView: View {
     // MARK: Кнопки управления
 
     private var controls: some View {
-        HStack(spacing: 16) {
+        HStack(spacing: 12) {
             controlButton(
                 icon: (voice.muted || voice.deafened) ? "mic.slash.fill" : "mic.fill",
                 active: voice.muted || voice.deafened
@@ -109,6 +112,10 @@ struct VoiceView: View {
                 active: voice.deafened
             ) { voice.toggleDeafen() }
 
+            controlButton(icon: "captions.bubble.fill", active: voice.captionsEnabled) {
+                voice.setCaptions(!voice.captionsEnabled)
+            }
+
             controlButton(icon: voice.speakerOn ? "speaker.wave.3.fill" : "ear.fill", active: false) {
                 showAudio = true
             }
@@ -118,9 +125,9 @@ struct VoiceView: View {
                 onMinimize()
             } label: {
                 Image(systemName: "phone.down.fill")
-                    .font(.system(size: 22))
+                    .font(.system(size: 20))
                     .foregroundStyle(.white)
-                    .frame(width: 62, height: 62)
+                    .frame(width: 54, height: 54)
                     .background(Color.red, in: Circle())
             }
         }
@@ -134,9 +141,9 @@ struct VoiceView: View {
     private func controlButton(icon: String, active: Bool, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Image(systemName: icon)
-                .font(.system(size: 22))
+                .font(.system(size: 20))
                 .foregroundStyle(active ? Color.black : Theme.text)
-                .frame(width: 62, height: 62)
+                .frame(width: 54, height: 54)
                 .background(active ? Color.white : Theme.input, in: Circle())
         }
     }
@@ -168,6 +175,8 @@ struct ParticipantTile: View {
             )
             .overlay(alignment: .topTrailing) {
                 HStack(spacing: 4) {
+                    if flag.stream { liveBadge }
+                    if flag.video { badge("video.fill", color: Theme.green) }
                     if flag.deaf {
                         badge("speaker.slash.fill")
                     } else if flag.mute {
@@ -184,12 +193,142 @@ struct ParticipantTile: View {
         return id == voice.userId ? "Ты" : "…"
     }
 
-    private func badge(_ icon: String) -> some View {
+    private func badge(_ icon: String, color: Color = .red) -> some View {
         Image(systemName: icon)
             .font(.system(size: 11, weight: .bold))
             .foregroundStyle(.white)
             .frame(width: 22, height: 22)
-            .background(Color.red, in: Circle())
+            .background(color, in: Circle())
+    }
+
+    private var liveBadge: some View {
+        Text("LIVE")
+            .font(.system(size: 10, weight: .heavy))
+            .foregroundStyle(.white)
+            .padding(.horizontal, 6)
+            .frame(height: 22)
+            .background(Color.red, in: Capsule())
+    }
+}
+
+// MARK: - Участник голосового канала в списке каналов
+
+struct VoiceMemberRow: View {
+    @EnvironmentObject var store: Store
+    let state: VoiceMemberState
+
+    var body: some View {
+        let user = store.voiceUsers[state.userId]
+        HStack(spacing: 8) {
+            AvatarView(user: user, size: 22)
+            Text(user?.displayName ?? "…")
+                .font(.system(size: 14, weight: .medium))
+                .foregroundStyle(Theme.muted)
+                .lineLimit(1)
+            Spacer(minLength: 4)
+            if state.stream {
+                Text("LIVE")
+                    .font(.system(size: 9, weight: .heavy))
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 2)
+                    .background(Color.red, in: RoundedRectangle(cornerRadius: 4))
+            }
+            if state.video {
+                Image(systemName: "video.fill")
+                    .font(.system(size: 12))
+                    .foregroundStyle(Theme.muted)
+            }
+            if state.deaf {
+                Image(systemName: "speaker.slash.fill")
+                    .font(.system(size: 12))
+                    .foregroundStyle(Theme.muted)
+            } else if state.mute {
+                Image(systemName: "mic.slash.fill")
+                    .font(.system(size: 12))
+                    .foregroundStyle(Theme.muted)
+            }
+        }
+        .padding(.leading, 44)
+        .padding(.trailing, 14)
+        .padding(.vertical, 3)
+    }
+}
+
+// MARK: - Субтитры
+
+struct CaptionsPanel: View {
+    @ObservedObject var voice: VoiceSpike
+
+    private var langName: String {
+        TranscriptLanguage.all.first(where: { $0.code == voice.captionLang })?.name ?? voice.captionLang
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 8) {
+                Image(systemName: "captions.bubble.fill")
+                    .foregroundStyle(Theme.muted)
+                Text("Субтитры")
+                    .font(.system(size: 14, weight: .bold))
+                    .foregroundStyle(Theme.text)
+                Spacer()
+                Menu {
+                    ForEach(TranscriptLanguage.all) { l in
+                        Button(l.name) { voice.setCaptionLanguage(l.code) }
+                    }
+                } label: {
+                    HStack(spacing: 4) {
+                        Text(langName)
+                        Image(systemName: "chevron.up.chevron.down").font(.system(size: 10))
+                    }
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(Theme.link)
+                }
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 8)
+
+            if !voice.captionStatus.isEmpty {
+                Text(voice.captionStatus)
+                    .font(.system(size: 11))
+                    .foregroundStyle(Theme.muted)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 14)
+                    .padding(.bottom, 4)
+            }
+
+            ScrollViewReader { proxy in
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 8) {
+                        ForEach(voice.captions) { c in
+                            HStack(alignment: .top, spacing: 8) {
+                                AvatarView(user: voice.users[c.userId], size: 24)
+                                VStack(alignment: .leading, spacing: 1) {
+                                    Text(voice.users[c.userId]?.displayName ?? (c.userId == voice.userId ? "Ты" : "…"))
+                                        .font(.system(size: 11, weight: .bold))
+                                        .foregroundStyle(Theme.muted)
+                                    Text(c.text)
+                                        .font(.system(size: 15))
+                                        .foregroundStyle(c.isFinal ? Theme.text : Theme.muted)
+                                }
+                                Spacer(minLength: 0)
+                            }
+                            .id(c.id)
+                        }
+                    }
+                    .padding(.horizontal, 14)
+                    .padding(.bottom, 8)
+                }
+                .onChange(of: voice.captionsVersion) { _, _ in
+                    if let last = voice.captions.last?.id {
+                        proxy.scrollTo(last, anchor: .bottom)
+                    }
+                }
+            }
+        }
+        .frame(height: 210)
+        .background(Theme.panel)
     }
 }
 
@@ -381,6 +520,11 @@ struct VoiceLogView: View {
             }
             .pickerStyle(.segmented)
             .disabled(voice.isConnected)
+
+            Toggle("Видео (эксперимент, только лог)", isOn: $voice.videoProbe)
+                .tint(Theme.blurple)
+                .foregroundStyle(Theme.text)
+                .disabled(voice.isConnected)
 
             Button {
                 voice.add("DAVE в сборке: \(DaveLib.isBuiltIn ? "да" : "нет")")

@@ -24,6 +24,8 @@ final class Gateway {
     var onLog: ((String) -> Void)?
     /// Вызывается, когда шлюз готов (READY или RESUMED).
     var onReady: (() -> Void)?
+    /// Голосовые состояния участников по серверам (из READY и GUILD_CREATE).
+    var onGuildVoiceStates: (([(String, [[String: Any]])]) -> Void)?
 
     init(token: String, session: URLSession) {
         self.token = token
@@ -157,11 +159,16 @@ final class Gateway {
                 if let d = obj["d"] as? [String: Any] {
                     sessionId = d["session_id"] as? String
                     resumeURL = d["resume_gateway_url"] as? String
+                    if let guilds = d["guilds"] as? [[String: Any]] {
+                        emitVoiceStates(guilds)
+                    }
                 }
                 isReady = true
                 retryDelay = 3
                 log("Gateway: READY получен (\(text.utf8.count / 1024) КБ)")
                 onReady?()
+            } else if t == "GUILD_CREATE", let d = obj["d"] as? [String: Any] {
+                emitVoiceStates([d])
             } else if t == "RESUMED" {
                 isReady = true
                 retryDelay = 3
@@ -179,6 +186,18 @@ final class Gateway {
         default:
             break
         }
+    }
+
+    private func emitVoiceStates(_ guilds: [[String: Any]]) {
+        var out: [(String, [[String: Any]])] = []
+        for g in guilds {
+            if let id = g["id"] as? String,
+               let vs = g["voice_states"] as? [[String: Any]],
+               !vs.isEmpty {
+                out.append((id, vs))
+            }
+        }
+        if !out.isEmpty { onGuildVoiceStates?(out) }
     }
 
     private func identify() {

@@ -2,6 +2,15 @@ import Foundation
 import SwiftUI
 import SwiftOGG
 
+struct VoiceMemberState: Equatable {
+    var userId: String
+    var channelId: String
+    var mute = false
+    var deaf = false
+    var video = false
+    var stream = false
+}
+
 @MainActor
 final class Store: ObservableObject {
     @Published var me: User?
@@ -17,6 +26,9 @@ final class Store: ObservableObject {
     @Published var forumPreviews: [String: Message] = [:]
     @Published var forumHasMore: [String: Bool] = [:]
     @Published var path: [Channel] = []
+    @Published var voiceRoster: [String: [String: VoiceMemberState]] = [:]
+    @Published var voiceUsers: [String: User] = [:]
+    private var resolvingVoiceUsers = Set<String>()
     @Published var error: String?
     @Published var isLoading = false
     @Published var proxy: ProxySettings {
@@ -89,6 +101,8 @@ final class Store: ObservableObject {
         messages = [:]
         forumThreads = [:]
         forumPreviews = [:]
+        voiceRoster = [:]
+        voiceUsers = [:]
         path = []
         lastChannel = nil
         Keychain.delete()
@@ -109,7 +123,13 @@ final class Store: ObservableObject {
             }
         }
         gw.onEvent = { [weak self] t, d in
-            Task { @MainActor in self?.voice.handle(t, d) }
+            Task { @MainActor in
+                self?.voice.handle(t, d)
+                if t == "VOICE_STATE_UPDATE" { self?.applyVoiceStateUpdate(d) }
+            }
+        }
+        gw.onGuildVoiceStates = { [weak self] list in
+            Task { @MainActor in self?.setGuildVoiceStates(list) }
         }
         gw.onDispatchName = { [weak self] t in
             Task { @MainActor in self?.voice.noteEvent(t) }
@@ -219,6 +239,81 @@ final class Store: ObservableObject {
         if let guildId { p += "&guild_id=\(guildId)" }
         let r: ProfileResponse? = try? await api.get(p)
         return r
+    }
+
+    // MARK: - Кто сидит в голосовых каналах
+
+    func members(in channelId: String, guildId: String) -> [VoiceMemberState] {
+        (voiceRoster[guildId] ?? [:]).values
+            .filter { $0.channelId == channelId }
+            .sorted { $0.userId < $1.userId }
+    }
+
+    func setGuildVoiceStates(_ list: [(String, [[String: Any]])]) {
+        for (gid, states) in list {
+            var map: [String: VoiceMemberState] = [:]
+            for s in states {
+                if let m = parseVoiceState(s) { map[m.userId] = m }
+                cacheVoiceUser(from: s)
+            }
+            voiceRoster[gid] = map
+        }
+        resolveMissingVoiceUsers()
+    }
+
+    func applyVoiceStateUpdate(_ d: [String: Any]) {
+        guard let gid = d["guild_id"] as? String, let uid = d["user_id"] as? String else { return }
+        if let m = parseVoiceState(d) {
+            var map = voiceRoster[gid] ?? [:]
+            map[uid] = m
+            voiceRoster[gid] = map
+        } else if voiceRoster[gid]?[uid] != nil {
+            voiceRoster[gid]?[uid] = nil
+        }
+        cacheVoiceUser(from: d)
+        resolveMissingVoiceUsers()
+    }
+
+    private func parseVoiceState(_ d: [String: Any]) -> VoiceMemberState? {
+        guard let uid = d["user_id"] as? String, let cid = d["channel_id"] as? String else { return nil }
+        let mute = (d["self_mute"] as? Bool ?? false) || (d["mute"] as? Bool ?? false)
+        let deaf = (d["self_deaf"] as? Bool ?? false) || (d["deaf"] as? Bool ?? false)
+        return VoiceMemberState(
+            userId: uid,
+            channelId: cid,
+            mute: mute,
+            deaf: deaf,
+            video: d["self_video"] as? Bool ?? false,
+            stream: d["self_stream"] as? Bool ?? false
+        )
+    }
+
+    private func cacheVoiceUser(from d: [String: Any]) {
+        guard let member = d["member"] as? [String: Any],
+              let userObj = member["user"] as? [String: Any],
+              let uid = userObj["id"] as? String,
+              voiceUsers[uid] == nil,
+              let data = try? JSONSerialization.data(withJSONObject: userObj),
+              let user = try? JSONDecoder().decode(User.self, from: data) else { return }
+        voiceUsers[uid] = user
+    }
+
+    private func resolveMissingVoiceUsers() {
+        var needed: [String] = []
+        for map in voiceRoster.values {
+            for uid in map.keys where voiceUsers[uid] == nil && !resolvingVoiceUsers.contains(uid) {
+                needed.append(uid)
+            }
+        }
+        for id in needed.prefix(30) {
+            resolvingVoiceUsers.insert(id)
+            Task { [weak self] in
+                if let u = await self?.fetchUser(id) {
+                    self?.voiceUsers[id] = u
+                }
+                self?.resolvingVoiceUsers.remove(id)
+            }
+        }
     }
 
     /// Профиль пользователя по id (для подписей участников голосового канала).

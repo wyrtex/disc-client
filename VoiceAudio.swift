@@ -31,16 +31,24 @@ struct LinearResampler {
 }
 
 /// Аудиодвижок голоса: воспроизведение участников, захват микрофона, эхоподавление, маршрут вывода.
+///
+/// Запуск и остановка идут в отдельной очереди и никогда не блокируют главный поток.
+/// Блокировка состояния не удерживается во время остановки движка: колбэки плееров берут только `pendingLock`.
 final class VoiceAudio {
+    private let control = DispatchQueue(label: "voice.audio.control")
+    private let stateLock = NSLock()
+    private let pendingLock = NSLock()
+    private let micQueue = DispatchQueue(label: "voice.mic")
+
     private var engine = AVAudioEngine()
     private let format = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 48000, channels: 2, interleaved: false)!
-    private let lock = NSLock()
-    private let micQueue = DispatchQueue(label: "voice.mic")
     private var observers: [NSObjectProtocol] = []
     private var resampler = LinearResampler()
     private var accumulator: [Float] = []
     private var running = false
     private var deafened = false
+    private var micRunning = false
+    private var echoCancellation = false
 
     private final class PlayerChannel {
         let node = AVAudioPlayerNode()
@@ -49,8 +57,6 @@ final class VoiceAudio {
     private var channels: [UInt32: PlayerChannel] = [:]
 
     var speakerOn = true
-    private(set) var micRunning = false
-    private(set) var echoCancellation = false
 
     /// Кадр микрофона: 960 сэмплов, mono, 48 кГц (20 мс).
     var onMicFrame: (([Float]) -> Void)?
@@ -95,12 +101,21 @@ final class VoiceAudio {
         }
     }
 
-    // MARK: Запуск и остановка
+    // MARK: Запуск и остановка (в отдельной очереди)
 
     func start(useMic: Bool) {
-        lock.lock()
-        defer { lock.unlock() }
-        if running { return }
+        control.async { self.startSync(useMic: useMic) }
+    }
+
+    func stop() {
+        control.async { self.stopSync() }
+    }
+
+    private func startSync(useMic: Bool) {
+        stateLock.lock()
+        let already = running
+        stateLock.unlock()
+        if already { return }
 
         if useMic {
             if boot(voiceChat: true, mic: true, voiceProcessing: true) {
@@ -122,7 +137,7 @@ final class VoiceAudio {
     }
 
     private func boot(voiceChat: Bool, mic: Bool, voiceProcessing: Bool) -> Bool {
-        teardownEngine()
+        teardown()
         do {
             let session = AVAudioSession.sharedInstance()
             try session.setCategory(
@@ -146,9 +161,11 @@ final class VoiceAudio {
             e.prepare()
             try e.start()
 
+            stateLock.lock()
             engine = e
             micRunning = mic
             echoCancellation = mic && voiceProcessing
+            stateLock.unlock()
             return true
         } catch {
             log?("Аудио: ошибка запуска (\(error.localizedDescription))")
@@ -157,56 +174,72 @@ final class VoiceAudio {
     }
 
     private func finishStart() {
+        stateLock.lock()
         running = true
-        VoiceAudio.setSpeaker(speakerOn)
         engine.mainMixerNode.outputVolume = deafened ? 0 : 1
-        log?("Аудио: запущено. Микрофон: \(micRunning ? "да" : "нет"), эхоподавление: \(echoCancellation ? "да" : "нет"), вывод: \(VoiceAudio.currentOutputName())")
+        let mic = micRunning
+        let echo = echoCancellation
+        stateLock.unlock()
+
+        VoiceAudio.setSpeaker(speakerOn)
+        log?("Аудио: запущено. Микрофон: \(mic ? "да" : "нет"), эхоподавление: \(echo ? "да" : "нет"), вывод: \(VoiceAudio.currentOutputName())")
 
         let center = NotificationCenter.default
-        observers.append(center.addObserver(forName: .AVAudioEngineConfigurationChange, object: engine, queue: nil) { [weak self] _ in
-            self?.restartIfNeeded()
-        })
-        observers.append(center.addObserver(forName: AVAudioSession.interruptionNotification, object: nil, queue: nil) { [weak self] note in
+        let obsConfig = center.addObserver(forName: .AVAudioEngineConfigurationChange, object: nil, queue: nil) { [weak self] _ in
+            self?.control.async { self?.restartIfNeeded() }
+        }
+        let obsInterrupt = center.addObserver(forName: AVAudioSession.interruptionNotification, object: nil, queue: nil) { [weak self] note in
             guard let raw = note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
                   AVAudioSession.InterruptionType(rawValue: raw) == .ended else { return }
-            self?.restartIfNeeded()
-        })
+            self?.control.async { self?.restartIfNeeded() }
+        }
+        stateLock.lock()
+        observers = [obsConfig, obsInterrupt]
+        stateLock.unlock()
     }
 
     private func restartIfNeeded() {
-        lock.lock()
-        defer { lock.unlock() }
-        guard running else { return }
+        stateLock.lock()
+        let isRunning = running
+        let e = engine
+        stateLock.unlock()
+        guard isRunning else { return }
         try? AVAudioSession.sharedInstance().setActive(true)
-        if !engine.isRunning { try? engine.start() }
+        if !e.isRunning { try? e.start() }
         VoiceAudio.setSpeaker(speakerOn)
     }
 
-    private func teardownEngine() {
-        for c in channels.values { c.node.stop() }
+    /// Забирает состояние под замком, а останавливает уже без замка.
+    private func teardown() {
+        stateLock.lock()
+        let oldEngine = engine
+        let oldChannels = channels
+        let hadMic = micRunning
+        let oldObservers = observers
         channels = [:]
-        if micRunning { engine.inputNode.removeTap(onBus: 0) }
-        if engine.isRunning { engine.stop() }
+        observers = []
+        running = false
         micRunning = false
         echoCancellation = false
+        stateLock.unlock()
+
+        for o in oldObservers { NotificationCenter.default.removeObserver(o) }
+        for c in oldChannels.values { c.node.stop() }
+        if hadMic { oldEngine.inputNode.removeTap(onBus: 0) }
+        if oldEngine.isRunning { oldEngine.stop() }
     }
 
-    func stop() {
-        lock.lock()
-        defer { lock.unlock() }
-        teardownEngine()
-        running = false
-        for o in observers { NotificationCenter.default.removeObserver(o) }
-        observers = []
+    private func stopSync() {
+        teardown()
         micQueue.async { self.accumulator = [] }
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
     }
 
     func setDeafened(_ d: Bool) {
-        lock.lock()
-        defer { lock.unlock() }
+        stateLock.lock()
         deafened = d
         if running { engine.mainMixerNode.outputVolume = d ? 0 : 1 }
+        stateLock.unlock()
     }
 
     // MARK: Микрофон
@@ -246,11 +279,10 @@ final class VoiceAudio {
             right[i] = interleaved[2 * i + 1]
         }
 
-        lock.lock()
-        guard running else {
-            lock.unlock()
-            return
-        }
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        guard running, engine.isRunning else { return }
+
         let ch: PlayerChannel
         if let existing = channels[ssrc] {
             ch = existing
@@ -261,23 +293,24 @@ final class VoiceAudio {
             engine.connect(c.node, to: engine.mainMixerNode, format: format)
             ch = c
         }
+
+        pendingLock.lock()
         if ch.pending > 25 {
             // Очередь разрослась: пропускаем, чтобы не копить задержку.
-            lock.unlock()
+            pendingLock.unlock()
             return
         }
         ch.pending += 1
         let pendingNow = ch.pending
-        let isRunning = engine.isRunning
-        lock.unlock()
+        pendingLock.unlock()
 
         ch.node.scheduleBuffer(buffer, completionCallbackType: .dataPlayedBack) { [weak self, weak ch] _ in
             guard let self, let ch else { return }
-            self.lock.lock()
+            self.pendingLock.lock()
             ch.pending -= 1
-            self.lock.unlock()
+            self.pendingLock.unlock()
         }
-        if !ch.node.isPlaying && pendingNow >= 3 && isRunning {
+        if !ch.node.isPlaying && pendingNow >= 3 {
             ch.node.play()
         }
     }

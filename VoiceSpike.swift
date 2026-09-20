@@ -33,6 +33,8 @@ final class VoiceGateway {
     var onMicLevel: ((Float) -> Void)?
     var vadThreshold: () -> Double = { -45 }
 
+    var transcriber: VoiceTranscriber?
+    private let videoProbe: Bool
     private let audio: VoiceAudio
     private let micAllowed: Bool
     private var ownSsrc: UInt32 = 0
@@ -41,7 +43,8 @@ final class VoiceGateway {
 
     init(endpoint: String, serverId: String, channelId: String, userId: String, sessionId: String, token: String,
          session: URLSession, daveVersion: Int, audio: VoiceAudio, micAllowed: Bool,
-         muted: Bool, deafened: Bool) {
+         muted: Bool, deafened: Bool, videoProbe: Bool) {
+        self.videoProbe = videoProbe
         self.channelId = channelId
         self.audio = audio
         self.micAllowed = micAllowed
@@ -173,10 +176,7 @@ final class VoiceGateway {
         case 5:
             let uid = d["user_id"] as? String
             let ssrc = d["ssrc"] as? Int
-            let uidText: String = uid ?? "?"
-            let ssrcText: String = ssrc.map { String($0) } ?? "?"
-            let flagsText: String = String(d["speaking"] as? Int ?? -1)
-            log("op 5 Speaking: \(uidText), ssrc \(ssrcText), флаги \(flagsText)")
+            log("op 5 Speaking: \(uid ?? "?"), ssrc \(ssrc.map { String($0) } ?? "?"), флаги \(d["speaking"] as? Int ?? -1)")
             if let uid, let ssrc {
                 let s = UInt32(truncatingIfNeeded: ssrc)
                 ssrcMap[s] = uid
@@ -222,14 +222,15 @@ final class VoiceGateway {
     }
 
     private func identify() {
-        let d: [String: Any] = [
+        var d: [String: Any] = [
             "server_id": serverId,
             "user_id": userId,
             "session_id": sessionId,
             "token": token,
             "max_dave_protocol_version": daveVersion
         ]
-        log("Отправляю Identify (op 0), DAVE v\(daveVersion)")
+        if videoProbe { d["video"] = true }
+        log("Отправляю Identify (op 0), DAVE v\(daveVersion)\(videoProbe ? ", video: true (диагностика)" : "")")
         send(["op": 0, "d": d])
     }
 
@@ -349,6 +350,8 @@ final class VoiceGateway {
                 micAllowed: micAllowed
             )
             m.log = { [weak self] s in self?.log(s) }
+            m.transcriber = transcriber
+            m.ownUserId = userId
             m.onAudio = { [weak self] uid in self?.onAudio?(uid) }
             m.onLocalSpeaking = { [weak self] on in self?.onLocalSpeaking?(on) }
             m.onMicLevel = { [weak self] db in self?.onMicLevel?(db) }
@@ -429,6 +432,38 @@ final class VoiceSharedSettings {
 struct VoiceFlags {
     var mute = false
     var deaf = false
+    var video = false
+    var stream = false
+}
+
+struct Caption: Identifiable {
+    let id = UUID()
+    var userId: String
+    var text: String
+    var isFinal: Bool
+    var date: Date
+}
+
+struct TranscriptLanguage: Identifiable {
+    let code: String
+    let name: String
+    var id: String { code }
+
+    static let all: [TranscriptLanguage] = [
+        TranscriptLanguage(code: "en-US", name: "English"),
+        TranscriptLanguage(code: "ru-RU", name: "Русский"),
+        TranscriptLanguage(code: "es-ES", name: "Español"),
+        TranscriptLanguage(code: "pt-BR", name: "Português"),
+        TranscriptLanguage(code: "fr-FR", name: "Français"),
+        TranscriptLanguage(code: "de-DE", name: "Deutsch"),
+        TranscriptLanguage(code: "it-IT", name: "Italiano"),
+        TranscriptLanguage(code: "pl-PL", name: "Polski"),
+        TranscriptLanguage(code: "tr-TR", name: "Türkçe"),
+        TranscriptLanguage(code: "uk-UA", name: "Українська"),
+        TranscriptLanguage(code: "ja-JP", name: "日本語"),
+        TranscriptLanguage(code: "ko-KR", name: "한국어"),
+        TranscriptLanguage(code: "zh-CN", name: "中文")
+    ]
 }
 
 @MainActor
@@ -451,6 +486,23 @@ final class VoiceSpike: ObservableObject {
     @Published var micLevelDb: Double = -90
     @Published var micAllowed = true
     @Published var encrypted = false
+    @Published var captionsEnabled = false
+    @Published var captionLang = "en-US"
+    @Published var captionStatus = ""
+    @Published var captions: [Caption] = []
+    @Published var captionsVersion = 0
+    @Published var videoProbe = false
+
+    let transcriber = VoiceTranscriber()
+
+    init() {
+        transcriber.onUpdate = { [weak self] u in
+            Task { @MainActor in self?.handleTranscript(u) }
+        }
+        transcriber.onStatus = { [weak self] s in
+            Task { @MainActor in self?.captionStatus = s }
+        }
+    }
 
     /// Когда последний раз слышали пользователя (читается из TimelineView, поэтому не @Published).
     var lastHeard: [String: Date] = [:]
@@ -552,6 +604,7 @@ final class VoiceSpike: ObservableObject {
         encrypted = false
         flags = [:]
         lastHeard = [:]
+        captions = []
         updateParticipants([])
 
         let cid = channel.id
@@ -588,6 +641,7 @@ final class VoiceSpike: ObservableObject {
         flags = [:]
         lastHeard = [:]
         micLevelDb = -90
+        transcriber.reset()
         if !silent { add("Отключился") }
     }
 
@@ -623,6 +677,46 @@ final class VoiceSpike: ObservableObject {
         hasPendingLeave = false
         add("Связь восстановлена, повторяю выход из голосового канала")
         sendLeave(guildId: pendingLeaveGuild, silent: false)
+    }
+
+    // MARK: Субтитры
+
+    func setCaptions(_ on: Bool) {
+        if !on {
+            captionsEnabled = false
+            transcriber.configure(enabled: false, locale: captionLang)
+            return
+        }
+        Task { [weak self] in
+            guard let self else { return }
+            let ok = await VoiceTranscriber.requestAuthorization()
+            if ok {
+                self.captionsEnabled = true
+                self.transcriber.configure(enabled: true, locale: self.captionLang)
+            } else {
+                self.captionsEnabled = false
+                self.captionStatus = "Нет доступа к распознаванию речи. Разреши в Настройки → DiscClient."
+            }
+        }
+    }
+
+    func setCaptionLanguage(_ code: String) {
+        captionLang = code
+        if captionsEnabled {
+            transcriber.configure(enabled: true, locale: code)
+        }
+    }
+
+    func handleTranscript(_ u: VoiceTranscriber.Update) {
+        if let idx = captions.lastIndex(where: { $0.userId == u.userId }), !captions[idx].isFinal {
+            captions[idx].text = u.text
+            captions[idx].isFinal = u.isFinal
+            captions[idx].date = Date()
+        } else {
+            captions.append(Caption(userId: u.userId, text: u.text, isFinal: u.isFinal, date: Date()))
+        }
+        if captions.count > 60 { captions.removeFirst(captions.count - 60) }
+        captionsVersion += 1
     }
 
     // MARK: Микрофон, наушники, маршрут звука
@@ -688,7 +782,12 @@ final class VoiceSpike: ObservableObject {
             if let uid, channel == activeChannelId {
                 let mute = (d["self_mute"] as? Bool ?? false) || (d["mute"] as? Bool ?? false)
                 let deaf = (d["self_deaf"] as? Bool ?? false) || (d["deaf"] as? Bool ?? false)
-                flags[uid] = VoiceFlags(mute: mute, deaf: deaf)
+                flags[uid] = VoiceFlags(
+                    mute: mute,
+                    deaf: deaf,
+                    video: d["self_video"] as? Bool ?? false,
+                    stream: d["self_stream"] as? Bool ?? false
+                )
                 if users[uid] == nil,
                    let member = d["member"] as? [String: Any],
                    let userObj = member["user"] as? [String: Any],
@@ -728,8 +827,10 @@ final class VoiceSpike: ObservableObject {
             audio: audio,
             micAllowed: micAllowed,
             muted: muted,
-            deafened: deafened
+            deafened: deafened,
+            videoProbe: videoProbe
         )
+        vg.transcriber = transcriber
         let settings = shared
         vg.vadThreshold = { settings.vad }
         vg.onLog = { [weak self] s in
