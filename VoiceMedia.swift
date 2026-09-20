@@ -30,7 +30,7 @@ final class OpusDecoderBox {
         var pcm = [Float](repeating: 0, count: maxFrames * 2)
         let n: Int32 = data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) -> Int32 in
             pcm.withUnsafeMutableBufferPointer { out -> Int32 in
-                opus_decode_float(d, raw.bindMemory(to: UInt8.self).baseAddress, Int32(data.count), out.baseAddress, Int32(maxFrames), 0)
+                opus_decode_float(d, raw.bindMemory(to: UInt8.self).baseAddress, Int32(data.count), out.baseAddress!, Int32(maxFrames), 0)
             }
         }
         guard n > 0 else { return nil }
@@ -63,7 +63,7 @@ final class OpusEncoderBox {
         var out = [UInt8](repeating: 0, count: 1500)
         let n: Int32 = pcm.withUnsafeBufferPointer { p -> Int32 in
             out.withUnsafeMutableBufferPointer { o -> Int32 in
-                opus_encode_float(e, p.baseAddress, 960, o.baseAddress, Int32(o.count))
+                opus_encode_float(e, p.baseAddress!, 960, o.baseAddress!, Int32(o.count))
             }
         }
         guard n > 0 else { return nil }
