@@ -16,8 +16,8 @@ struct RootView: View {
 
 struct LoginView: View {
     @EnvironmentObject var store: Store
+    @State private var token = ""
     @State private var showWeb = false
-
 
     var body: some View {
         NavigationStack {
@@ -70,7 +70,6 @@ struct LoginView: View {
                 }
                 .ignoresSafeArea()
             }
-
         }
     }
 }
@@ -165,7 +164,6 @@ struct ChatView: View {
         .navigationBarTitleDisplayMode(.inline)
         .task {
             await store.loadMessages(channel.id)
-            // Запасное обновление на случай, если Gateway не доставил сообщение.
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 4_000_000_000)
                 await store.loadMessages(channel.id)
