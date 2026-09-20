@@ -15,9 +15,13 @@ targets:
     dependencies:
       - package: SwiftOGG
         product: SwiftOGG
+    configFiles:
+      Debug: Vendor/dave-link.xcconfig
+      Release: Vendor/dave-link.xcconfig
     settings:
       base:
         SWIFT_VERSION: "5.0"
+        SWIFT_OBJC_BRIDGING_HEADER: DiscClient-Bridging-Header.h
         PRODUCT_BUNDLE_IDENTIFIER: com.example.discclient
         MARKETING_VERSION: "0.1"
         CURRENT_PROJECT_VERSION: "1"

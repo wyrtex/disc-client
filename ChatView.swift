@@ -549,7 +549,6 @@ struct MessageRow: View {
     let onReact: (EmojiRef) -> Void
 
     @State private var dragX: CGFloat = 0
-    @State private var showOriginal = false
 
     var body: some View {
         ZStack(alignment: .trailing) {
@@ -606,26 +605,10 @@ struct MessageRow: View {
                 }
                 VStack(alignment: .leading, spacing: 4) {
                     if showHeader { header }
-                    if let tr = translation, !showOriginal {
+                    if let tr = translation {
                         RichText(raw: tr.text, mentions: message.mentions)
                     } else if !message.content.isEmpty {
                         RichText(raw: message.content, mentions: message.mentions)
-                    }
-                    if let tr = translation {
-                        Button {
-                            showOriginal.toggle()
-                        } label: {
-                            HStack(spacing: 4) {
-                                Image(systemName: "character.bubble")
-                                    .font(.system(size: 10))
-                                Text(showOriginal
-                                     ? "показать перевод"
-                                     : "переведено с \(Languages.name(tr.sourceCode).lowercased()) · оригинал")
-                                    .font(.system(size: 11))
-                            }
-                            .foregroundStyle(Theme.muted)
-                        }
-                        .buttonStyle(.plain)
                     }
                     if let f = message.forwarded { forwardedBlock(f) }
                     ForEach(message.attachments) { a in

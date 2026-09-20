@@ -477,6 +477,18 @@ struct VoiceDebugView: View {
                 .foregroundStyle(Theme.muted)
                 .frame(maxWidth: .infinity, alignment: .leading)
 
+            Button {
+                voice.add("DAVE в сборке: \(DaveLib.isBuiltIn ? "да" : "нет")")
+                for line in DaveLib.selfTest() { voice.add(line) }
+            } label: {
+                Text("Проверить библиотеку DAVE")
+                    .font(.system(size: 14, weight: .semibold))
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 10)
+                    .background(Theme.input, in: RoundedRectangle(cornerRadius: 10))
+                    .foregroundStyle(Theme.text)
+            }
+
             Picker("DAVE", selection: $voice.daveVersion) {
                 Text("DAVE 0 (без E2EE)").tag(0)
                 Text("DAVE 1 (заявить поддержку)").tag(1)
