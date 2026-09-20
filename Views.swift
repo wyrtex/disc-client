@@ -16,7 +16,8 @@ struct RootView: View {
 
 struct LoginView: View {
     @EnvironmentObject var store: Store
-    @State private var token = ""
+    @State private var showWeb = false
+
 
     var body: some View {
         NavigationStack {
@@ -57,6 +58,19 @@ struct LoginView: View {
                 }
             }
             .navigationTitle("DiscClient")
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("Через браузер") { showWeb = true }
+                }
+            }
+            .sheet(isPresented: $showWeb) {
+                WebLoginView { t in
+                    showWeb = false
+                    Task { await store.login(token: t) }
+                }
+                .ignoresSafeArea()
+            }
+
         }
     }
 }
