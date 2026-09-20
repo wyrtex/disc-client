@@ -1,7 +1,9 @@
 import SwiftUI
+import Translation
 
 struct MainView: View {
     @EnvironmentObject var store: Store
+    @EnvironmentObject var translator: Translator
     @State private var selection: String? = nil   // nil = личные сообщения
     @State private var collapsed: Set<String> = []
     @State private var confirmLogout = false
@@ -27,6 +29,9 @@ struct MainView: View {
                 }
             }
             .toolbar(.hidden, for: .navigationBar)
+        }
+        .translationTask(translator.configuration) { session in
+            await translator.run(session)
         }
         .confirmationDialog("Аккаунт", isPresented: $confirmLogout, titleVisibility: .hidden) {
             Button("Выйти из аккаунта", role: .destructive) { store.logout() }

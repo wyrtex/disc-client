@@ -16,6 +16,7 @@ struct ViewerItem: Identifiable {
 struct ChatView: View {
     @EnvironmentObject var store: Store
     @Environment(\.dismiss) private var dismiss
+    @EnvironmentObject var translator: Translator
     let channel: Channel
 
     @State private var text = ""
@@ -31,8 +32,35 @@ struct ChatView: View {
     @State private var actionMessage: Message?
     @State private var profileUser: User?
     @StateObject private var recorder = VoiceRecorder()
+    @State private var showTranslate = false
 
     private var guildId: String? { store.guildID(of: channel) }
+
+    private var tset: ChannelTranslateSettings {
+        translator.settings[channel.id] ?? ChannelTranslateSettings()
+    }
+
+    private struct TranslateKey: Equatable {
+        let enabled: Bool
+        let count: Int
+        let target: String
+        let last: String?
+        let total: Int
+        let sheet: Bool
+    }
+
+    private var translateKey: TranslateKey {
+        let msgs = store.messages[channel.id] ?? []
+        let s = tset
+        return TranslateKey(
+            enabled: s.incomingEnabled,
+            count: s.count,
+            target: s.incomingTarget,
+            last: msgs.last?.id,
+            total: msgs.count,
+            sheet: showTranslate
+        )
+    }
 
     private var canSend: Bool {
         !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !pending.isEmpty
@@ -47,6 +75,11 @@ struct ChatView: View {
                     .environmentObject(store)
             }
             .sheet(isPresented: $showEmoji) { emojiSheet }
+            .sheet(isPresented: $showTranslate) {
+                TranslateSettingsSheet(channelId: channel.id)
+                    .environmentObject(translator)
+            }
+            .task(id: translateKey) { await runIncomingTranslation() }
             .fullScreenCover(item: $viewer) { item in viewerCover(item) }
             .task { await poll() }
             .onAppear { store.lastChannel = channel }
@@ -160,8 +193,17 @@ struct ChatView: View {
 
     // MARK: - Список сообщений
 
+    private func runIncomingTranslation() async {
+        let s = tset
+        guard s.incomingEnabled, !showTranslate else { return }
+        let window = Array((store.messages[channel.id] ?? []).suffix(s.count))
+        await translator.translateIncoming(window, target: s.incomingTarget)
+    }
+
     private func messageList(_ msgs: [Message]) -> some View {
-        ScrollViewReader { proxy in
+        let s = tset
+        let shown: Set<String> = s.incomingEnabled ? Set(msgs.suffix(s.count).map { $0.id }) : []
+        return ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 0) {
                     ForEach(Array(msgs.enumerated()), id: \.element.id) { i, m in
@@ -169,6 +211,9 @@ struct ChatView: View {
                         MessageRow(
                             message: m,
                             showHeader: header,
+                            translation: shown.contains(m.id)
+                                ? translator.incoming[translator.cacheKey(m, s.incomingTarget)]
+                                : nil,
                             onImage: { url in viewer = ViewerItem(url: url) },
                             onProfile: { u in profileUser = u },
                             onReply: { replyTo = m },
@@ -296,6 +341,15 @@ struct ChatView: View {
                 .padding(.leading, 14)
 
                 Button {
+                    showTranslate = true
+                } label: {
+                    Image(systemName: "character.bubble")
+                        .font(.system(size: 20))
+                        .foregroundStyle(tset.incomingEnabled || tset.outgoingEnabled ? Theme.blurple : Theme.muted)
+                        .frame(width: 32, height: 40)
+                }
+
+                Button {
                     showEmoji = true
                 } label: {
                     Image(systemName: "face.smiling")
@@ -415,8 +469,19 @@ struct ChatView: View {
         sending = true
         let files = pending.map { $0.file }
         let replyId = replyTo?.id
+        let s = tset
         Task {
-            let ok = await store.send(t, files: files, to: channel.id, replyTo: replyId)
+            var outText = t
+            if s.outgoingEnabled, !t.isEmpty {
+                if let translated = await translator.translateOutgoing(t, to: s.outgoingLang) {
+                    outText = translated
+                } else {
+                    sending = false
+                    store.error = "Не удалось перевести сообщение. Проверь, что языковые пакеты скачаны (Настройки → Приложения → Перевод), или выключи перевод моих сообщений."
+                    return
+                }
+            }
+            let ok = await store.send(outText, files: files, to: channel.id, replyTo: replyId)
             sending = false
             if ok {
                 text = ""
@@ -476,6 +541,7 @@ struct ChatView: View {
 struct MessageRow: View {
     let message: Message
     let showHeader: Bool
+    let translation: TranslatedText?
     let onImage: (URL) -> Void
     let onProfile: (User) -> Void
     let onReply: () -> Void
@@ -483,6 +549,7 @@ struct MessageRow: View {
     let onReact: (EmojiRef) -> Void
 
     @State private var dragX: CGFloat = 0
+    @State private var showOriginal = false
 
     var body: some View {
         ZStack(alignment: .trailing) {
@@ -539,8 +606,26 @@ struct MessageRow: View {
                 }
                 VStack(alignment: .leading, spacing: 4) {
                     if showHeader { header }
-                    if !message.content.isEmpty {
+                    if let tr = translation, !showOriginal {
+                        RichText(raw: tr.text, mentions: message.mentions)
+                    } else if !message.content.isEmpty {
                         RichText(raw: message.content, mentions: message.mentions)
+                    }
+                    if let tr = translation {
+                        Button {
+                            showOriginal.toggle()
+                        } label: {
+                            HStack(spacing: 4) {
+                                Image(systemName: "character.bubble")
+                                    .font(.system(size: 10))
+                                Text(showOriginal
+                                     ? "показать перевод"
+                                     : "переведено с \(Languages.name(tr.sourceCode).lowercased()) · оригинал")
+                                    .font(.system(size: 11))
+                            }
+                            .foregroundStyle(Theme.muted)
+                        }
+                        .buttonStyle(.plain)
                     }
                     if let f = message.forwarded { forwardedBlock(f) }
                     ForEach(message.attachments) { a in
