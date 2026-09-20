@@ -1,14 +1,19 @@
 import Foundation
 
 /// Подключение к Discord Gateway: новые сообщения и голосовые события в реальном времени.
+/// Умеет восстанавливать сессию (resume), чтобы после сворачивания приложения не терять состояние.
 final class Gateway {
     private let token: String
     private let session: URLSession
     private var task: URLSessionWebSocketTask?
     private var seq: Int?
+    private var sessionId: String?
+    private var resumeURL: String?
+    private var resuming = false
     private var heartbeatTask: Task<Void, Never>?
     private var stopped = false
     private var retryDelay: Double = 3
+    private var generation = 0
     private(set) var isReady = false
 
     var onMessage: ((Message) -> Void)?
@@ -17,6 +22,8 @@ final class Gateway {
     /// Имя любого пришедшего события (для диагностики).
     var onDispatchName: ((String) -> Void)?
     var onLog: ((String) -> Void)?
+    /// Вызывается, когда шлюз готов (READY или RESUMED).
+    var onReady: (() -> Void)?
 
     init(token: String, session: URLSession) {
         self.token = token
@@ -32,22 +39,46 @@ final class Gateway {
 
     func stop() {
         stopped = true
+        generation += 1
         heartbeatTask?.cancel()
         task?.cancel(with: .goingAway, reason: nil)
         task = nil
         isReady = false
     }
 
+    /// Проверка связи после возвращения в приложение.
+    func ensureConnected() {
+        guard !stopped else { return }
+        guard let t = task else {
+            generation += 1
+            retryDelay = 3
+            connect()
+            return
+        }
+        t.sendPing { [weak self] err in
+            if err != nil {
+                self?.log("Gateway: связь потеряна, переподключаюсь")
+                self?.reconnect(after: 0)
+            }
+        }
+    }
+
     private func connect() {
-        guard let url = URL(string: "wss://gateway.discord.gg/?v=9&encoding=json") else { return }
+        var urlString = "wss://gateway.discord.gg/?v=9&encoding=json"
+        resuming = false
+        if sessionId != nil, seq != nil, let base = resumeURL {
+            urlString = base + "/?v=9&encoding=json"
+            resuming = true
+        }
+        guard let url = URL(string: urlString) else { return }
         let t = session.webSocketTask(with: url)
         // Первое сообщение (READY) у пользовательского аккаунта на несколько мегабайт,
         // стандартный лимит iOS в 1 МБ обрывает соединение.
         t.maximumMessageSize = 64 * 1024 * 1024
         task = t
-        seq = nil
+        if !resuming { seq = nil }
         isReady = false
-        log("Gateway: подключаюсь")
+        log(resuming ? "Gateway: подключаюсь (восстановление сессии)" : "Gateway: подключаюсь")
         t.resume()
         receive(on: t)
     }
@@ -58,7 +89,7 @@ final class Gateway {
             switch result {
             case .failure(let err):
                 self.log("Gateway: соединение оборвалось (код \(t.closeCode.rawValue)): \(err.localizedDescription)")
-                self.reconnect()
+                self.reconnect(after: nil)
             case .success(let message):
                 if case .string(let s) = message { self.handle(s) }
                 self.receive(on: t)
@@ -66,17 +97,26 @@ final class Gateway {
         }
     }
 
-    private func reconnect() {
+    /// after == nil: пауза растёт от 3 до 60 секунд.
+    private func reconnect(after fixed: Double?) {
         guard !stopped else { return }
+        generation += 1
+        let gen = generation
         heartbeatTask?.cancel()
         task?.cancel(with: .goingAway, reason: nil)
         task = nil
         isReady = false
-        let delay = retryDelay
-        retryDelay = min(retryDelay * 2, 60)
+
+        let delay: Double
+        if let fixed {
+            delay = fixed
+        } else {
+            delay = retryDelay
+            retryDelay = min(retryDelay * 2, 60)
+        }
         log("Gateway: переподключение через \(Int(delay)) с")
         DispatchQueue.global().asyncAfter(deadline: .now() + delay) { [weak self] in
-            guard let self, !self.stopped else { return }
+            guard let self, !self.stopped, self.generation == gen else { return }
             self.connect()
         }
     }
@@ -91,24 +131,42 @@ final class Gateway {
         case 10:
             let d = obj["d"] as? [String: Any]
             let interval = (d?["heartbeat_interval"] as? Double) ?? 41250
-            log("Gateway: Hello, отправляю Identify")
             startHeartbeat(interval: interval)
-            identify()
+            if resuming {
+                log("Gateway: Hello, восстанавливаю сессию")
+                sendResume()
+            } else {
+                log("Gateway: Hello, отправляю Identify")
+                identify()
+            }
         case 1:
             sendHeartbeat()
         case 7:
             log("Gateway: сервер просит переподключиться (op 7)")
-            reconnect()
+            reconnect(after: 1)
         case 9:
-            log("Gateway: сессия недействительна (op 9)")
-            reconnect()
+            log("Gateway: сессия недействительна (op 9), начинаю заново")
+            sessionId = nil
+            resumeURL = nil
+            seq = nil
+            reconnect(after: 2)
         case 0:
             let t = obj["t"] as? String ?? ""
             onDispatchName?(t)
             if t == "READY" {
+                if let d = obj["d"] as? [String: Any] {
+                    sessionId = d["session_id"] as? String
+                    resumeURL = d["resume_gateway_url"] as? String
+                }
                 isReady = true
                 retryDelay = 3
                 log("Gateway: READY получен (\(text.utf8.count / 1024) КБ)")
+                onReady?()
+            } else if t == "RESUMED" {
+                isReady = true
+                retryDelay = 3
+                log("Gateway: сессия восстановлена")
+                onReady?()
             }
             if t == "MESSAGE_CREATE",
                let d = obj["d"],
@@ -134,6 +192,15 @@ final class Gateway {
         ])
     }
 
+    private func sendResume() {
+        let d: [String: Any] = [
+            "token": token,
+            "session_id": sessionId ?? "",
+            "seq": seq ?? 0
+        ]
+        send(["op": 6, "d": d])
+    }
+
     private func startHeartbeat(interval: Double) {
         heartbeatTask?.cancel()
         heartbeatTask = Task { [weak self] in
@@ -150,14 +217,14 @@ final class Gateway {
         send(["op": 1, "d": value])
     }
 
-    /// Отправка произвольного пакета (например, вход в голосовой канал). Возвращает false, если шлюз не готов.
+    /// Отправка произвольного пакета (например, вход в голосовой канал). Возвращает false, если шлюз не подключён.
     @discardableResult
     func sendRaw(_ obj: [String: Any]) -> Bool {
         guard task != nil else {
             log("Gateway: не подключён, пакет не отправлен")
             return false
         }
-        if !isReady { log("Gateway: READY ещё не получен, отправляю всё равно") }
+        if !isReady { log("Gateway: готовность ещё не подтверждена, отправляю всё равно") }
         send(obj)
         return true
     }

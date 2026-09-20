@@ -93,6 +93,11 @@ final class Store: ObservableObject {
         Keychain.delete()
     }
 
+    /// Приложение вернулось на экран: проверяем, жив ли Gateway.
+    func appBecameActive() {
+        gateway?.ensureConnected()
+    }
+
     private func startGateway(token: String, session: URLSession) {
         gateway?.stop()
         let gw = Gateway(token: token, session: session)
@@ -111,7 +116,11 @@ final class Store: ObservableObject {
         gw.onLog = { [weak self] s in
             Task { @MainActor in self?.voice.addGateway(s) }
         }
+        gw.onReady = { [weak self] in
+            Task { @MainActor in self?.voice.gatewayReady() }
+        }
         voice.sendGateway = { [weak gw] obj in gw?.sendRaw(obj) ?? false }
+        voice.ensureGateway = { [weak gw] in gw?.ensureConnected() }
         gw.start()
         gateway = gw
     }

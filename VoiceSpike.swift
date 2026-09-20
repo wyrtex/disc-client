@@ -5,7 +5,7 @@ import SwiftUI
 // MARK: - Голосовой шлюз (диагностика)
 
 /// Проходит по шагам подключения к голосовому серверу Discord и пишет всё в лог.
-/// Звук пока не отправляется и не принимается, задача: выяснить, пустит ли Discord наш клиент.
+/// Звук пока не отправляется и не принимается, задача: выяснить, что именно требует Discord.
 final class VoiceGateway {
     private let endpoint: String
     private let serverId: String
@@ -13,6 +13,7 @@ final class VoiceGateway {
     private let sessionId: String
     private let token: String
     private let session: URLSession
+    private let daveVersion: Int
 
     private var task: URLSessionWebSocketTask?
     private var seq: Int = -1
@@ -22,13 +23,15 @@ final class VoiceGateway {
     var onLog: ((String) -> Void)?
     var onState: ((String) -> Void)?
 
-    init(endpoint: String, serverId: String, userId: String, sessionId: String, token: String, session: URLSession) {
+    init(endpoint: String, serverId: String, userId: String, sessionId: String, token: String,
+         session: URLSession, daveVersion: Int) {
         self.endpoint = endpoint
         self.serverId = serverId
         self.userId = userId
         self.sessionId = sessionId
         self.token = token
         self.session = session
+        self.daveVersion = daveVersion
     }
 
     private func log(_ s: String) { onLog?(s) }
@@ -42,6 +45,7 @@ final class VoiceGateway {
         }
         log("Voice WS: подключаюсь к \(ep)")
         let t = session.webSocketTask(with: url)
+        t.maximumMessageSize = 16 * 1024 * 1024
         task = t
         t.resume()
         receive(on: t)
@@ -71,7 +75,8 @@ final class VoiceGateway {
                     self.handle(s)
                 case .data(let d):
                     let op = d.count > 2 ? Int(d[2]) : -1
-                    self.log("Бинарное сообщение: \(d.count) байт, op \(op)")
+                    let head = d.prefix(12).map { String(format: "%02x", $0) }.joined()
+                    self.log("Бинарное сообщение: \(d.count) байт, op \(op), начало \(head)")
                 @unknown default:
                     break
                 }
@@ -94,7 +99,7 @@ final class VoiceGateway {
         case 4014: return "Отключён (канал удалён или кикнули)."
         case 4015: return "Голосовой сервер упал."
         case 4016: return "Неизвестный режим шифрования."
-        case 4017: return "Вероятно, требуется E2EE-протокол DAVE."
+        case 4017: return "Требуется E2EE-протокол DAVE."
         case 4020: return "Плохой запрос."
         case 4021: return "Превышен лимит запросов."
         case 4022: return "Звонок завершён."
@@ -127,21 +132,22 @@ final class VoiceGateway {
             log("op 9 Resumed")
         case 11, 13, 18, 20:
             log("op \(op): \(d)")
+        case 21, 22, 24, 31:
+            log("DAVE op \(op): \(d)")
         default:
-            log("op \(op)")
+            log("op \(op): \(d)")
         }
     }
 
     private func identify() {
-        // max_dave_protocol_version = 0: честно говорим, что E2EE-протокол не поддерживаем.
         let d: [String: Any] = [
             "server_id": serverId,
             "user_id": userId,
             "session_id": sessionId,
             "token": token,
-            "max_dave_protocol_version": 0
+            "max_dave_protocol_version": daveVersion
         ]
-        log("Отправляю Identify (op 0)")
+        log("Отправляю Identify (op 0), DAVE v\(daveVersion)")
         send(["op": 0, "d": d])
     }
 
@@ -261,8 +267,10 @@ final class VoiceSpike: ObservableObject {
     @Published var status = "Не подключено"
     @Published var activeChannelId: String?
     @Published var gwLog: [String] = []
+    @Published var daveVersion = 1
 
     var sendGateway: (([String: Any]) -> Bool)?
+    var ensureGateway: (() -> Void)?
     var userId = ""
     var session: URLSession = .shared
 
@@ -270,6 +278,11 @@ final class VoiceSpike: ObservableObject {
     private var sessionId: String?
     private var server: (token: String, endpoint: String)?
     private var gateway: VoiceGateway?
+
+    private var awaitingLeave = false
+    private var hasPendingLeave = false
+    private var pendingLeaveGuild: String?
+    private var leaveRetries = 0
 
     private static let timeFormatter: DateFormatter = {
         let f = DateFormatter()
@@ -300,7 +313,7 @@ final class VoiceSpike: ObservableObject {
         add("Событие Gateway: \(t)")
     }
 
-    private func voiceStatePacket(channelId: String?) -> [String: Any] {
+    private func voiceStatePacket(guildId: String?, channelId: String?) -> [String: Any] {
         var d: [String: Any] = [
             "self_mute": true,
             "self_deaf": false,
@@ -319,8 +332,9 @@ final class VoiceSpike: ObservableObject {
         server = nil
         activeChannelId = channelId
         status = "Подключаюсь…"
-        add("Запрашиваю вход в канал (op 4)")
-        let sent = sendGateway?(voiceStatePacket(channelId: channelId)) ?? false
+        add("Запрашиваю вход в канал (op 4), DAVE v\(daveVersion)")
+        ensureGateway?()
+        let sent = sendGateway?(voiceStatePacket(guildId: guildId, channelId: channelId)) ?? false
         add(sent ? "op 4 отправлен" : "op 4 НЕ отправлен: основной шлюз не подключён")
 
         Task { [weak self] in
@@ -334,19 +348,63 @@ final class VoiceSpike: ObservableObject {
         gateway?.stop()
         gateway = nil
         if activeChannelId != nil {
-            let sent = sendGateway?(voiceStatePacket(channelId: nil)) ?? false
-            if !silent { add(sent ? "op 4 (выход) отправлен" : "op 4 (выход) НЕ отправлен: шлюз не подключён") }
+            leaveRetries = 0
+            sendLeave(guildId: guildId, silent: silent)
         }
         activeChannelId = nil
         status = "Не подключено"
         if !silent { add("Отключился") }
     }
 
+    /// Выход из голосового канала с подтверждением. Если шлюз мёртв, выход откладывается до восстановления связи.
+    private func sendLeave(guildId: String?, silent: Bool) {
+        ensureGateway?()
+        let sent = sendGateway?(voiceStatePacket(guildId: guildId, channelId: nil)) ?? false
+        if sent {
+            awaitingLeave = true
+            hasPendingLeave = false
+            if !silent { add("op 4 (выход) отправлен, жду подтверждения от Discord") }
+            Task { [weak self] in
+                try? await Task.sleep(nanoseconds: 5_000_000_000)
+                guard let self, self.awaitingLeave else { return }
+                self.awaitingLeave = false
+                if self.leaveRetries < 3 {
+                    self.hasPendingLeave = true
+                    self.pendingLeaveGuild = guildId
+                    if !silent { self.add("Выход не подтверждён, повторю при восстановлении связи") }
+                    self.ensureGateway?()
+                }
+            }
+        } else {
+            hasPendingLeave = true
+            pendingLeaveGuild = guildId
+            if !silent { add("Выход отложен: шлюз не подключён, отправлю при восстановлении связи") }
+        }
+    }
+
+    /// Основной шлюз снова готов: досылаем отложенный выход.
+    func gatewayReady() {
+        guard hasPendingLeave, leaveRetries < 3 else { return }
+        leaveRetries += 1
+        hasPendingLeave = false
+        add("Связь восстановлена, повторяю выход из голосового канала")
+        sendLeave(guildId: pendingLeaveGuild, silent: false)
+    }
+
     func handle(_ t: String, _ d: [String: Any]) {
+        if t == "VOICE_STATE_UPDATE",
+           (d["user_id"] as? String) == userId,
+           (d["channel_id"] as? String) == nil,
+           awaitingLeave {
+            awaitingLeave = false
+            hasPendingLeave = false
+            add("Discord подтвердил выход из канала")
+        }
         guard activeChannelId != nil else { return }
         switch t {
         case "VOICE_STATE_UPDATE":
-            if (d["user_id"] as? String) == userId, let sid = d["session_id"] as? String {
+            if (d["user_id"] as? String) == userId, let sid = d["session_id"] as? String,
+               (d["channel_id"] as? String) != nil {
                 sessionId = sid
                 add("VOICE_STATE_UPDATE: получил session_id")
                 tryConnect()
@@ -375,7 +433,8 @@ final class VoiceSpike: ObservableObject {
             userId: userId,
             sessionId: sid,
             token: server.token,
-            session: session
+            session: session,
+            daveVersion: daveVersion
         )
         vg.onLog = { [weak self] s in
             Task { @MainActor in self?.add(s) }
@@ -417,6 +476,13 @@ struct VoiceDebugView: View {
                 .font(.system(size: 12))
                 .foregroundStyle(Theme.muted)
                 .frame(maxWidth: .infinity, alignment: .leading)
+
+            Picker("DAVE", selection: $voice.daveVersion) {
+                Text("DAVE 0 (без E2EE)").tag(0)
+                Text("DAVE 1 (заявить поддержку)").tag(1)
+            }
+            .pickerStyle(.segmented)
+            .disabled(isActive)
 
             if !voice.gwLog.isEmpty {
                 Text("Основной шлюз:\n" + voice.gwLog.suffix(3).joined(separator: "\n"))
