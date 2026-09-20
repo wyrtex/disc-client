@@ -285,7 +285,10 @@ final class VoiceMedia {
         }
         guard bytes.count >= headerLen + 16 + 4 else { return nil }
 
-        let src = UInt32(bytes[8]) << 24 | UInt32(bytes[9]) << 16 | UInt32(bytes[10]) << 8 | UInt32(bytes[11])
+        var src: UInt32 = 0
+        for i in 8..<12 {
+            src = (src << 8) | UInt32(bytes[i])
+        }
         let tagStart = bytes.count - 4 - 16
         let cipher = Data(bytes[headerLen..<tagStart])
         let tag = Data(bytes[tagStart..<(bytes.count - 4)])

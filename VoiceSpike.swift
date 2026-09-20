@@ -173,7 +173,10 @@ final class VoiceGateway {
         case 5:
             let uid = d["user_id"] as? String
             let ssrc = d["ssrc"] as? Int
-            log("op 5 Speaking: \(uid ?? "?"), ssrc \(ssrc.map { String($0) } ?? "?"), флаги \(d["speaking"] as? Int ?? -1)")
+            let uidText: String = uid ?? "?"
+            let ssrcText: String = ssrc.map { String($0) } ?? "?"
+            let flagsText: String = String(d["speaking"] as? Int ?? -1)
+            log("op 5 Speaking: \(uidText), ssrc \(ssrcText), флаги \(flagsText)")
             if let uid, let ssrc {
                 let s = UInt32(truncatingIfNeeded: ssrc)
                 ssrcMap[s] = uid
