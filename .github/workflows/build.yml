@@ -8,21 +8,65 @@ jobs:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
+
       - name: Arrange sources
         run: |
           mkdir -p Sources
           mv *.swift Sources/
+
+      - name: Restore DAVE cache
+        id: dave-cache
+        uses: actions/cache@v4
+        with:
+          path: Vendor/dave
+          key: dave-ios-v1-${{ hashFiles('build-dave.sh') }}
+
+      - name: Build libdave (iOS)
+        if: steps.dave-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        run: bash build-dave.sh
+
+      - name: DAVE link config
+        run: |
+          mkdir -p Vendor
+          if [ -f Vendor/dave/lib/libdave.a ]; then
+            LIBS=""
+            for f in Vendor/dave/lib/*.a; do
+              n=$(basename "$f" .a)
+              n=${n#lib}
+              LIBS="$LIBS -l$n"
+            done
+            {
+              echo 'HEADER_SEARCH_PATHS = $(inherited) $(SRCROOT)/Vendor/dave/include'
+              echo "OTHER_LDFLAGS = \$(inherited) -L\$(SRCROOT)/Vendor/dave/lib$LIBS -lc++"
+              echo 'SWIFT_ACTIVE_COMPILATION_CONDITIONS = $(inherited) DAVE'
+            } > Vendor/dave-link.xcconfig
+            echo "### DAVE: библиотека собрана и подключена" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "// DAVE не собрана" > Vendor/dave-link.xcconfig
+            echo "### DAVE: библиотека НЕ собрана, приложение соберётся без неё" >> "$GITHUB_STEP_SUMMARY"
+            if [ -f "$RUNNER_TEMP/dave-build.log" ]; then
+              echo '```' >> "$GITHUB_STEP_SUMMARY"
+              tail -n 80 "$RUNNER_TEMP/dave-build.log" >> "$GITHUB_STEP_SUMMARY"
+              echo '```' >> "$GITHUB_STEP_SUMMARY"
+            fi
+          fi
+
       - name: Install XcodeGen
         run: brew install xcodegen
+
       - name: Generate project
         run: xcodegen generate
+
       - name: Build
         run: xcodebuild -project DiscClient.xcodeproj -scheme DiscClient -configuration Release -sdk iphoneos -derivedDataPath build CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" build
+
       - name: Package IPA
         run: |
           mkdir -p Payload
           cp -R build/Build/Products/Release-iphoneos/DiscClient.app Payload/
           zip -qr DiscClient.ipa Payload
+
       - uses: actions/upload-artifact@v4
         with:
           name: app-ipa
