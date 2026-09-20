@@ -10,6 +10,8 @@ final class Gateway {
     private var stopped = false
 
     var onMessage: ((Message) -> Void)?
+    /// Прочие события (сейчас только VOICE_*).
+    var onEvent: ((String, [String: Any]) -> Void)?
 
     init(token: String, session: URLSession) {
         self.token = token
@@ -78,11 +80,14 @@ final class Gateway {
         case 7, 9:
             reconnect()
         case 0:
-            if obj["t"] as? String == "MESSAGE_CREATE",
+            let t = obj["t"] as? String ?? ""
+            if t == "MESSAGE_CREATE",
                let d = obj["d"],
                let raw = try? JSONSerialization.data(withJSONObject: d),
                let msg = try? JSONDecoder().decode(Message.self, from: raw) {
                 onMessage?(msg)
+            } else if t.hasPrefix("VOICE_"), let d = obj["d"] as? [String: Any] {
+                onEvent?(t, d)
             }
         default:
             break
@@ -114,6 +119,11 @@ final class Gateway {
     private func sendHeartbeat() {
         let value: Any = seq.map { $0 as Any } ?? NSNull()
         send(["op": 1, "d": value])
+    }
+
+    /// Отправка произвольного пакета в основной Gateway (например, вход в голосовой канал).
+    func sendRaw(_ obj: [String: Any]) {
+        send(obj)
     }
 
     private func send(_ obj: [String: Any]) {

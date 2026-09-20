@@ -264,6 +264,29 @@ struct Attachment: Decodable, Identifiable {
     let width: Int?
     let height: Int?
     let content_type: String?
+    let duration_secs: Double?
+    let waveform: String?
+
+    var isVoice: Bool { waveform != nil }
+
+    var waveformBytes: [UInt8] {
+        guard let waveform, let d = Data(base64Encoded: waveform) else { return [] }
+        return [UInt8](d)
+    }
+
+    /// Столбики для отрисовки голосового сообщения, значения 0...1.
+    func bars(_ n: Int) -> [Double] {
+        let b = waveformBytes
+        guard !b.isEmpty, n > 0 else { return Array(repeating: 0.3, count: max(n, 0)) }
+        return (0..<n).map { i in
+            let start = i * b.count / n
+            let end = max(start + 1, (i + 1) * b.count / n)
+            let slice = b[start..<min(end, b.count)]
+            let sum = slice.reduce(0) { $0 + Int($1) }
+            let avg = Double(sum) / Double(max(1, slice.count))
+            return max(0.08, min(1, avg / 255))
+        }
+    }
 
     var isImage: Bool {
         if let t = content_type { return t.hasPrefix("image/") }

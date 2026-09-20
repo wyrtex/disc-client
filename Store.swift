@@ -1,5 +1,6 @@
 import Foundation
 import SwiftUI
+import SwiftOGG
 
 @MainActor
 final class Store: ObservableObject {
@@ -27,6 +28,7 @@ final class Store: ObservableObject {
     }
 
     var lastChannel: Channel?
+    let voice = VoiceSpike()
     private(set) var api: API?
     private var gateway: Gateway?
 
@@ -61,6 +63,8 @@ final class Store: ObservableObject {
             self.guilds = g
             self.dms = d.sorted { (UInt64($0.last_message_id ?? "0") ?? 0) > (UInt64($1.last_message_id ?? "0") ?? 0) }
             ImageLoader.shared.session = api.session
+            voice.session = api.session
+            voice.userId = me.id
             Keychain.save(clean)
             startGateway(token: clean, session: api.session)
         } catch {
@@ -69,6 +73,7 @@ final class Store: ObservableObject {
     }
 
     func logout() {
+        voice.leave(silent: true)
         gateway?.stop()
         gateway = nil
         api = nil
@@ -97,6 +102,10 @@ final class Store: ObservableObject {
                 self.merge([msg], into: msg.channel_id)
             }
         }
+        gw.onEvent = { [weak self] t, d in
+            Task { @MainActor in self?.voice.handle(t, d) }
+        }
+        voice.sendGateway = { [weak gw] obj in gw?.sendRaw(obj) }
         gw.start()
         gateway = gw
     }
@@ -244,6 +253,36 @@ final class Store: ObservableObject {
             await loadMessages(m.channel_id, silent: true)
         } catch {
             self.error = error.localizedDescription
+        }
+    }
+
+    /// Голосовое сообщение: m4a -> OGG/Opus -> загрузка -> сообщение. Без каких-либо фильтров.
+    func sendVoice(_ rec: RecordedVoice, to channelId: String, replyTo: String? = nil) async -> Bool {
+        guard let api else { return false }
+        let src = rec.url
+        let dest = FileManager.default.temporaryDirectory
+            .appendingPathComponent("voice-\(UUID().uuidString).ogg")
+        defer {
+            try? FileManager.default.removeItem(at: dest)
+            try? FileManager.default.removeItem(at: src)
+        }
+        do {
+            try await Task.detached(priority: .userInitiated) {
+                try OGGConverter.convertM4aFileToOpusOGG(src: src, dest: dest)
+            }.value
+            let data = try Data(contentsOf: dest)
+            let m = try await api.sendVoiceMessage(
+                channelId: channelId,
+                ogg: data,
+                duration: rec.duration,
+                waveform: rec.waveformBase64,
+                replyTo: replyTo
+            )
+            merge([m], into: channelId)
+            return true
+        } catch {
+            self.error = "Голосовое сообщение: " + error.localizedDescription
+            return false
         }
     }
 

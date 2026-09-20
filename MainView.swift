@@ -112,7 +112,7 @@ struct ChannelPanel: View {
     let onUserTap: () -> Void
 
     @State private var showServer = false
-    @State private var showVoiceInfo = false
+    @State private var voiceChannel: Channel?
 
     private var guild: Guild? {
         store.guilds.first { $0.id == selection }
@@ -152,10 +152,9 @@ struct ChannelPanel: View {
                     .environmentObject(store)
             }
         }
-        .alert("Голосовые каналы", isPresented: $showVoiceInfo) {
-            Button("OK", role: .cancel) {}
-        } message: {
-            Text("Голосовые каналы и трибуны будут следующим этапом. Пока их нельзя открыть.")
+        .sheet(item: $voiceChannel) { ch in
+            VoiceDebugView(voice: store.voice, channel: ch, guildId: selection)
+                .environmentObject(store)
         }
     }
 
@@ -302,7 +301,7 @@ struct ChannelPanel: View {
             NavigationLink(value: ch) { rowLabel(ch, locked: false) }
                 .buttonStyle(.plain)
         } else {
-            Button { showVoiceInfo = true } label: { rowLabel(ch, locked: false) }
+            Button { voiceChannel = ch } label: { rowLabel(ch, locked: false) }
                 .buttonStyle(.plain)
         }
     }

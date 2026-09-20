@@ -30,6 +30,7 @@ struct ChatView: View {
     @State private var viewer: ViewerItem?
     @State private var actionMessage: Message?
     @State private var profileUser: User?
+    @StateObject private var recorder = VoiceRecorder()
 
     private var guildId: String? { store.guildID(of: channel) }
 
@@ -49,6 +50,7 @@ struct ChatView: View {
             .fullScreenCover(item: $viewer) { item in viewerCover(item) }
             .task { await poll() }
             .onAppear { store.lastChannel = channel }
+            .onDisappear { recorder.cancel() }
     }
 
     // MARK: - Каркас
@@ -58,7 +60,7 @@ struct ChatView: View {
             messageList(msgs)
             if let r = replyTo { replyBar(r) }
             if !pending.isEmpty { pendingStrip }
-            inputBar
+            if recorder.isRecording { recordingBar } else { inputBar }
         }
         .background(Theme.chat)
         .simultaneousGesture(backSwipe)
@@ -320,7 +322,12 @@ struct ChatView: View {
                     .padding(.bottom, 4)
                     .disabled(sending)
                 } else {
-                    Color.clear.frame(width: 6, height: 1)
+                    Button(action: startRecording) {
+                        Image(systemName: "mic.fill")
+                            .font(.system(size: 20))
+                            .foregroundStyle(Theme.muted)
+                            .frame(width: 40, height: 40)
+                    }
                 }
             }
             .background(Theme.input, in: RoundedRectangle(cornerRadius: 20))
@@ -328,6 +335,78 @@ struct ChatView: View {
         .padding(.horizontal, 10)
         .padding(.vertical, 8)
         .background(Theme.chat)
+    }
+
+    // MARK: - Голосовое сообщение
+
+    private var recordingBar: some View {
+        HStack(spacing: 10) {
+            Button {
+                recorder.cancel()
+            } label: {
+                Image(systemName: "trash.fill")
+                    .font(.system(size: 17))
+                    .foregroundStyle(Color.red)
+                    .frame(width: 40, height: 40)
+                    .background(Theme.input, in: Circle())
+            }
+            HStack(spacing: 10) {
+                Circle().fill(Color.red).frame(width: 10, height: 10)
+                Text(durationText(recorder.elapsed))
+                    .font(.system(size: 15, design: .monospaced))
+                    .foregroundStyle(Theme.text)
+                LiveWaveform(levels: recorder.levels)
+            }
+            .padding(.horizontal, 14)
+            .frame(height: 40)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Theme.input, in: Capsule())
+            Button(action: sendVoice) {
+                Group {
+                    if sending {
+                        ProgressView().tint(.white)
+                    } else {
+                        Image(systemName: "arrow.up").font(.system(size: 16, weight: .bold))
+                    }
+                }
+                .foregroundStyle(.white)
+                .frame(width: 40, height: 40)
+                .background(Theme.blurple, in: Circle())
+            }
+            .disabled(sending)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .background(Theme.chat)
+    }
+
+    private func durationText(_ t: TimeInterval) -> String {
+        let s = Int(t)
+        return String(format: "%d:%02d", s / 60, s % 60)
+    }
+
+    private func startRecording() {
+        Task {
+            let ok = await recorder.start()
+            if !ok {
+                store.error = "Нет доступа к микрофону. Разреши его в Настройки → DiscClient → Микрофон."
+            }
+        }
+    }
+
+    private func sendVoice() {
+        guard !sending, let rec = recorder.stop() else { return }
+        if rec.duration < 0.6 {
+            try? FileManager.default.removeItem(at: rec.url)
+            return
+        }
+        sending = true
+        let replyId = replyTo?.id
+        Task {
+            let ok = await store.sendVoice(rec, to: channel.id, replyTo: replyId)
+            sending = false
+            if ok { replyTo = nil }
+        }
     }
 
     private func submit() {
@@ -560,7 +639,9 @@ struct AttachmentView: View {
     }
 
     var body: some View {
-        if attachment.isImage, let url = URL(string: attachment.url) {
+        if attachment.isVoice {
+            VoiceMessageView(attachment: attachment)
+        } else if attachment.isImage, let url = URL(string: attachment.url) {
             RemoteImage(url: url, contentMode: .fill) {
                 Theme.input
             }

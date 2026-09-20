@@ -110,6 +110,47 @@ final class API {
         String(Int(Date().timeIntervalSince1970 * 1000))
     }
 
+    /// Голосовое сообщение: OGG/Opus загружается отдельно, потом уходит сообщение с флагом 8192.
+    func sendVoiceMessage(channelId: String, ogg: Data, duration: Double, waveform: String, replyTo: String? = nil) async throws -> Message {
+        struct Slot: Decodable {
+            let upload_url: String
+            let upload_filename: String
+        }
+        struct SlotList: Decodable {
+            let attachments: [Slot]
+        }
+
+        let file: [String: Any] = ["filename": "voice-message.ogg", "file_size": ogg.count, "id": "2"]
+        let slotBody: [String: Any] = ["files": [file]]
+        let slots: SlotList = try await post("/channels/\(channelId)/attachments", body: slotBody)
+        guard let slot = slots.attachments.first, let url = URL(string: slot.upload_url) else {
+            throw APIError.badResponse
+        }
+
+        var put = URLRequest(url: url)
+        put.httpMethod = "PUT"
+        put.setValue("audio/ogg", forHTTPHeaderField: "Content-Type")
+        let (putData, putResp) = try await session.upload(for: put, from: ogg)
+        try check(putData, putResp)
+
+        let attachment: [String: Any] = [
+            "id": "0",
+            "filename": "voice-message.ogg",
+            "uploaded_filename": slot.upload_filename,
+            "duration_secs": duration,
+            "waveform": waveform
+        ]
+        var payload: [String: Any] = [
+            "flags": 8192,
+            "nonce": nonce(),
+            "attachments": [attachment]
+        ]
+        if let replyTo {
+            payload["message_reference"] = ["message_id": replyTo, "channel_id": channelId]
+        }
+        return try await post("/channels/\(channelId)/messages", body: payload)
+    }
+
     /// Отправка сообщения: текст, ответ на сообщение, файлы (multipart).
     func sendMessage(channelId: String, content: String, files: [UploadFile], replyTo: String? = nil) async throws -> Message {
         let path = "/channels/\(channelId)/messages"
