@@ -65,6 +65,7 @@ final class Store: ObservableObject {
             ImageLoader.shared.session = api.session
             voice.session = api.session
             voice.userId = me.id
+            voice.resolveUser = { [weak self] id in await self?.fetchUser(id) }
             Keychain.save(clean)
             startGateway(token: clean, session: api.session)
         } catch {
@@ -218,6 +219,16 @@ final class Store: ObservableObject {
         if let guildId { p += "&guild_id=\(guildId)" }
         let r: ProfileResponse? = try? await api.get(p)
         return r
+    }
+
+    /// Профиль пользователя по id (для подписей участников голосового канала).
+    func fetchUser(_ id: String) async -> User? {
+        if let me, me.id == id { return me }
+        guard let api else { return nil }
+        if let r: ProfileResponse = try? await api.get("/users/\(id)/profile"), let u = r.user {
+            return u
+        }
+        return nil
     }
 
     func openDM(with user: User) async {

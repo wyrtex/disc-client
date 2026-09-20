@@ -21,13 +21,32 @@ final class VoiceGateway {
     private var seq: Int = -1
     private var heartbeatTask: Task<Void, Never>?
     private var udp: NWConnection?
+    private var media: VoiceMedia?
+    private var ssrcMap: [UInt32: String] = [:]
+    private var userIds = Set<String>()
 
     var onLog: ((String) -> Void)?
     var onState: ((String) -> Void)?
+    var onUsers: (([String]) -> Void)?
+    var onAudio: ((String) -> Void)?
+    var onLocalSpeaking: ((Bool) -> Void)?
+    var onMicLevel: ((Float) -> Void)?
+    var vadThreshold: () -> Double = { -45 }
+
+    private let audio: VoiceAudio
+    private let micAllowed: Bool
+    private var ownSsrc: UInt32 = 0
+    private var muted = false
+    private var deafened = false
 
     init(endpoint: String, serverId: String, channelId: String, userId: String, sessionId: String, token: String,
-         session: URLSession, daveVersion: Int) {
+         session: URLSession, daveVersion: Int, audio: VoiceAudio, micAllowed: Bool,
+         muted: Bool, deafened: Bool) {
         self.channelId = channelId
+        self.audio = audio
+        self.micAllowed = micAllowed
+        self.muted = muted
+        self.deafened = deafened
         self.endpoint = endpoint
         self.serverId = serverId
         self.userId = userId
@@ -65,7 +84,19 @@ final class VoiceGateway {
         receive(on: t)
     }
 
+    func setMuted(_ m: Bool) {
+        muted = m
+        media?.setMuted(m)
+    }
+
+    func setDeafened(_ d: Bool) {
+        deafened = d
+        audio.setDeafened(d)
+    }
+
     func stop() {
+        media?.stop()
+        media = nil
         dave = nil
         heartbeatTask?.cancel()
         heartbeatTask = nil
@@ -140,17 +171,29 @@ final class VoiceGateway {
         case 4:
             handleSessionDescription(d)
         case 5:
-            log("op 5 Speaking: \(d["user_id"] as? String ?? "?")")
+            let uid = d["user_id"] as? String
+            let ssrc = d["ssrc"] as? Int
+            log("op 5 Speaking: \(uid ?? "?"), ssrc \(ssrc.map { String($0) } ?? "?"), флаги \(d["speaking"] as? Int ?? -1)")
+            if let uid, let ssrc {
+                let s = UInt32(truncatingIfNeeded: ssrc)
+                ssrcMap[s] = uid
+                media?.setSsrc(s, user: uid)
+            }
         case 9:
             log("op 9 Resumed")
         case 11:
             let ids = d["user_ids"] as? [String] ?? []
             log("op 11: в канал вошли \(ids.joined(separator: ", "))")
             dave?.userConnected(ids)
+            for id in ids { userIds.insert(id) }
+            onUsers?(Array(userIds))
         case 13:
             if let id = d["user_id"] as? String {
                 log("op 13: вышел \(id)")
                 dave?.userDisconnected(id)
+                userIds.remove(id)
+                media?.removeUser(id)
+                onUsers?(Array(userIds))
             }
         case 18, 20:
             log("op \(op): \(d)")
@@ -208,6 +251,8 @@ final class VoiceGateway {
         let ip = d["ip"] as? String ?? ""
         let port = (d["port"] as? Int) ?? 0
         let modes = d["modes"] as? [String] ?? []
+        ownSsrc = UInt32(truncatingIfNeeded: ssrc)
+        dave?.setSelfSsrc(ownSsrc)
         log("op 2 Ready: ssrc \(ssrc), UDP \(ip):\(port)")
         log("Режимы шифрования: \(modes.joined(separator: ", "))")
         discover(ip: ip, port: port, ssrc: UInt32(truncatingIfNeeded: ssrc), modes: modes)
@@ -280,7 +325,8 @@ final class VoiceGateway {
 
     private func handleSessionDescription(_ d: [String: Any]) {
         let mode = d["mode"] as? String ?? "?"
-        let keyLen = (d["secret_key"] as? [Any])?.count ?? 0
+        let keyBytes = (d["secret_key"] as? [Int])?.map { UInt8(truncatingIfNeeded: $0) } ?? []
+        let keyLen = keyBytes.count
         let daveVer = d["dave_protocol_version"] as? Int
         let daveText = daveVer.map { String($0) } ?? "нет"
         log("op 4 Session Description: режим \(mode), ключ \(keyLen) байт, DAVE: \(daveText)")
@@ -288,6 +334,35 @@ final class VoiceGateway {
         onState?("Подключено, обмен ключами DAVE…")
         if daveVersion > 0 {
             dave?.onSessionDescription(version: daveVer ?? 0)
+        }
+
+        if mode == "aead_aes256_gcm_rtpsize", keyBytes.count == 32, let conn = udp {
+            let m = VoiceMedia(
+                connection: conn,
+                secretKey: Data(keyBytes),
+                ssrc: ownSsrc,
+                dave: daveVersion > 0 ? dave : nil,
+                audio: audio,
+                micAllowed: micAllowed
+            )
+            m.log = { [weak self] s in self?.log(s) }
+            m.onAudio = { [weak self] uid in self?.onAudio?(uid) }
+            m.onLocalSpeaking = { [weak self] on in self?.onLocalSpeaking?(on) }
+            m.onMicLevel = { [weak self] db in self?.onMicLevel?(db) }
+            m.vadThresholdDb = { [weak self] in self?.vadThreshold() ?? -45 }
+            m.sendSpeaking = { [weak self] on in
+                guard let self else { return }
+                let d: [String: Any] = ["speaking": on ? 1 : 0, "delay": 0, "ssrc": Int(self.ownSsrc)]
+                self.send(["op": 5, "d": d])
+            }
+            for (ssrc, uid) in ssrcMap { m.setSsrc(ssrc, user: uid) }
+            m.setMuted(muted || deafened)
+            audio.setDeafened(deafened)
+            media = m
+            m.start()
+            log("Приём звука запущен (режим \(mode))")
+        } else {
+            log("Приём звука не запущен: режим \(mode) не поддерживается или нет UDP-соединения")
         }
     }
 
@@ -334,25 +409,63 @@ final class VoiceGateway {
     }
 }
 
-// MARK: - Управление входом в канал
+
+// MARK: - Управление голосовым подключением
+
+/// Настройки, которые читаются из медиа-потока (не с главного потока).
+final class VoiceSharedSettings {
+    private let lock = NSLock()
+    private var _vad: Double = -45
+
+    var vad: Double {
+        get { lock.lock(); defer { lock.unlock() }; return _vad }
+        set { lock.lock(); _vad = newValue; lock.unlock() }
+    }
+}
+
+struct VoiceFlags {
+    var mute = false
+    var deaf = false
+}
 
 @MainActor
 final class VoiceSpike: ObservableObject {
     @Published var log: [String] = []
     @Published var status = "Не подключено"
     @Published var activeChannelId: String?
+    @Published var activeChannel: Channel?
     @Published var gwLog: [String] = []
     @Published var daveVersion = 1
+    @Published var participantIds: [String] = []
+    @Published var users: [String: User] = [:]
+    @Published var flags: [String: VoiceFlags] = [:]
+    @Published var muted = false
+    @Published var deafened = false
+    @Published var speakerOn = true
+    @Published var vadThreshold: Double = -45 {
+        didSet { shared.vad = vadThreshold }
+    }
+    @Published var micLevelDb: Double = -90
+    @Published var micAllowed = true
+    @Published var encrypted = false
+
+    /// Когда последний раз слышали пользователя (читается из TimelineView, поэтому не @Published).
+    var lastHeard: [String: Date] = [:]
 
     var sendGateway: (([String: Any]) -> Bool)?
     var ensureGateway: (() -> Void)?
+    var resolveUser: ((String) async -> User?)?
     var userId = ""
     var session: URLSession = .shared
+
+    let audio = VoiceAudio()
+    private let shared = VoiceSharedSettings()
 
     private var guildId: String?
     private var sessionId: String?
     private var server: (token: String, endpoint: String)?
     private var gateway: VoiceGateway?
+    private var mutedBeforeDeafen = false
 
     private var awaitingLeave = false
     private var hasPendingLeave = false
@@ -365,11 +478,16 @@ final class VoiceSpike: ObservableObject {
         return f
     }()
 
+    var isConnected: Bool { activeChannelId != nil }
+
+    // MARK: Лог
+
     func add(_ s: String) {
         log.append(VoiceSpike.timeFormatter.string(from: Date()) + "  " + s)
+        if log.count > 400 { log.removeFirst(log.count - 400) }
     }
 
-    /// Состояние основного шлюза (последние строки показываются на экране диагностики).
+    /// Состояние основного шлюза (последние строки показываются в логе).
     func addGateway(_ s: String) {
         gwLog.append(VoiceSpike.timeFormatter.string(from: Date()) + "  " + s)
         if gwLog.count > 30 { gwLog.removeFirst(gwLog.count - 30) }
@@ -382,16 +500,35 @@ final class VoiceSpike: ObservableObject {
         "GUILD_MEMBER_UPDATE", "GUILD_MEMBER_LIST_UPDATE", "SESSIONS_REPLACE"
     ]
 
-    /// Пока идёт подключение к каналу, пишем в лог названия приходящих событий.
     func noteEvent(_ t: String) {
         guard activeChannelId != nil, !t.isEmpty, !VoiceSpike.noisyEvents.contains(t) else { return }
         add("Событие Gateway: \(t)")
     }
 
+    // MARK: Участники
+
+    func updateParticipants(_ others: [String]) {
+        let ids = [userId] + others.filter { $0 != userId }.sorted()
+        participantIds = ids
+        for id in ids where users[id] == nil {
+            Task { [weak self] in
+                if let u = await self?.resolveUser?(id) {
+                    self?.users[id] = u
+                }
+            }
+        }
+    }
+
+    func markHeard(_ uid: String) {
+        lastHeard[uid] = Date()
+    }
+
+    // MARK: Вход и выход
+
     private func voiceStatePacket(guildId: String?, channelId: String?) -> [String: Any] {
         var d: [String: Any] = [
-            "self_mute": true,
-            "self_deaf": false,
+            "self_mute": muted || deafened,
+            "self_deaf": deafened,
             "self_video": false
         ]
         d["guild_id"] = guildId ?? NSNull()
@@ -399,23 +536,37 @@ final class VoiceSpike: ObservableObject {
         return ["op": 4, "d": d]
     }
 
-    func join(guildId: String?, channelId: String) {
+    func join(guildId: String?, channel: Channel) {
+        if activeChannelId == channel.id { return }
         leave(silent: true)
         log = []
         self.guildId = guildId
         sessionId = nil
         server = nil
-        activeChannelId = channelId
+        activeChannelId = channel.id
+        activeChannel = channel
         status = "Подключаюсь…"
-        add("Запрашиваю вход в канал (op 4), DAVE v\(daveVersion)")
-        ensureGateway?()
-        let sent = sendGateway?(voiceStatePacket(guildId: guildId, channelId: channelId)) ?? false
-        add(sent ? "op 4 отправлен" : "op 4 НЕ отправлен: основной шлюз не подключён")
+        encrypted = false
+        flags = [:]
+        lastHeard = [:]
+        updateParticipants([])
 
+        let cid = channel.id
         Task { [weak self] in
+            guard let self else { return }
+            self.micAllowed = await VoiceAudio.requestMicPermission()
+            guard self.activeChannelId == cid else { return }
+            self.add(self.micAllowed ? "Микрофон: доступ есть" : "Микрофон: доступа нет, будет только прослушивание")
+            self.add("Запрашиваю вход в канал (op 4), DAVE v\(self.daveVersion)")
+            self.ensureGateway?()
+            let sent = self.sendGateway?(self.voiceStatePacket(guildId: guildId, channelId: cid)) ?? false
+            self.add(sent ? "op 4 отправлен" : "op 4 НЕ отправлен: основной шлюз не подключён")
+
             try? await Task.sleep(nanoseconds: 8_000_000_000)
-            guard let self, self.activeChannelId == channelId, self.server == nil else { return }
-            self.add("За 8 секунд не пришло VOICE_SERVER_UPDATE. Discord не выдал голосовой сервер.")
+            if self.activeChannelId == cid, self.server == nil {
+                self.add("За 8 секунд не пришло VOICE_SERVER_UPDATE. Discord не выдал голосовой сервер.")
+                self.status = "Нет ответа от Discord"
+            }
         }
     }
 
@@ -427,11 +578,17 @@ final class VoiceSpike: ObservableObject {
             sendLeave(guildId: guildId, silent: silent)
         }
         activeChannelId = nil
+        activeChannel = nil
         status = "Не подключено"
+        encrypted = false
+        participantIds = []
+        flags = [:]
+        lastHeard = [:]
+        micLevelDb = -90
         if !silent { add("Отключился") }
     }
 
-    /// Выход из голосового канала с подтверждением. Если шлюз мёртв, выход откладывается до восстановления связи.
+    /// Выход с подтверждением. Если шлюз мёртв, выход откладывается до восстановления связи.
     private func sendLeave(guildId: String?, silent: Bool) {
         ensureGateway?()
         let sent = sendGateway?(voiceStatePacket(guildId: guildId, channelId: nil)) ?? false
@@ -457,7 +614,6 @@ final class VoiceSpike: ObservableObject {
         }
     }
 
-    /// Основной шлюз снова готов: досылаем отложенный выход.
     func gatewayReady() {
         guard hasPendingLeave, leaveRetries < 3 else { return }
         leaveRetries += 1
@@ -465,6 +621,47 @@ final class VoiceSpike: ObservableObject {
         add("Связь восстановлена, повторяю выход из голосового канала")
         sendLeave(guildId: pendingLeaveGuild, silent: false)
     }
+
+    // MARK: Микрофон, наушники, маршрут звука
+
+    func toggleMute() {
+        if deafened {
+            deafened = false
+            muted = false
+        } else {
+            muted.toggle()
+        }
+        applyAudioState()
+    }
+
+    func toggleDeafen() {
+        deafened.toggle()
+        if deafened {
+            mutedBeforeDeafen = muted
+            muted = true
+        } else {
+            muted = mutedBeforeDeafen
+        }
+        applyAudioState()
+    }
+
+    private func applyAudioState() {
+        gateway?.setMuted(muted || deafened)
+        gateway?.setDeafened(deafened)
+        if userId.isEmpty == false {
+            flags[userId] = VoiceFlags(mute: muted || deafened, deaf: deafened)
+        }
+        guard let cid = activeChannelId else { return }
+        _ = sendGateway?(voiceStatePacket(guildId: guildId, channelId: cid))
+    }
+
+    func setSpeaker(_ on: Bool) {
+        speakerOn = on
+        audio.speakerOn = on
+        VoiceAudio.setSpeaker(on)
+    }
+
+    // MARK: События основного шлюза
 
     func handle(_ t: String, _ d: [String: Any]) {
         if t == "VOICE_STATE_UPDATE",
@@ -478,11 +675,24 @@ final class VoiceSpike: ObservableObject {
         guard activeChannelId != nil else { return }
         switch t {
         case "VOICE_STATE_UPDATE":
-            if (d["user_id"] as? String) == userId, let sid = d["session_id"] as? String,
-               (d["channel_id"] as? String) != nil {
+            let uid = d["user_id"] as? String
+            let channel = d["channel_id"] as? String
+            if uid == userId, let sid = d["session_id"] as? String, channel != nil {
                 sessionId = sid
                 add("VOICE_STATE_UPDATE: получил session_id")
                 tryConnect()
+            }
+            if let uid, channel == activeChannelId {
+                let mute = (d["self_mute"] as? Bool ?? false) || (d["mute"] as? Bool ?? false)
+                let deaf = (d["self_deaf"] as? Bool ?? false) || (d["deaf"] as? Bool ?? false)
+                flags[uid] = VoiceFlags(mute: mute, deaf: deaf)
+                if users[uid] == nil,
+                   let member = d["member"] as? [String: Any],
+                   let userObj = member["user"] as? [String: Any],
+                   let data = try? JSONSerialization.data(withJSONObject: userObj),
+                   let user = try? JSONDecoder().decode(User.self, from: data) {
+                    users[uid] = user
+                }
             }
         case "VOICE_SERVER_UPDATE":
             if let token = d["token"] as? String, let ep = d["endpoint"] as? String {
@@ -502,6 +712,7 @@ final class VoiceSpike: ObservableObject {
               let sid = sessionId,
               let server,
               let channelId = activeChannelId else { return }
+        audio.speakerOn = speakerOn
         let vg = VoiceGateway(
             endpoint: server.endpoint,
             serverId: guildId ?? channelId,
@@ -510,126 +721,46 @@ final class VoiceSpike: ObservableObject {
             sessionId: sid,
             token: server.token,
             session: session,
-            daveVersion: daveVersion
+            daveVersion: daveVersion,
+            audio: audio,
+            micAllowed: micAllowed,
+            muted: muted,
+            deafened: deafened
         )
+        let settings = shared
+        vg.vadThreshold = { settings.vad }
         vg.onLog = { [weak self] s in
             Task { @MainActor in self?.add(s) }
         }
         vg.onState = { [weak self] s in
-            Task { @MainActor in self?.status = s }
+            Task { @MainActor in
+                guard let self else { return }
+                self.status = s
+                if s.contains("E2EE установлено") { self.encrypted = true }
+            }
+        }
+        vg.onUsers = { [weak self] ids in
+            Task { @MainActor in self?.updateParticipants(ids) }
+        }
+        vg.onAudio = { [weak self] uid in
+            Task { @MainActor in self?.markHeard(uid) }
+        }
+        vg.onLocalSpeaking = { [weak self] on in
+            Task { @MainActor in
+                guard let self else { return }
+                if on { self.markHeard(self.userId) } else { self.lastHeard[self.userId] = nil }
+            }
+        }
+        vg.onMicLevel = { [weak self] db in
+            Task { @MainActor in
+                guard let self else { return }
+                self.micLevelDb = Double(db)
+                if self.micLevelDb > self.vadThreshold, !self.muted, !self.deafened {
+                    self.markHeard(self.userId)
+                }
+            }
         }
         gateway = vg
         vg.start()
-    }
-}
-
-// MARK: - Экран диагностики
-
-struct VoiceDebugView: View {
-    @EnvironmentObject var store: Store
-    @ObservedObject var voice: VoiceSpike
-    let channel: Channel
-    let guildId: String?
-
-    private var isActive: Bool { voice.activeChannelId == channel.id }
-
-    var body: some View {
-        VStack(spacing: 12) {
-            HStack(spacing: 8) {
-                Image(systemName: channel.icon)
-                    .foregroundStyle(Theme.muted)
-                Text(channel.title)
-                    .font(.system(size: 17, weight: .bold))
-                    .foregroundStyle(Theme.text)
-                    .lineLimit(1)
-                Spacer()
-                Text(voice.status)
-                    .font(.system(size: 12))
-                    .foregroundStyle(Theme.muted)
-            }
-
-            Text("Диагностика подключения к голосу. Звука пока нет. Ты появишься в списке участников канала, лучше проверять на своём сервере. При закрытии экрана приложение выйдет из канала.")
-                .font(.system(size: 12))
-                .foregroundStyle(Theme.muted)
-                .frame(maxWidth: .infinity, alignment: .leading)
-
-            Button {
-                voice.add("DAVE в сборке: \(DaveLib.isBuiltIn ? "да" : "нет")")
-                for line in DaveLib.selfTest() { voice.add(line) }
-            } label: {
-                Text("Проверить библиотеку DAVE")
-                    .font(.system(size: 14, weight: .semibold))
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 10)
-                    .background(Theme.input, in: RoundedRectangle(cornerRadius: 10))
-                    .foregroundStyle(Theme.text)
-            }
-
-            Picker("DAVE", selection: $voice.daveVersion) {
-                Text("DAVE 0 (без E2EE)").tag(0)
-                Text("DAVE 1 (заявить поддержку)").tag(1)
-            }
-            .pickerStyle(.segmented)
-            .disabled(isActive)
-
-            if !voice.gwLog.isEmpty {
-                Text("Основной шлюз:\n" + voice.gwLog.suffix(3).joined(separator: "\n"))
-                    .font(.system(size: 10, design: .monospaced))
-                    .foregroundStyle(Theme.muted)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            }
-
-            ScrollViewReader { proxy in
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 4) {
-                        ForEach(Array(voice.log.enumerated()), id: \.offset) { i, line in
-                            Text(line)
-                                .font(.system(size: 11, design: .monospaced))
-                                .foregroundStyle(Theme.normalText)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .id(i)
-                        }
-                    }
-                    .padding(10)
-                }
-                .background(Theme.rail, in: RoundedRectangle(cornerRadius: 10))
-                .onChange(of: voice.log.count) { _, n in
-                    if n > 0 { proxy.scrollTo(n - 1, anchor: .bottom) }
-                }
-            }
-
-            HStack(spacing: 10) {
-                Button {
-                    if isActive {
-                        voice.leave()
-                    } else {
-                        voice.join(guildId: guildId ?? channel.guild_id, channelId: channel.id)
-                    }
-                } label: {
-                    Text(isActive ? "Отключиться" : "Подключиться")
-                        .font(.system(size: 16, weight: .semibold))
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 12)
-                        .background(isActive ? Color.red : Theme.blurple, in: RoundedRectangle(cornerRadius: 10))
-                        .foregroundStyle(.white)
-                }
-                Button {
-                    UIPasteboard.general.string = voice.log.joined(separator: "\n")
-                } label: {
-                    Image(systemName: "doc.on.doc")
-                        .frame(width: 46, height: 46)
-                        .background(Theme.input, in: RoundedRectangle(cornerRadius: 10))
-                        .foregroundStyle(Theme.text)
-                }
-            }
-        }
-        .padding(16)
-        .background(Theme.panel)
-        .presentationDetents([.large])
-        .presentationDragIndicator(.visible)
-        .presentationBackground(Theme.panel)
-        .onDisappear {
-            if isActive { voice.leave() }
-        }
     }
 }

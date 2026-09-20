@@ -18,6 +18,9 @@ final class DaveSession {
     private var recognized = Set<String>()
     private var transitions: [Int: Int] = [:]
     private var latestPreparedVersion = 0
+    private var decryptors: [String: DAVEDecryptorHandle] = [:]
+    private var encryptor: DAVEEncryptorHandle?
+    private var selfSsrc: UInt32 = 0
     private let lock = NSRecursiveLock()
 
     private static let initTransitionId = 0
@@ -39,10 +42,80 @@ final class DaveSession {
             return nil
         }
         handle = h
+        encryptor = daveEncryptorCreate()
     }
 
     deinit {
+        for d in decryptors.values { daveDecryptorDestroy(d) }
+        if let e = encryptor { daveEncryptorDestroy(e) }
         if let h = handle { daveSessionDestroy(h) }
+    }
+
+    /// Наш SSRC (из op 2 Ready): нужен шифратору.
+    func setSelfSsrc(_ ssrc: UInt32) {
+        lock.lock(); defer { lock.unlock() }
+        selfSsrc = ssrc
+        if let e = encryptor { daveEncryptorAssignSsrcToCodec(e, ssrc, DAVE_CODEC_OPUS) }
+    }
+
+    /// Шифрование кадра Opus перед отправкой. nil, если ключ ещё не готов.
+    func encrypt(frame: Data, ssrc: UInt32) -> Data? {
+        lock.lock(); defer { lock.unlock() }
+        guard let enc = encryptor else { return nil }
+        if daveEncryptorIsPassthroughMode(enc) { return frame }
+        guard daveEncryptorHasKeyRatchet(enc) else { return nil }
+        let capacity = daveEncryptorGetMaxCiphertextByteSize(enc, DAVE_MEDIA_TYPE_AUDIO, frame.count)
+        var out = [UInt8](repeating: 0, count: max(capacity, 1))
+        var written: Int = 0
+        let result: DAVEEncryptorResultCode = frame.withUnsafeBytes { (raw: UnsafeRawBufferPointer) -> DAVEEncryptorResultCode in
+            out.withUnsafeMutableBufferPointer { buf -> DAVEEncryptorResultCode in
+                daveEncryptorEncrypt(
+                    enc,
+                    DAVE_MEDIA_TYPE_AUDIO,
+                    ssrc,
+                    raw.bindMemory(to: UInt8.self).baseAddress,
+                    frame.count,
+                    buf.baseAddress,
+                    capacity,
+                    &written
+                )
+            }
+        }
+        guard result == DAVE_ENCRYPTOR_RESULT_CODE_SUCCESS, written > 0 else { return nil }
+        return Data(out.prefix(written))
+    }
+
+    /// Расшифровка кадра Opus от пользователя (вызывается из медиа-потока).
+    func decrypt(userId: String, frame: Data) -> Data? {
+        lock.lock(); defer { lock.unlock() }
+        guard let dec = decryptors[userId] else { return nil }
+        let capacity = daveDecryptorGetMaxPlaintextByteSize(dec, DAVE_MEDIA_TYPE_AUDIO, frame.count)
+        var out = [UInt8](repeating: 0, count: max(capacity, 1))
+        var written: Int = 0
+        let result: DAVEDecryptorResultCode = frame.withUnsafeBytes { (raw: UnsafeRawBufferPointer) -> DAVEDecryptorResultCode in
+            out.withUnsafeMutableBufferPointer { buf -> DAVEDecryptorResultCode in
+                daveDecryptorDecrypt(
+                    dec,
+                    DAVE_MEDIA_TYPE_AUDIO,
+                    raw.bindMemory(to: UInt8.self).baseAddress,
+                    frame.count,
+                    buf.baseAddress,
+                    capacity,
+                    &written
+                )
+            }
+        }
+        guard result == DAVE_DECRYPTOR_RESULT_CODE_SUCCESS, written > 0 else { return nil }
+        return Data(out.prefix(written))
+    }
+
+    private func decryptor(for userId: String) -> DAVEDecryptorHandle? {
+        if let d = decryptors[userId] { return d }
+        guard let d = daveDecryptorCreate() else { return nil }
+        // Пока ключа нет, кадры без E2EE пропускаем как есть.
+        daveDecryptorTransitionToPassthroughMode(d, true)
+        decryptors[userId] = d
+        return d
     }
 
     // MARK: Входящие события голосового шлюза
@@ -58,6 +131,7 @@ final class DaveSession {
     func userDisconnected(_ id: String) {
         lock.lock(); defer { lock.unlock() }
         recognized.remove(id)
+        if let d = decryptors.removeValue(forKey: id) { daveDecryptorDestroy(d) }
     }
 
     /// op 4 (Session Description): начинаем рукопожатие, если сервер согласился на DAVE.
@@ -185,19 +259,35 @@ final class DaveSession {
 
     private func setupKeyRatchet(userId: String, version: Int) {
         guard let h = handle else { return }
+        let isSelf = (userId == selfUserId)
+
         if version == DaveSession.disabledVersion {
-            if userId == selfUserId { log?("DAVE: шифрование отключено, звук пойдёт без E2EE") }
+            if isSelf {
+                if let e = encryptor { daveEncryptorSetPassthroughMode(e, true) }
+                log?("DAVE: шифрование отключено, звук пойдёт без E2EE")
+            } else if let dec = decryptor(for: userId) {
+                daveDecryptorTransitionToPassthroughMode(dec, true)
+            }
             return
         }
         guard let ratchet = daveSessionGetKeyRatchet(h, userId) else {
             log?("DAVE: не удалось получить ключ для \(userId)")
             return
         }
-        // На этом этапе ключи только проверяем. Шифратор и дешифраторы подключим, когда дойдём до звука.
-        daveKeyRatchetDestroy(ratchet)
-        if userId == selfUserId {
+        // Шифратор и дешифратор копируют ключ, свою ссылку освобождаем сами.
+        defer { daveKeyRatchetDestroy(ratchet) }
+
+        if isSelf {
+            if let e = encryptor {
+                daveEncryptorSetKeyRatchet(e, ratchet)
+                daveEncryptorSetPassthroughMode(e, false)
+            }
             log?("DAVE: ключ шифрования для нас готов (версия \(version))")
             onEncryptionReady?(version)
+        } else if let dec = decryptor(for: userId) {
+            daveDecryptorTransitionToKeyRatchet(dec, ratchet)
+            daveDecryptorTransitionToPassthroughMode(dec, false)
+            log?("DAVE: ключ расшифровки для \(userId) обновлён")
         }
     }
 
@@ -308,6 +398,9 @@ final class DaveSession {
     init?(selfUserId: String, channelId: String) { return nil }
     func userConnected(_ ids: [String]) {}
     func userDisconnected(_ id: String) {}
+    func decrypt(userId: String, frame: Data) -> Data? { return nil }
+    func encrypt(frame: Data, ssrc: UInt32) -> Data? { return nil }
+    func setSelfSsrc(_ ssrc: UInt32) {}
     func onSessionDescription(version: Int) {}
     func onPrepareTransition(id: Int, version: Int) {}
     func onExecuteTransition(id: Int) {}

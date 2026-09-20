@@ -7,6 +7,7 @@ struct MainView: View {
     @State private var selection: String? = nil   // nil = личные сообщения
     @State private var collapsed: Set<String> = []
     @State private var confirmLogout = false
+    @State private var showVoice = false
 
     var body: some View {
         NavigationStack(path: $store.path) {
@@ -17,7 +18,8 @@ struct MainView: View {
                     ChannelPanel(
                         selection: selection,
                         collapsed: $collapsed,
-                        onUserTap: { confirmLogout = true }
+                        onUserTap: { confirmLogout = true },
+                        onOpenVoice: { showVoice = true }
                     )
                 }
             }
@@ -32,6 +34,10 @@ struct MainView: View {
         }
         .translationTask(translator.configuration) { session in
             await translator.run(session)
+        }
+        .fullScreenCover(isPresented: $showVoice) {
+            VoiceView(voice: store.voice) { showVoice = false }
+                .environmentObject(store)
         }
         .confirmationDialog("Аккаунт", isPresented: $confirmLogout, titleVisibility: .hidden) {
             Button("Выйти из аккаунта", role: .destructive) { store.logout() }
@@ -115,9 +121,9 @@ struct ChannelPanel: View {
     let selection: String?
     @Binding var collapsed: Set<String>
     let onUserTap: () -> Void
+    let onOpenVoice: () -> Void
 
     @State private var showServer = false
-    @State private var voiceChannel: Channel?
 
     private var guild: Guild? {
         store.guilds.first { $0.id == selection }
@@ -133,6 +139,7 @@ struct ChannelPanel: View {
                     dmContent
                 }
             }
+            VoiceBar(voice: store.voice, onOpen: onOpenVoice)
             UserBar(onTap: onUserTap)
         }
         .frame(maxWidth: .infinity)
@@ -157,10 +164,7 @@ struct ChannelPanel: View {
                     .environmentObject(store)
             }
         }
-        .sheet(item: $voiceChannel) { ch in
-            VoiceDebugView(voice: store.voice, channel: ch, guildId: selection)
-                .environmentObject(store)
-        }
+
     }
 
     /// Свайп влево по списку каналов возвращает в последний открытый чат.
@@ -306,7 +310,10 @@ struct ChannelPanel: View {
             NavigationLink(value: ch) { rowLabel(ch, locked: false) }
                 .buttonStyle(.plain)
         } else {
-            Button { voiceChannel = ch } label: { rowLabel(ch, locked: false) }
+            Button {
+                store.voice.join(guildId: guildId, channel: ch)
+                onOpenVoice()
+            } label: { rowLabel(ch, locked: false) }
                 .buttonStyle(.plain)
         }
     }
