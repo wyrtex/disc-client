@@ -101,6 +101,14 @@ final class API {
         try check(data, resp)
     }
 
+    /// Сырые данные ответа (чтобы сохранить их в кэш).
+    func raw(_ path: String) async throws -> Data {
+        let req = try baseRequest("GET", path)
+        let (data, resp) = try await session.data(for: req)
+        try check(data, resp)
+        return data
+    }
+
     func get<T: Decodable>(_ path: String) async throws -> T {
         try await send("GET", path)
     }

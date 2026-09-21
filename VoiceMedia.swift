@@ -120,6 +120,8 @@ final class VoiceMedia {
     private var timer: DispatchSourceTimer?
     private var keepaliveTimer: DispatchSourceTimer?
     private var keepaliveCounter: UInt64 = 0
+    private var otherPackets: [String: Int] = [:]
+    private var lastOtherLogged = ""
     private var firstTransportFailLogged = false
     private var firstDaveFailLogged = false
     private var firstEncryptFailLogged = false
@@ -229,6 +231,13 @@ final class VoiceMedia {
     }
 
     private func reportStats() {
+        if !otherPackets.isEmpty {
+            let text = otherPackets.sorted { $0.key < $1.key }.map { "\($0.key): \($0.value)" }.joined(separator: ", ")
+            if text != lastOtherLogged {
+                lastOtherLogged = text
+                log?("Прочие RTP-пакеты (возможно, видео): \(text)")
+            }
+        }
         guard stats != lastReported else { return }
         lastReported = stats
         log?("Звук: принято \(stats.received), проиграно \(stats.played), отправлено \(stats.sent). Ошибки: транспорт \(stats.transportFail), SSRC \(stats.unknownSsrc), DAVE \(stats.daveFail), Opus \(stats.opusFail), шифрование \(stats.encryptFail)")
@@ -251,6 +260,8 @@ final class VoiceMedia {
         }
         guard let user = ssrcToUser[packetSsrc] else {
             stats.unknownSsrc += 1
+            let pt = bytes.count > 1 ? Int(bytes[1] & 0x7F) : -1
+            otherPackets["pt\(pt) ssrc\(packetSsrc)", default: 0] += 1
             return
         }
         // Пакет тишины от сервера: три байта F8 FF FE.

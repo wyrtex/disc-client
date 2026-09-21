@@ -325,7 +325,22 @@ final class VoiceGateway {
         let mode = preferred.first(where: { modes.contains($0) }) ?? modes.first ?? "aead_aes256_gcm_rtpsize"
         log("Выбираю режим шифрования: \(mode)")
         let data: [String: Any] = ["address": address, "port": port, "mode": mode]
-        let d: [String: Any] = ["protocol": "udp", "data": data]
+        var d: [String: Any] = ["protocol": "udp", "data": data]
+        if videoProbe {
+            // Диагностика видео: сообщаем серверу, что умеем принимать H264/VP8.
+            d["address"] = address
+            d["port"] = port
+            d["mode"] = mode
+            d["codecs"] = [
+                ["name": "opus", "type": "audio", "priority": 1000, "payload_type": 120],
+                ["name": "H264", "type": "video", "priority": 1000, "payload_type": 101,
+                 "rtx_payload_type": 102, "encode": false, "decode": true],
+                ["name": "VP8", "type": "video", "priority": 2000, "payload_type": 103,
+                 "rtx_payload_type": 104, "encode": false, "decode": true]
+            ]
+            d["experiments"] = [String]()
+            log("Диагностика видео: в Select Protocol добавлены кодеки H264 и VP8")
+        }
         send(["op": 1, "d": d])
     }
 
@@ -337,6 +352,10 @@ final class VoiceGateway {
         let daveText = daveVer.map { String($0) } ?? "нет"
         log("op 4 Session Description: режим \(mode), ключ \(keyLen) байт, DAVE: \(daveText)")
         log("Discord принял подключение.")
+        if videoProbe {
+            send(["op": 15, "d": ["any": 100]])
+            log("Диагностика видео: отправил op 15 (желаемое качество)")
+        }
         onState?("Подключено, обмен ключами DAVE…")
         if daveVersion > 0 {
             dave?.onSessionDescription(version: daveVer ?? 0)
@@ -777,6 +796,36 @@ final class VoiceSpike: ObservableObject {
         }
         guard let cid = activeChannelId else { return }
         _ = sendGateway?(voiceStatePacket(guildId: guildId, channelId: cid))
+    }
+
+    // MARK: Фон
+
+    private var bgTask: UIBackgroundTaskIdentifier = .invalid
+
+    private func endBackgroundTask() {
+        if bgTask != .invalid {
+            UIApplication.shared.endBackgroundTask(bgTask)
+            bgTask = .invalid
+        }
+    }
+
+    /// Приложение свернули: держим голос. Фоновый режим «audio» оставляет приложение живым,
+    /// а короткая фоновая задача страхует переход.
+    func appDidEnterBackground() {
+        guard isConnected else { return }
+        endBackgroundTask()
+        bgTask = UIApplication.shared.beginBackgroundTask(withName: "voice") { [weak self] in
+            self?.endBackgroundTask()
+        }
+        audio.ensureRunning()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 20) { [weak self] in
+            self?.endBackgroundTask()
+        }
+    }
+
+    func appDidBecomeActive() {
+        endBackgroundTask()
+        if isConnected { audio.ensureRunning() }
     }
 
     /// Слушатель трибуны не передаёт звук, пока его не позвали на сцену.

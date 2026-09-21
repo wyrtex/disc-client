@@ -2,6 +2,28 @@ import Foundation
 import SwiftUI
 import SwiftOGG
 
+/// Кэш последних ответов Discord на диске: приложение открывается сразу, а обновляется уже в фоне.
+enum DiskCache {
+    private static var dir: URL {
+        let d = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("disc", isDirectory: true)
+        try? FileManager.default.createDirectory(at: d, withIntermediateDirectories: true)
+        return d
+    }
+
+    static func save(_ data: Data, _ name: String) {
+        try? data.write(to: dir.appendingPathComponent(name + ".json"))
+    }
+
+    static func load(_ name: String) -> Data? {
+        try? Data(contentsOf: dir.appendingPathComponent(name + ".json"))
+    }
+
+    static func clear() {
+        try? FileManager.default.removeItem(at: dir)
+    }
+}
+
 enum GuildVoiceSummary {
     case none, voice, video, stream
 }
@@ -40,6 +62,8 @@ final class Store: ObservableObject {
     @Published var voiceRoster: [String: [String: VoiceMemberState]] = [:]
     @Published var voiceUsers: [String: User] = [:]
     @Published var memberRoles: [String: Set<String>] = [:]
+    @Published var isRestoring = false
+    var gatewaySessionId: String?
     @Published var dmPreviews: [String: Message] = [:]
     @Published var guildMembers: [String: [String: MemberInfo]] = [:]
     private var memberTimeout: [String: Date] = [:]
@@ -78,8 +102,23 @@ final class Store: ObservableObject {
             proxy = ProxySettings()
         }
         if let saved = Keychain.load() {
+            isRestoring = !restoreFromCache()
             Task { await autoLogin(saved) }
         }
+    }
+
+    /// Показываем сохранённые данные сразу, пока идёт вход.
+    private func restoreFromCache() -> Bool {
+        guard let m = DiskCache.load("me"),
+              let g = DiskCache.load("guilds"),
+              let d = DiskCache.load("dms"),
+              let me = try? JSONDecoder().decode(User.self, from: m),
+              let guilds = try? JSONDecoder().decode([Guild].self, from: g),
+              let dms = try? JSONDecoder().decode([Channel].self, from: d) else { return false }
+        self.me = me
+        self.guilds = Store.applySavedOrder(guilds)
+        self.dms = dms.sorted { (UInt64($0.last_message_id ?? "0") ?? 0) > (UInt64($1.last_message_id ?? "0") ?? 0) }
+        return true
     }
 
     /// Вход при запуске: если сети ещё нет (например, VPN поднимается), тихо повторяем несколько раз.
@@ -87,10 +126,17 @@ final class Store: ObservableObject {
         for attempt in 0..<8 {
             await login(token: token, silent: true)
             if me != nil { return }
-            if let code = loginStatus, code == 401 || code == 403 { break }
+            if let code = loginStatus, code == 401 || code == 403 {
+                // Токен больше не действует: возвращаемся на экран входа.
+                logout()
+                error = lastLoginError
+                isRestoring = false
+                return
+            }
             try? await Task.sleep(nanoseconds: UInt64(2 + attempt) * 1_000_000_000)
         }
-        if me == nil { error = lastLoginError }
+        isRestoring = false
+        if api == nil, me == nil { error = lastLoginError }
     }
 
     // MARK: - Вход / выход
@@ -104,9 +150,15 @@ final class Store: ObservableObject {
 
         let api = API(token: clean, proxy: proxy)
         do {
-            let me: User = try await api.get("/users/@me")
-            let g: [Guild] = try await api.get("/users/@me/guilds")
-            let d: [Channel] = try await api.get("/users/@me/channels")
+            let meData = try await api.raw("/users/@me")
+            let gData = try await api.raw("/users/@me/guilds")
+            let dData = try await api.raw("/users/@me/channels")
+            let me = try JSONDecoder().decode(User.self, from: meData)
+            let g = try JSONDecoder().decode([Guild].self, from: gData)
+            let d = try JSONDecoder().decode([Channel].self, from: dData)
+            DiskCache.save(meData, "me")
+            DiskCache.save(gData, "guilds")
+            DiskCache.save(dData, "dms")
             self.api = api
             self.me = me
             self.guilds = Store.applySavedOrder(g)
@@ -137,6 +189,7 @@ final class Store: ObservableObject {
                 return self.voiceUsers[id]
             }
             Keychain.save(clean)
+            isRestoring = false
             startGateway(token: clean, session: api.session)
         } catch {
             lastLoginError = error.localizedDescription
@@ -169,6 +222,8 @@ final class Store: ObservableObject {
         path = []
         lastChannel = nil
         Keychain.delete()
+        DiskCache.clear()
+        gatewaySessionId = nil
     }
 
     /// Приложение вернулось на экран: проверяем, жив ли Gateway.
@@ -199,6 +254,9 @@ final class Store: ObservableObject {
                     if t == "VOICE_STATE_UPDATE" { self.applyVoiceStateUpdate(d) }
                 }
             }
+        }
+        gw.onSessionId = { [weak self] sid in
+            Task { @MainActor in self?.gatewaySessionId = sid }
         }
         gw.onGuildVoiceStates = { [weak self] list in
             Task { @MainActor in self?.setGuildVoiceStates(list) }
@@ -541,6 +599,51 @@ final class Store: ObservableObject {
             self.error = error.localizedDescription
             return false
         }
+    }
+
+    // MARK: - Кнопки и меню ботов
+
+    private func guildId(forChannelId cid: String) -> String? {
+        for (gid, list) in guildChannels where list.contains(where: { $0.id == cid }) {
+            return gid
+        }
+        return nil
+    }
+
+    private func sendInteraction(_ m: Message, data: [String: Any]) async {
+        guard let api else { return }
+        guard let session = gatewaySessionId else {
+            error = "Сессия Discord ещё не готова. Подожди секунду и повтори."
+            return
+        }
+        let ms = UInt64(Date().timeIntervalSince1970 * 1000)
+        let nonce = String((ms &- 1_420_070_400_000) << 22)
+        var body: [String: Any] = [
+            "type": 3,
+            "nonce": nonce,
+            "channel_id": m.channel_id,
+            "message_flags": m.flags,
+            "message_id": m.id,
+            "application_id": m.application_id ?? m.author.id,
+            "session_id": session,
+            "data": data
+        ]
+        if let gid = guildId(forChannelId: m.channel_id) { body["guild_id"] = gid }
+        do {
+            try await api.noContent("POST", "/interactions", body: body)
+            try? await Task.sleep(nanoseconds: 1_200_000_000)
+            await loadMessages(m.channel_id, silent: true)
+        } catch {
+            self.error = "Не удалось нажать кнопку: " + error.localizedDescription
+        }
+    }
+
+    func pressButton(_ m: Message, customId: String) async {
+        await sendInteraction(m, data: ["component_type": 2, "custom_id": customId])
+    }
+
+    func selectOption(_ m: Message, customId: String, values: [String]) async {
+        await sendInteraction(m, data: ["component_type": 3, "custom_id": customId, "type": 3, "values": values])
     }
 
     func toggleReaction(_ emoji: EmojiRef, on m: Message) async {

@@ -5,7 +5,7 @@ import UniformTypeIdentifiers
 struct MainView: View {
     @EnvironmentObject var store: Store
     @EnvironmentObject var translator: Translator
-    @State private var selection: String? = nil   // nil = личные сообщения
+    @State private var selection: String? = UserDefaults.standard.string(forKey: "lastSelection")   // nil = личные сообщения
     @State private var collapsed: Set<String> = []
     @State private var confirmLogout = false
     @State private var showVoice = false
@@ -39,6 +39,14 @@ struct MainView: View {
         .fullScreenCover(isPresented: $showVoice) {
             VoiceView(voice: store.voice) { showVoice = false }
                 .environmentObject(store)
+        }
+        .onChange(of: selection) { _, new in
+            UserDefaults.standard.set(new, forKey: "lastSelection")
+        }
+        .task(id: store.guilds.count) {
+            if let s = selection, !store.guilds.isEmpty, !store.guilds.contains(where: { $0.id == s }) {
+                selection = nil
+            }
         }
         .confirmationDialog("Аккаунт", isPresented: $confirmLogout, titleVisibility: .hidden) {
             Button("Выйти из аккаунта", role: .destructive) { store.logout() }

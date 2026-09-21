@@ -40,6 +40,7 @@ struct ChatView: View {
     @State private var suggestions: [Suggestion] = []
     @State private var suggestionTask: Task<Void, Never>?
     @State private var editing: Message?
+    @State private var videoItem: ViewerItem?
 
     private struct Suggestion: Identifiable {
         let id: String
@@ -113,6 +114,10 @@ struct ChatView: View {
             }
             .task(id: translateKey) { await runIncomingTranslation() }
             .fullScreenCover(item: $viewer) { item in viewerCover(item) }
+            .fullScreenCover(item: $videoItem) { item in
+                VideoViewer(url: item.url) { videoItem = nil }
+                    .environmentObject(store)
+            }
             .task { await poll() }
             .task {
                 if let gid = guildId { await store.loadRoles(gid) }
@@ -269,6 +274,7 @@ struct ChatView: View {
                             authorName: store.guildNick(guildId: guildId, user: m.author, fallbackNick: m.member_nick),
                             authorColor: store.roleColor(guildId: guildId, userId: m.author.id, fallbackRoles: m.member_roles),
                             onImage: { url in viewer = ViewerItem(url: url) },
+                            onVideo: { url in videoItem = ViewerItem(url: url) },
                             onProfile: { u in profileUser = u },
                             onReply: { replyTo = m },
                             onMenu: { actionMessage = m },
@@ -926,6 +932,7 @@ struct MessageRow: View {
     let authorName: String
     let authorColor: Color?
     let onImage: (URL) -> Void
+    let onVideo: (URL) -> Void
     let onProfile: (User) -> Void
     let onReply: () -> Void
     let onMenu: () -> Void
@@ -959,6 +966,16 @@ struct MessageRow: View {
         .onLongPressGesture(minimumDuration: 0.4) {
             UIImpactFeedbackGenerator(style: .medium).impactOccurred()
             onMenu()
+        }
+    }
+
+    /// Если сообщение состоит только из ссылки на гифку или картинку, ссылку прячем (как в Discord).
+    private var hideText: Bool {
+        let t = message.content.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard t.hasPrefix("http"), !t.contains(" "), !t.contains("\n") else { return false }
+        return message.embeds.contains { e in
+            let type = e.type ?? ""
+            return (type == "gifv" || type == "image") && e.url == t
         }
     }
 
@@ -1006,13 +1023,11 @@ struct MessageRow: View {
                     if showHeader { header }
                     if let tr = translation {
                         RichText(raw: tr.text, mentions: message.mentions)
-                    } else if !message.content.isEmpty {
+                    } else if !message.content.isEmpty && !hideText {
                         RichText(raw: message.content, mentions: message.mentions)
                     }
                     if let f = message.forwarded { forwardedBlock(f) }
-                    ForEach(message.attachments) { a in
-                        AttachmentView(attachment: a, onImage: onImage)
-                    }
+                    MessageMedia(message: message, onImage: onImage, onVideo: onVideo)
                     if !message.reactions.isEmpty {
                         FlowLayout(spacing: 6) {
                             ForEach(message.reactions) { r in

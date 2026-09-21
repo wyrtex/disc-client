@@ -199,6 +199,11 @@ final class VoiceAudio {
         stateLock.unlock()
     }
 
+    /// Убедиться, что движок жив (например, после возврата из фона).
+    func ensureRunning() {
+        control.async { [weak self] in self?.restartIfNeeded() }
+    }
+
     private func restartIfNeeded() {
         stateLock.lock()
         guard running else {

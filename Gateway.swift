@@ -26,6 +26,8 @@ final class Gateway {
     var onReady: (() -> Void)?
     /// Голосовые состояния участников по серверам (из READY и GUILD_CREATE).
     var onGuildVoiceStates: (([(String, [[String: Any]])]) -> Void)?
+    /// Идентификатор сессии (нужен для нажатий на кнопки ботов).
+    var onSessionId: ((String) -> Void)?
 
     init(token: String, session: URLSession) {
         self.token = token
@@ -158,6 +160,7 @@ final class Gateway {
             if t == "READY" {
                 if let d = obj["d"] as? [String: Any] {
                     sessionId = d["session_id"] as? String
+                    if let sid = sessionId { onSessionId?(sid) }
                     resumeURL = d["resume_gateway_url"] as? String
                     if let guilds = d["guilds"] as? [[String: Any]] {
                         emitVoiceStates(guilds)

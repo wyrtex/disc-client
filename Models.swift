@@ -296,6 +296,7 @@ struct Attachment: Decodable, Identifiable {
     let content_type: String?
     let duration_secs: Double?
     let waveform: String?
+    let proxy_url: String?
 
     var isVoice: Bool { waveform != nil }
 
@@ -324,7 +325,14 @@ struct Attachment: Decodable, Identifiable {
         return ["png", "jpg", "jpeg", "gif", "webp", "heic"].contains(ext)
     }
 
-    var isVideo: Bool { content_type?.hasPrefix("video/") ?? false }
+    /// Видео, которое умеет играть iOS. У части вложений тип не указан, тогда смотрим на расширение.
+    var isVideo: Bool {
+        if let t = content_type, t.hasPrefix("video/") {
+            return !t.contains("webm") && !t.contains("matroska")
+        }
+        let ext = (filename as NSString).pathExtension.lowercased()
+        return ["mp4", "mov", "m4v"].contains(ext)
+    }
 
     var sizeText: String {
         ByteCountFormatter.string(fromByteCount: Int64(size ?? 0), countStyle: .file)
@@ -427,6 +435,11 @@ struct Message: Decodable, Identifiable {
     let mention_everyone: Bool
     let member_roles: [String]
     let member_nick: String?
+    let embeds: [Embed]
+    let components: [Component]
+    let stickers: [StickerItem]
+    let flags: Int
+    let application_id: String?
     let reply: ReplyRef?
     let reactions: [Reaction]
     let forwarded: ForwardedContent?
@@ -435,6 +448,7 @@ struct Message: Decodable, Identifiable {
     enum CodingKeys: String, CodingKey {
         case id, channel_id, content, author, timestamp, attachments, mentions
         case mention_roles, mention_everyone, member
+        case embeds, components, sticker_items, flags, application_id
         case referenced_message, reactions, message_snapshots
     }
 
@@ -452,6 +466,11 @@ struct Message: Decodable, Identifiable {
         mentions = (try? c.decode([User].self, forKey: .mentions)) ?? []
         mention_roles = (try? c.decode([String].self, forKey: .mention_roles)) ?? []
         mention_everyone = (try? c.decode(Bool.self, forKey: .mention_everyone)) ?? false
+        embeds = (try? c.decode([Embed].self, forKey: .embeds)) ?? []
+        components = (try? c.decode([Component].self, forKey: .components)) ?? []
+        stickers = (try? c.decode([StickerItem].self, forKey: .sticker_items)) ?? []
+        flags = (try? c.decode(Int.self, forKey: .flags)) ?? 0
+        application_id = try? c.decodeIfPresent(String.self, forKey: .application_id)
         if let mc = try? c.nestedContainer(keyedBy: MemberKeys.self, forKey: .member) {
             member_roles = (try? mc.decode([String].self, forKey: .roles)) ?? []
             member_nick = try? mc.decodeIfPresent(String.self, forKey: .nick)
@@ -501,4 +520,158 @@ struct Message: Decodable, Identifiable {
 struct MemberSearchItem: Decodable {
     let user: User
     let nick: String?
+}
+
+
+// MARK: - Эмбеды, стикеры и компоненты сообщений
+
+struct EmbedMedia: Decodable {
+    let url: String?
+    let proxy_url: String?
+    let width: Int?
+    let height: Int?
+
+    /// Лучше брать адрес через прокси Discord: он стабильнее и отдаёт нужный формат.
+    var best: URL? {
+        if let p = proxy_url, let u = URL(string: p) { return u }
+        if let s = url, let u = URL(string: s) { return u }
+        return nil
+    }
+}
+
+struct EmbedFooter: Decodable {
+    let text: String?
+    let icon_url: String?
+}
+
+struct EmbedProvider: Decodable {
+    let name: String?
+}
+
+struct EmbedAuthor: Decodable {
+    let name: String?
+    let url: String?
+    let icon_url: String?
+}
+
+struct EmbedField: Decodable {
+    let name: String
+    let value: String
+    let inline: Bool?
+}
+
+struct Embed: Decodable {
+    let type: String?
+    let title: String?
+    let description: String?
+    let url: String?
+    let color: Int?
+    let timestamp: String?
+    let footer: EmbedFooter?
+    let image: EmbedMedia?
+    let thumbnail: EmbedMedia?
+    let video: EmbedMedia?
+    let provider: EmbedProvider?
+    let author: EmbedAuthor?
+    let fields: [EmbedField]?
+}
+
+struct StickerItem: Decodable, Identifiable {
+    let id: String
+    let name: String
+    let format_type: Int
+
+    /// PNG и APNG показываем как картинку, GIF как анимацию. Lottie (3) не поддерживаем.
+    var url: URL? {
+        switch format_type {
+        case 1, 2: return URL(string: "https://media.discordapp.net/stickers/\(id).png?size=160")
+        case 4: return URL(string: "https://media.discordapp.net/stickers/\(id).gif?size=160")
+        default: return nil
+        }
+    }
+}
+
+struct SelectOption: Decodable, Identifiable {
+    let label: String
+    let value: String
+    let description: String?
+    let emoji: EmojiRef?
+    let isDefault: Bool?
+
+    var id: String { value }
+
+    enum CodingKeys: String, CodingKey {
+        case label, value, description, emoji
+        case isDefault = "default"
+    }
+}
+
+struct GalleryItem: Decodable {
+    let media: EmbedMedia
+    let description: String?
+}
+
+struct FileRef: Decodable {
+    let url: String?
+}
+
+/// Компонент сообщения бота: кнопка, меню, а также блоки нового формата (текст, контейнер, галерея и т.д.).
+struct Component: Decodable, Identifiable {
+    let uid = UUID()
+    var id: UUID { uid }
+
+    let type: Int
+    let style: Int?
+    let label: String?
+    let emoji: EmojiRef?
+    let custom_id: String?
+    let url: String?
+    let disabled: Bool
+    let children: [Component]
+    let options: [SelectOption]
+    let placeholder: String?
+    let content: String?
+    let accessory: [Component]
+    let mediaItems: [GalleryItem]
+    let divider: Bool
+    let accent_color: Int?
+    let fileURL: String?
+
+    enum CodingKeys: String, CodingKey {
+        case type, style, label, emoji, custom_id, url, disabled, components
+        case options, placeholder, content, accessory, items, media
+        case divider, accent_color, file
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        type = try c.decode(Int.self, forKey: .type)
+        style = try? c.decode(Int.self, forKey: .style)
+        label = try? c.decodeIfPresent(String.self, forKey: .label)
+        emoji = try? c.decode(EmojiRef.self, forKey: .emoji)
+        custom_id = try? c.decodeIfPresent(String.self, forKey: .custom_id)
+        url = try? c.decodeIfPresent(String.self, forKey: .url)
+        disabled = (try? c.decode(Bool.self, forKey: .disabled)) ?? false
+        children = (try? c.decode([Component].self, forKey: .components)) ?? []
+        options = (try? c.decode([SelectOption].self, forKey: .options)) ?? []
+        placeholder = try? c.decodeIfPresent(String.self, forKey: .placeholder)
+        content = try? c.decodeIfPresent(String.self, forKey: .content)
+        if let a = try? c.decode(Component.self, forKey: .accessory) {
+            accessory = [a]
+        } else {
+            accessory = []
+        }
+        var items = (try? c.decode([GalleryItem].self, forKey: .items)) ?? []
+        if let m = try? c.decode(EmbedMedia.self, forKey: .media) {
+            items = [GalleryItem(media: m, description: nil)]
+        }
+        mediaItems = items
+        divider = (try? c.decode(Bool.self, forKey: .divider)) ?? true
+        accent_color = try? c.decodeIfPresent(Int.self, forKey: .accent_color)
+        if let f = try? c.decode(FileRef.self, forKey: .file) {
+            fileURL = f.url
+        } else {
+            fileURL = nil
+        }
+    }
 }

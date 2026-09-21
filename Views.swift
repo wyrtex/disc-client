@@ -7,6 +7,8 @@ struct RootView: View {
         Group {
             if store.me != nil {
                 MainView()
+            } else if store.isRestoring {
+                SplashView()
             } else {
                 LoginView()
             }
@@ -117,5 +119,22 @@ struct LoginView: View {
                 .foregroundStyle(Theme.muted)
         }
         .padding(.top, 8)
+    }
+}
+
+
+/// Пока идёт вход по сохранённому токену, показываем спокойную заставку, а не экран входа.
+struct SplashView: View {
+    var body: some View {
+        ZStack {
+            Theme.chat.ignoresSafeArea()
+            VStack(spacing: 16) {
+                Image(systemName: "bubble.left.and.bubble.right.fill")
+                    .font(.system(size: 44))
+                    .foregroundStyle(Theme.blurple)
+                ProgressView()
+                    .tint(.white)
+            }
+        }
     }
 }

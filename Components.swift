@@ -1,4 +1,5 @@
 import SwiftUI
+import ImageIO
 
 /// Ограничитель числа одновременных задач (чтобы аватарки не душили канал, по которому идёт голос).
 actor AsyncLimiter {
@@ -87,6 +88,52 @@ final class ImageLoader {
             if attempt == 0 { try? await Task.sleep(nanoseconds: 500_000_000) }
         }
         return nil
+    }
+
+    // MARK: Анимированные GIF
+
+    private let animatedCache = NSCache<NSURL, UIImage>()
+
+    func animatedImage(for url: URL) async -> UIImage? {
+        if let c = animatedCache.object(forKey: url as NSURL) { return c }
+        let s = session
+        let l = limiter
+        await l.acquire()
+        var data: Data?
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 30
+        req.cachePolicy = .returnCacheDataElseLoad
+        if let (d, resp) = try? await s.data(for: req) {
+            let ok = (resp as? HTTPURLResponse).map { (200..<300).contains($0.statusCode) } ?? true
+            if ok { data = d }
+        }
+        await l.release()
+        guard let data, let img = ImageLoader.decodeAnimated(data) else { return nil }
+        animatedCache.setObject(img, forKey: url as NSURL)
+        return img
+    }
+
+    static func decodeAnimated(_ data: Data) -> UIImage? {
+        guard let src = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
+        let count = CGImageSourceGetCount(src)
+        if count <= 1 { return UIImage(data: data) }
+        var frames: [UIImage] = []
+        var total = 0.0
+        for i in 0..<min(count, 120) {
+            guard let cg = CGImageSourceCreateImageAtIndex(src, i, nil) else { continue }
+            frames.append(UIImage(cgImage: cg))
+            var delay = 0.1
+            if let props = CGImageSourceCopyPropertiesAtIndex(src, i, nil) as? [CFString: Any],
+               let gif = props[kCGImagePropertyGIFDictionary] as? [CFString: Any] {
+                delay = (gif[kCGImagePropertyGIFUnclampedDelayTime] as? Double)
+                    ?? (gif[kCGImagePropertyGIFDelayTime] as? Double)
+                    ?? 0.1
+                if delay < 0.02 { delay = 0.1 }
+            }
+            total += delay
+        }
+        guard !frames.isEmpty else { return nil }
+        return UIImage.animatedImage(with: frames, duration: total)
     }
 
     /// Кастомный эмодзи, уменьшенный до нужного размера в пунктах.

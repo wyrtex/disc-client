@@ -18,8 +18,16 @@ struct DiscApp: App {
                 .environmentObject(translator)
                 .preferredColorScheme(.dark)
                 .onChange(of: scenePhase) { _, phase in
-                    // После сворачивания iOS убивает сокет, проверяем связь при возвращении.
-                    if phase == .active { store.appBecameActive() }
+                    switch phase {
+                    case .active:
+                        // После сворачивания iOS мог убить сокет, проверяем связь при возвращении.
+                        store.appBecameActive()
+                        store.voice.appDidBecomeActive()
+                    case .background:
+                        store.voice.appDidEnterBackground()
+                    default:
+                        break
+                    }
                 }
         }
     }
