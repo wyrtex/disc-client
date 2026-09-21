@@ -152,15 +152,20 @@ struct VoiceView: View {
 // MARK: - Плитка участника
 
 struct ParticipantTile: View {
+    @EnvironmentObject var store: Store
     @ObservedObject var voice: VoiceSpike
     let id: String
+
+    private var user: User? {
+        voice.users[id] ?? store.voiceUsers[id] ?? (store.me?.id == id ? store.me : nil)
+    }
 
     var body: some View {
         TimelineView(.periodic(from: .now, by: 0.25)) { ctx in
             let speaking = ctx.date.timeIntervalSince(voice.lastHeard[id] ?? .distantPast) < 0.6
             let flag = voice.flags[id] ?? VoiceFlags()
             VStack(spacing: 8) {
-                AvatarView(user: voice.users[id], size: 76)
+                AvatarView(user: user, size: 76)
                 Text(name)
                     .font(.system(size: 14, weight: .semibold))
                     .foregroundStyle(Theme.text)
@@ -189,7 +194,7 @@ struct ParticipantTile: View {
     }
 
     private var name: String {
-        if let u = voice.users[id] { return u.displayName + (id == voice.userId ? " (ты)" : "") }
+        if let u = user { return u.displayName + (id == voice.userId ? " (ты)" : "") }
         return id == voice.userId ? "Ты" : "…"
     }
 
@@ -258,7 +263,12 @@ struct VoiceMemberRow: View {
 // MARK: - Субтитры
 
 struct CaptionsPanel: View {
+    @EnvironmentObject var store: Store
     @ObservedObject var voice: VoiceSpike
+
+    private func user(_ id: String) -> User? {
+        voice.users[id] ?? store.voiceUsers[id] ?? (store.me?.id == id ? store.me : nil)
+    }
 
     private var langName: String {
         TranscriptLanguage.all.first(where: { $0.code == voice.captionLang })?.name ?? voice.captionLang
@@ -303,9 +313,9 @@ struct CaptionsPanel: View {
                     LazyVStack(alignment: .leading, spacing: 8) {
                         ForEach(voice.captions) { c in
                             HStack(alignment: .top, spacing: 8) {
-                                AvatarView(user: voice.users[c.userId], size: 24)
+                                AvatarView(user: user(c.userId), size: 24)
                                 VStack(alignment: .leading, spacing: 1) {
-                                    Text(voice.users[c.userId]?.displayName ?? (c.userId == voice.userId ? "Ты" : "…"))
+                                    Text(user(c.userId)?.displayName ?? (c.userId == voice.userId ? "Ты" : "…"))
                                         .font(.system(size: 11, weight: .bold))
                                         .foregroundStyle(Theme.muted)
                                     Text(c.text)

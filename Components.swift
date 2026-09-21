@@ -1,20 +1,92 @@
 import SwiftUI
 
+/// Ограничитель числа одновременных задач (чтобы аватарки не душили канал, по которому идёт голос).
+actor AsyncLimiter {
+    private var running = 0
+    private var limit: Int
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    init(limit: Int) { self.limit = limit }
+
+    func setLimit(_ n: Int) { limit = max(1, n) }
+
+    func acquire() async {
+        if running < limit {
+            running += 1
+            return
+        }
+        await withCheckedContinuation { cont in
+            waiters.append(cont)
+        }
+    }
+
+    func release() {
+        if waiters.isEmpty {
+            running -= 1
+        } else {
+            let w = waiters.removeFirst()
+            w.resume()
+        }
+    }
+}
+
 final class ImageLoader {
     static let shared = ImageLoader()
     var session: URLSession = .shared
     private let cache = NSCache<NSURL, UIImage>()
+    private let lock = NSLock()
+    private var inflight: [URL: Task<UIImage?, Never>] = [:]
+    private let limiter = AsyncLimiter(limit: 6)
+
+    init() {
+        cache.countLimit = 500
+    }
+
+    /// Во время голосового звонка грузим меньше картинок одновременно.
+    func setLimit(_ n: Int) {
+        let l = limiter
+        Task { await l.setLimit(n) }
+    }
 
     func image(for url: URL) async -> UIImage? {
         if let cached = cache.object(forKey: url as NSURL) { return cached }
-        do {
-            let (data, _) = try await session.data(from: url)
-            guard let img = UIImage(data: data) else { return nil }
-            cache.setObject(img, forKey: url as NSURL)
-            return img
-        } catch {
-            return nil
+
+        lock.lock()
+        if let existing = inflight[url] {
+            lock.unlock()
+            return await existing.value
         }
+        let s = session
+        let l = limiter
+        let task = Task<UIImage?, Never> {
+            await l.acquire()
+            let result = await ImageLoader.fetch(url, session: s)
+            await l.release()
+            return result
+        }
+        inflight[url] = task
+        lock.unlock()
+
+        let img = await task.value
+        if let img { cache.setObject(img, forKey: url as NSURL) }
+        lock.lock()
+        inflight[url] = nil
+        lock.unlock()
+        return img
+    }
+
+    private static func fetch(_ url: URL, session: URLSession) async -> UIImage? {
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 20
+        req.cachePolicy = .returnCacheDataElseLoad
+        for attempt in 0..<2 {
+            if let (data, resp) = try? await session.data(for: req) {
+                let ok = (resp as? HTTPURLResponse).map { (200..<300).contains($0.statusCode) } ?? true
+                if ok, let img = UIImage(data: data) { return img }
+            }
+            if attempt == 0 { try? await Task.sleep(nanoseconds: 500_000_000) }
+        }
+        return nil
     }
 
     /// Кастомный эмодзи, уменьшенный до нужного размера в пунктах.
@@ -113,15 +185,32 @@ enum DiscordText {
     }
 }
 
-/// Текст сообщения: разметка + кастомные эмодзи картинками прямо в строке.
+// MARK: - Текущий сервер в окружении
+
+private struct GuildIDKey: EnvironmentKey {
+    static let defaultValue: String? = nil
+}
+
+extension EnvironmentValues {
+    var currentGuildId: String? {
+        get { self[GuildIDKey.self] }
+        set { self[GuildIDKey.self] = newValue }
+    }
+}
+
+/// Текст сообщения: разметка, кастомные эмодзи картинками, упоминания (пользователи, роли, каналы), время.
 struct RichText: View {
     let raw: String
     let mentions: [User]
+    @EnvironmentObject var store: Store
+    @Environment(\.currentGuildId) private var guildId
     @State private var images: [String: UIImage] = [:]
 
     enum Token {
         case text(String)
         case emoji(id: String, name: String)
+        case mention(kind: String, id: String)
+        case time(seconds: Double, style: String)
 
         var isEmoji: Bool {
             if case .emoji = self { return true }
@@ -129,16 +218,36 @@ struct RichText: View {
         }
     }
 
+    private static let tokenRegex = try? NSRegularExpression(
+        pattern: "<a?:(\\w+):(\\d+)>|<@!?(\\d+)>|<@&(\\d+)>|<#(\\d+)>|<t:(-?\\d+)(?::([a-zA-Z]))?>"
+    )
+
     static func tokenize(_ s: String) -> [Token] {
-        guard let re = try? NSRegularExpression(pattern: "<a?:(\\w+):(\\d+)>") else { return [.text(s)] }
+        guard let re = tokenRegex else { return [.text(s)] }
         let ns = s as NSString
         var out: [Token] = []
         var last = 0
+
+        func group(_ m: NSTextCheckingResult, _ i: Int) -> String? {
+            let r = m.range(at: i)
+            return r.location == NSNotFound ? nil : ns.substring(with: r)
+        }
+
         for m in re.matches(in: s, range: NSRange(location: 0, length: ns.length)) {
             if m.range.location > last {
                 out.append(.text(ns.substring(with: NSRange(location: last, length: m.range.location - last))))
             }
-            out.append(.emoji(id: ns.substring(with: m.range(at: 2)), name: ns.substring(with: m.range(at: 1))))
+            if let id = group(m, 2), let name = group(m, 1) {
+                out.append(.emoji(id: id, name: name))
+            } else if let id = group(m, 3) {
+                out.append(.mention(kind: "u", id: id))
+            } else if let id = group(m, 4) {
+                out.append(.mention(kind: "r", id: id))
+            } else if let id = group(m, 5) {
+                out.append(.mention(kind: "c", id: id))
+            } else if let t = group(m, 6), let secs = Double(t) {
+                out.append(.time(seconds: secs, style: group(m, 7) ?? "f"))
+            }
             last = m.range.location + m.range.length
         }
         if last < ns.length { out.append(.text(ns.substring(from: last))) }
@@ -152,6 +261,7 @@ struct RichText: View {
             switch tok {
             case .emoji: return true
             case .text(let s): return s.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            default: return false
             }
         }
         return count > 0 && count <= 6 && onlyEmoji
@@ -172,6 +282,54 @@ struct RichText: View {
             }
     }
 
+    private func mentionName(kind: String, id: String) -> String {
+        switch kind {
+        case "u":
+            if let u = mentions.first(where: { $0.id == id }) { return "@" + u.displayName }
+            if let u = store.voiceUsers[id] { return "@" + u.displayName }
+            if let me = store.me, me.id == id { return "@" + me.displayName }
+            return "@пользователь"
+        case "r":
+            if let gid = guildId,
+               let role = store.guildRoles[gid]?.first(where: { $0.id == id }) {
+                return "@" + role.name
+            }
+            return "@роль"
+        default:
+            if let name = store.channelName(id) { return "#" + name }
+            return "#канал"
+        }
+    }
+
+    private static let timeDate: DateFormatter = {
+        let f = DateFormatter()
+        f.dateStyle = .medium
+        f.timeStyle = .short
+        return f
+    }()
+
+    private func timeString(_ secs: Double, style: String) -> String {
+        let d = Date(timeIntervalSince1970: secs)
+        let f = DateFormatter()
+        switch style {
+        case "R":
+            return RelativeDateTimeFormatter().localizedString(for: d, relativeTo: Date())
+        case "t":
+            f.dateStyle = .none; f.timeStyle = .short
+        case "T":
+            f.dateStyle = .none; f.timeStyle = .medium
+        case "d":
+            f.dateStyle = .short; f.timeStyle = .none
+        case "D":
+            f.dateStyle = .long; f.timeStyle = .none
+        case "F":
+            f.dateStyle = .full; f.timeStyle = .short
+        default:
+            f.dateStyle = .long; f.timeStyle = .short
+        }
+        return f.string(from: d)
+    }
+
     private func build() -> Text {
         var result = Text("")
         for t in RichText.tokenize(raw) {
@@ -184,6 +342,15 @@ struct RichText: View {
                 } else {
                     result = result + Text(":\(name):")
                 }
+            case .mention(let kind, let id):
+                var a = AttributedString(mentionName(kind: kind, id: id))
+                a.foregroundColor = Color(hex: 0xC9CDFB)
+                a.backgroundColor = Theme.blurple.opacity(0.3)
+                result = result + Text(a)
+            case .time(let secs, let style):
+                var a = AttributedString(timeString(secs, style: style))
+                a.backgroundColor = Color.white.opacity(0.12)
+                result = result + Text(a)
             }
         }
         return result

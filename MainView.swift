@@ -105,6 +105,10 @@ struct ServerRail: View {
                 ForEach(store.guilds) { g in
                     RailItem(selected: selection == g.id, action: { selection = g.id }) {
                         GuildIcon(guild: g, selected: selection == g.id)
+                            .overlay(alignment: .bottomTrailing) {
+                                GuildVoiceBadge(state: store.guildVoiceSummary(g.id))
+                                    .offset(x: 5, y: 5)
+                            }
                     }
                 }
             }
@@ -131,10 +135,13 @@ struct ChannelPanel: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            header
+            if guild == nil { header }
             ScrollView {
                 if let g = guild {
-                    guildContent(g)
+                    VStack(spacing: 0) {
+                        guildHeader(g)
+                        guildContent(g)
+                    }
                 } else {
                     dmContent
                 }
@@ -153,7 +160,9 @@ struct ChannelPanel: View {
         .ignoresSafeArea(edges: .bottom)
         .simultaneousGesture(openLastChatSwipe)
         .task(id: selection) {
+            store.selectedGuildId = selection
             if let g = guild {
+                store.resolveVoiceUsers(guildId: g.id)
                 await store.loadGuildChannels(g)
                 _ = await store.loadGuildDetail(g.id)
             }
@@ -180,7 +189,75 @@ struct ChannelPanel: View {
             }
     }
 
-    // MARK: Шапка
+    // MARK: Шапка сервера (баннер, название, статистика). Прокручивается вместе со списком.
+
+    private func guildHeader(_ g: Guild) -> some View {
+        let detail = store.guildDetails[g.id]
+        let banner = detail?.bannerURL
+        let height: CGFloat = banner == nil ? 76 : 150
+        return Button {
+            showServer = true
+        } label: {
+            ZStack(alignment: .bottomLeading) {
+                if let banner {
+                    RemoteImage(url: banner) { Theme.panel }
+                        .frame(maxWidth: .infinity)
+                        .frame(height: height)
+                        .clipped()
+                    LinearGradient(
+                        colors: [Color.clear, Color.black.opacity(0.7)],
+                        startPoint: .top,
+                        endPoint: .bottom
+                    )
+                    .frame(height: height)
+                }
+                VStack(alignment: .leading, spacing: 5) {
+                    HStack(spacing: 6) {
+                        Text(g.name)
+                            .font(.system(size: 18, weight: .bold))
+                            .foregroundStyle(Theme.text)
+                            .lineLimit(1)
+                        Image(systemName: "chevron.right")
+                            .font(.system(size: 11, weight: .bold))
+                            .foregroundStyle(Theme.muted)
+                    }
+                    guildStats(detail)
+                }
+                .padding(.horizontal, 16)
+                .padding(.bottom, 10)
+            }
+            .frame(maxWidth: .infinity)
+            .frame(height: height, alignment: .bottomLeading)
+            .overlay(alignment: .bottom) {
+                Rectangle().fill(Color.black.opacity(0.25)).frame(height: 1)
+            }
+        }
+        .buttonStyle(.plain)
+    }
+
+    @ViewBuilder
+    private func guildStats(_ detail: GuildDetail?) -> some View {
+        if let d = detail, d.approximate_presence_count != nil || d.approximate_member_count != nil {
+            HStack(spacing: 12) {
+                if let online = d.approximate_presence_count {
+                    HStack(spacing: 5) {
+                        Circle().fill(Theme.green).frame(width: 8, height: 8)
+                        Text("\(online.formatted()) в сети")
+                    }
+                }
+                if let total = d.approximate_member_count {
+                    HStack(spacing: 5) {
+                        Circle().fill(Theme.muted).frame(width: 8, height: 8)
+                        Text("\(total.formatted()) участников")
+                    }
+                }
+            }
+            .font(.system(size: 12, weight: .medium))
+            .foregroundStyle(Theme.text.opacity(0.85))
+        }
+    }
+
+    // MARK: Шапка (личные сообщения)
 
     private var header: some View {
         Button {
@@ -378,5 +455,39 @@ struct UserBar: View {
             .padding(.bottom, 28)
         }
         .buttonStyle(.plain)
+    }
+}
+
+
+/// Значок на иконке сервера: LIVE (кто-то стримит), камера или просто люди в голосе.
+struct GuildVoiceBadge: View {
+    let state: GuildVoiceSummary
+
+    var body: some View {
+        switch state {
+        case .none:
+            EmptyView()
+        case .voice:
+            badge(icon: "speaker.wave.2.fill", color: Theme.green)
+        case .video:
+            badge(icon: "video.fill", color: Theme.green)
+        case .stream:
+            Text("LIVE")
+                .font(.system(size: 9, weight: .heavy))
+                .foregroundStyle(.white)
+                .padding(.horizontal, 5)
+                .frame(height: 16)
+                .background(Color.red, in: Capsule())
+                .overlay(Capsule().stroke(Theme.rail, lineWidth: 2))
+        }
+    }
+
+    private func badge(icon: String, color: Color) -> some View {
+        Image(systemName: icon)
+            .font(.system(size: 9, weight: .bold))
+            .foregroundStyle(.white)
+            .frame(width: 18, height: 18)
+            .background(color, in: Circle())
+            .overlay(Circle().stroke(Theme.rail, lineWidth: 2))
     }
 }

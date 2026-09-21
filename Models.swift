@@ -393,6 +393,8 @@ struct Message: Decodable, Identifiable {
     let timestamp: String
     let attachments: [Attachment]
     let mentions: [User]
+    let mention_roles: [String]
+    let mention_everyone: Bool
     let reply: ReplyRef?
     let reactions: [Reaction]
     let forwarded: ForwardedContent?
@@ -400,6 +402,7 @@ struct Message: Decodable, Identifiable {
 
     enum CodingKeys: String, CodingKey {
         case id, channel_id, content, author, timestamp, attachments, mentions
+        case mention_roles, mention_everyone
         case referenced_message, reactions, message_snapshots
     }
 
@@ -413,6 +416,8 @@ struct Message: Decodable, Identifiable {
         timestamp = ts
         attachments = (try? c.decode([Attachment].self, forKey: .attachments)) ?? []
         mentions = (try? c.decode([User].self, forKey: .mentions)) ?? []
+        mention_roles = (try? c.decode([String].self, forKey: .mention_roles)) ?? []
+        mention_everyone = (try? c.decode(Bool.self, forKey: .mention_everyone)) ?? false
         reply = try? c.decode(ReplyRef.self, forKey: .referenced_message)
         reactions = (try? c.decode([Reaction].self, forKey: .reactions)) ?? []
         forwarded = (try? c.decode([ForwardedContent].self, forKey: .message_snapshots))?.first
@@ -449,4 +454,10 @@ struct Message: Decodable, Identifiable {
         if Calendar.current.isDateInYesterday(d) { return "Вчера, " + Message.hm.string(from: d) }
         return Message.full.string(from: d)
     }
+}
+
+/// Результат поиска участников сервера (для подсказок при вводе @).
+struct MemberSearchItem: Decodable {
+    let user: User
+    let nick: String?
 }

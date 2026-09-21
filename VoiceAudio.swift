@@ -53,6 +53,7 @@ final class VoiceAudio {
     private final class PlayerChannel {
         let node = AVAudioPlayerNode()
         var pending = 0
+        var lastCompletion = Date()
     }
     private var channels: [UInt32: PlayerChannel] = [:]
 
@@ -200,12 +201,27 @@ final class VoiceAudio {
 
     private func restartIfNeeded() {
         stateLock.lock()
-        let isRunning = running
+        guard running else {
+            stateLock.unlock()
+            return
+        }
         let e = engine
+        var stale: [PlayerChannel] = []
+        if !e.isRunning {
+            // После остановки движка старые плееры «зависают», создадим их заново.
+            stale = Array(channels.values)
+            channels = [:]
+        }
         stateLock.unlock()
-        guard isRunning else { return }
+
         try? AVAudioSession.sharedInstance().setActive(true)
-        if !e.isRunning { try? e.start() }
+        if !e.isRunning {
+            for c in stale {
+                c.node.stop()
+                e.detach(c.node)
+            }
+            try? e.start()
+        }
         VoiceAudio.setSpeaker(speakerOn)
     }
 
@@ -296,6 +312,14 @@ final class VoiceAudio {
 
         pendingLock.lock()
         if ch.pending > 25 {
+            if Date().timeIntervalSince(ch.lastCompletion) > 1.0 {
+                // Счётчик завис (например, после перезапуска движка): сбрасываем плеер.
+                ch.pending = 0
+                ch.lastCompletion = Date()
+                pendingLock.unlock()
+                ch.node.stop()
+                return
+            }
             // Очередь разрослась: пропускаем, чтобы не копить задержку.
             pendingLock.unlock()
             return
@@ -307,7 +331,8 @@ final class VoiceAudio {
         ch.node.scheduleBuffer(buffer, completionCallbackType: .dataPlayedBack) { [weak self, weak ch] _ in
             guard let self, let ch else { return }
             self.pendingLock.lock()
-            ch.pending -= 1
+            ch.pending = max(0, ch.pending - 1)
+            ch.lastCompletion = Date()
             self.pendingLock.unlock()
         }
         if !ch.node.isPlaying && pendingNow >= 3 {

@@ -2,6 +2,10 @@ import Foundation
 import SwiftUI
 import SwiftOGG
 
+enum GuildVoiceSummary {
+    case none, voice, video, stream
+}
+
 struct VoiceMemberState: Equatable {
     var userId: String
     var channelId: String
@@ -28,7 +32,16 @@ final class Store: ObservableObject {
     @Published var path: [Channel] = []
     @Published var voiceRoster: [String: [String: VoiceMemberState]] = [:]
     @Published var voiceUsers: [String: User] = [:]
-    private var resolvingVoiceUsers = Set<String>()
+    @Published var memberRoles: [String: Set<String>] = [:]
+    @Published var loadingOlder: Set<String> = []
+    @Published var reachedTop: Set<String> = []
+    @Published var detachedChannels: Set<String> = []
+    var selectedGuildId: String?
+    private var userFailedAt: [String: Date] = [:]
+    private var userInFlight: [String: Task<User?, Never>] = [:]
+    private let userLimiter = AsyncLimiter(limit: 2)
+    private var loginStatus: Int?
+    private var lastLoginError: String?
     @Published var error: String?
     @Published var isLoading = false
     @Published var proxy: ProxySettings {
@@ -52,17 +65,28 @@ final class Store: ObservableObject {
             proxy = ProxySettings()
         }
         if let saved = Keychain.load() {
-            Task { await login(token: saved) }
+            Task { await autoLogin(saved) }
         }
+    }
+
+    /// Вход при запуске: если сети ещё нет (например, VPN поднимается), тихо повторяем несколько раз.
+    private func autoLogin(_ token: String) async {
+        for attempt in 0..<8 {
+            await login(token: token, silent: true)
+            if me != nil { return }
+            if let code = loginStatus, code == 401 || code == 403 { break }
+            try? await Task.sleep(nanoseconds: UInt64(2 + attempt) * 1_000_000_000)
+        }
+        if me == nil { error = lastLoginError }
     }
 
     // MARK: - Вход / выход
 
-    func login(token: String) async {
+    func login(token: String, silent: Bool = false) async {
         let clean = token.trimmingCharacters(in: CharacterSet(charactersIn: " \n\r\t\""))
         guard !clean.isEmpty else { return }
         isLoading = true
-        error = nil
+        if !silent { error = nil }
         defer { isLoading = false }
 
         let api = API(token: clean, proxy: proxy)
@@ -78,10 +102,17 @@ final class Store: ObservableObject {
             voice.session = api.session
             voice.userId = me.id
             voice.resolveUser = { [weak self] id in await self?.fetchUser(id) }
+            voice.cachedUser = { [weak self] id in
+                guard let self else { return nil }
+                if let me = self.me, me.id == id { return me }
+                return self.voiceUsers[id]
+            }
             Keychain.save(clean)
             startGateway(token: clean, session: api.session)
         } catch {
-            self.error = error.localizedDescription
+            lastLoginError = error.localizedDescription
+            if case APIError.http(let code, _) = error { loginStatus = code } else { loginStatus = nil }
+            if !silent { self.error = error.localizedDescription }
         }
     }
 
@@ -103,6 +134,9 @@ final class Store: ObservableObject {
         forumPreviews = [:]
         voiceRoster = [:]
         voiceUsers = [:]
+        memberRoles = [:]
+        reachedTop = []
+        detachedChannels = []
         path = []
         lastChannel = nil
         Keychain.delete()
@@ -167,9 +201,11 @@ final class Store: ObservableObject {
         if guildChannels[guild.id] != nil { return }
         do {
             let all: [Channel] = try await api.get("/guilds/\(guild.id)/channels")
-            if let member: GuildMember = try? await api.get("/users/@me/guilds/\(guild.id)/member"),
-               let ids = Store.viewableIDs(all, guild: guild, roles: Set(member.roles), meId: me.id) {
-                viewable[guild.id] = ids
+            if let member: GuildMember = try? await api.get("/users/@me/guilds/\(guild.id)/member") {
+                memberRoles[guild.id] = Set(member.roles)
+                if let ids = Store.viewableIDs(all, guild: guild, roles: Set(member.roles), meId: me.id) {
+                    viewable[guild.id] = ids
+                }
             }
             guildChannels[guild.id] = all
         } catch {
@@ -298,32 +334,74 @@ final class Store: ObservableObject {
         voiceUsers[uid] = user
     }
 
+    /// Профили дотягиваем только для открытого сервера, чтобы не забивать сеть (и голосовой канал).
     private func resolveMissingVoiceUsers() {
-        var needed: [String] = []
-        for map in voiceRoster.values {
-            for uid in map.keys where voiceUsers[uid] == nil && !resolvingVoiceUsers.contains(uid) {
-                needed.append(uid)
-            }
-        }
-        for id in needed.prefix(30) {
-            resolvingVoiceUsers.insert(id)
-            Task { [weak self] in
-                if let u = await self?.fetchUser(id) {
-                    self?.voiceUsers[id] = u
-                }
-                self?.resolvingVoiceUsers.remove(id)
-            }
-        }
+        if let g = selectedGuildId { resolveVoiceUsers(guildId: g) }
     }
 
     /// Профиль пользователя по id (для подписей участников голосового канала).
     func fetchUser(_ id: String) async -> User? {
         if let me, me.id == id { return me }
+        if let u = voiceUsers[id] { return u }
         guard let api else { return nil }
-        if let r: ProfileResponse = try? await api.get("/users/\(id)/profile"), let u = r.user {
-            return u
+        if let t = userFailedAt[id], Date().timeIntervalSince(t) < 90 { return nil }
+        if let existing = userInFlight[id] { return await existing.value }
+
+        let limiter = userLimiter
+        let task = Task<User?, Never> {
+            await limiter.acquire()
+            var found: User?
+            if let u: User = try? await api.get("/users/\(id)") {
+                found = u
+            } else if let r: ProfileResponse = try? await api.get("/users/\(id)/profile"), let u = r.user {
+                found = u
+            }
+            await limiter.release()
+            return found
         }
+        userInFlight[id] = task
+        let result = await task.value
+        userInFlight[id] = nil
+        if let result {
+            voiceUsers[id] = result
+        } else {
+            userFailedAt[id] = Date()
+        }
+        return result
+    }
+
+    /// Имя канала по id (для упоминаний #канал; показываем и недоступные каналы).
+    func channelName(_ id: String) -> String? {
+        for list in guildChannels.values {
+            if let c = list.first(where: { $0.id == id }) { return c.name }
+        }
+        if let dm = dms.first(where: { $0.id == id }) { return dm.title }
         return nil
+    }
+
+    /// Поиск участников сервера для подсказок при вводе @.
+    func searchMembers(guildId: String, query: String) async -> [User] {
+        guard let api, !query.isEmpty else { return [] }
+        let q = query.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? query
+        if let list: [MemberSearchItem] = try? await api.get("/guilds/\(guildId)/members/search?query=\(q)&limit=8") {
+            return list.map { $0.user }
+        }
+        return []
+    }
+
+    /// Значок сервера в левой колонке: кто-то стримит, у кого-то камера или просто есть люди в голосе.
+    func guildVoiceSummary(_ guildId: String) -> GuildVoiceSummary {
+        guard let map = voiceRoster[guildId], !map.isEmpty else { return .none }
+        if map.values.contains(where: { $0.stream }) { return .stream }
+        if map.values.contains(where: { $0.video }) { return .video }
+        return .voice
+    }
+
+    func resolveVoiceUsers(guildId: String) {
+        guard let map = voiceRoster[guildId] else { return }
+        for uid in map.keys where voiceUsers[uid] == nil {
+            Task { [weak self] in _ = await self?.fetchUser(uid) }
+        }
     }
 
     func openDM(with user: User) async {
@@ -343,8 +421,51 @@ final class Store: ObservableObject {
 
     // MARK: - Сообщения
 
+    /// Подгрузка более старых сообщений. Возвращает id бывшего первого сообщения (чтобы удержать позицию прокрутки).
+    func loadOlder(_ channelId: String) async -> String? {
+        guard let api,
+              !loadingOlder.contains(channelId),
+              !reachedTop.contains(channelId),
+              let first = messages[channelId]?.first else { return nil }
+        loadingOlder.insert(channelId)
+        defer { loadingOlder.remove(channelId) }
+        do {
+            let list: [Message] = try await api.get("/channels/\(channelId)/messages?limit=50&before=\(first.id)")
+            if list.count < 50 { reachedTop.insert(channelId) }
+            if list.isEmpty { return nil }
+            merge(list, into: channelId)
+            return first.id
+        } catch {
+            self.error = error.localizedDescription
+            return nil
+        }
+    }
+
+    /// Прыжок к старому сообщению: заменяем окно сообщений на окно вокруг него.
+    func loadAround(_ channelId: String, messageId: String) async -> Bool {
+        guard let api else { return false }
+        do {
+            let list: [Message] = try await api.get("/channels/\(channelId)/messages?limit=50&around=\(messageId)")
+            guard !list.isEmpty else { return false }
+            messages[channelId] = list.sorted { (UInt64($0.id) ?? 0) < (UInt64($1.id) ?? 0) }
+            detachedChannels.insert(channelId)
+            reachedTop.remove(channelId)
+            return true
+        } catch {
+            self.error = error.localizedDescription
+            return false
+        }
+    }
+
+    func returnToLatest(_ channelId: String) async {
+        detachedChannels.remove(channelId)
+        reachedTop.remove(channelId)
+        messages[channelId] = []
+        await loadMessages(channelId)
+    }
+
     func loadMessages(_ channelId: String, silent: Bool = false) async {
-        guard let api else { return }
+        guard let api, !detachedChannels.contains(channelId) else { return }
         do {
             let list: [Message] = try await api.get("/channels/\(channelId)/messages?limit=50")
             merge(list, into: channelId)

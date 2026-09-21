@@ -118,6 +118,8 @@ final class VoiceMedia {
     private var stats = Stats()
     private var lastReported = Stats()
     private var timer: DispatchSourceTimer?
+    private var keepaliveTimer: DispatchSourceTimer?
+    private var keepaliveCounter: UInt64 = 0
     private var firstTransportFailLogged = false
     private var firstDaveFailLogged = false
     private var firstEncryptFailLogged = false
@@ -164,12 +166,28 @@ final class VoiceMedia {
         t.setEventHandler { [weak self] in self?.reportStats() }
         t.resume()
         timer = t
+
+        // Раз в несколько секунд шлём keepalive по UDP: поддерживает соответствие в NAT/туннеле.
+        let k = DispatchSource.makeTimerSource(queue: queue)
+        k.schedule(deadline: .now() + 1, repeating: 4)
+        k.setEventHandler { [weak self] in self?.sendKeepalive() }
+        k.resume()
+        keepaliveTimer = k
+    }
+
+    private func sendKeepalive() {
+        var counter = keepaliveCounter.bigEndian
+        keepaliveCounter &+= 1
+        let data = Data(bytes: &counter, count: 8)
+        connection.send(content: data, completion: .contentProcessed { _ in })
     }
 
     func stop() {
         stopped = true
         timer?.cancel()
         timer = nil
+        keepaliveTimer?.cancel()
+        keepaliveTimer = nil
         audio.onMicFrame = nil
         audio.stop()
     }
@@ -222,7 +240,7 @@ final class VoiceMedia {
         if bytes.count >= 2, bytes[1] >= 192, bytes[1] <= 223 { return }
 
         stats.received += 1
-        guard let (packetSsrc, payload) = openTransport(bytes) else {
+        guard let (packetSsrc, packetTs, payload) = openTransport(bytes) else {
             stats.transportFail += 1
             if !firstTransportFailLogged {
                 firstTransportFailLogged = true
@@ -262,7 +280,7 @@ final class VoiceMedia {
         }
         stats.played += 1
         audio.play(ssrc: packetSsrc, interleaved: pcm.samples, frames: pcm.frames)
-        transcriber?.feed(userId: user, interleaved: pcm.samples, channels: 2, frames: pcm.frames)
+        transcriber?.feed(userId: user, interleaved: pcm.samples, channels: 2, frames: pcm.frames, rtpTimestamp: packetTs)
 
         let now = Date()
         if now.timeIntervalSince(lastAudioReport[user] ?? .distantPast) > 0.1 {
@@ -273,7 +291,7 @@ final class VoiceMedia {
 
     /// Транспортная расшифровка режима aead_aes256_gcm_rtpsize.
     /// Заголовок RTP (с CSRC и преамбулой расширения) идёт как AAD, в конце пакета 4 байта nonce, перед ними 16 байт тега.
-    private func openTransport(_ bytes: [UInt8]) -> (UInt32, Data)? {
+    private func openTransport(_ bytes: [UInt8]) -> (UInt32, UInt32, Data)? {
         guard bytes.count >= 12 + 16 + 4 else { return nil }
         let b0 = bytes[0]
         guard b0 >> 6 == 2 else { return nil }
@@ -293,6 +311,10 @@ final class VoiceMedia {
         for i in 8..<12 {
             src = (src << 8) | UInt32(bytes[i])
         }
+        var rtpTs: UInt32 = 0
+        for i in 4..<8 {
+            rtpTs = (rtpTs << 8) | UInt32(bytes[i])
+        }
         let tagStart = bytes.count - 4 - 16
         let cipher = Data(bytes[headerLen..<tagStart])
         let tag = Data(bytes[tagStart..<(bytes.count - 4)])
@@ -310,7 +332,7 @@ final class VoiceMedia {
             guard payload.count >= n else { return nil }
             payload = Data(payload.dropFirst(n))
         }
-        return (src, payload)
+        return (src, rtpTs, payload)
     }
 
     // MARK: Отправка
@@ -346,7 +368,7 @@ final class VoiceMedia {
             return
         }
         guard speakingNow else { return }
-        transcriber?.feed(userId: ownUserId, interleaved: frame, channels: 1, frames: frame.count)
+        transcriber?.feed(userId: ownUserId, interleaved: frame, channels: 1, frames: frame.count, rtpTimestamp: ts)
         sendFrame(frame, timestamp: ts)
     }
 

@@ -267,7 +267,9 @@ final class VoiceGateway {
             log("Некорректный UDP-порт")
             return
         }
-        let conn = NWConnection(host: NWEndpoint.Host(ip), port: p, using: .udp)
+        let params = NWParameters.udp
+        params.serviceClass = .interactiveVoice
+        let conn = NWConnection(host: NWEndpoint.Host(ip), port: p, using: params)
         udp = conn
         var finished = false
 
@@ -510,6 +512,7 @@ final class VoiceSpike: ObservableObject {
     var sendGateway: (([String: Any]) -> Bool)?
     var ensureGateway: (() -> Void)?
     var resolveUser: ((String) async -> User?)?
+    var cachedUser: ((String) -> User?)?
     var userId = ""
     var session: URLSession = .shared
 
@@ -566,6 +569,10 @@ final class VoiceSpike: ObservableObject {
         let ids = [userId] + others.filter { $0 != userId }.sorted()
         participantIds = ids
         for id in ids where users[id] == nil {
+            if let u = cachedUser?(id) {
+                users[id] = u
+                continue
+            }
             Task { [weak self] in
                 if let u = await self?.resolveUser?(id) {
                     self?.users[id] = u
@@ -606,6 +613,7 @@ final class VoiceSpike: ObservableObject {
         lastHeard = [:]
         captions = []
         updateParticipants([])
+        ImageLoader.shared.setLimit(2)
 
         let cid = channel.id
         Task { [weak self] in
@@ -642,6 +650,7 @@ final class VoiceSpike: ObservableObject {
         lastHeard = [:]
         micLevelDb = -90
         transcriber.reset()
+        ImageLoader.shared.setLimit(6)
         if !silent { add("Отключился") }
     }
 
@@ -689,7 +698,12 @@ final class VoiceSpike: ObservableObject {
         }
         Task { [weak self] in
             guard let self else { return }
-            let ok = await VoiceTranscriber.requestAuthorization()
+            var ok = true
+            if #available(iOS 26.0, *) {
+                // Новое распознавание работает на устройстве и отдельного разрешения не требует.
+            } else {
+                ok = await VoiceTranscriber.requestAuthorization()
+            }
             if ok {
                 self.captionsEnabled = true
                 self.transcriber.configure(enabled: true, locale: self.captionLang)

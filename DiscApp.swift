@@ -6,6 +6,11 @@ struct DiscApp: App {
     @StateObject private var translator = Translator()
     @Environment(\.scenePhase) private var scenePhase
 
+    init() {
+        // Кэш картинок на диске: аватарки и иконки не скачиваются заново при каждом запуске.
+        URLCache.shared = URLCache(memoryCapacity: 30 * 1024 * 1024, diskCapacity: 300 * 1024 * 1024)
+    }
+
     var body: some Scene {
         WindowGroup {
             RootView()

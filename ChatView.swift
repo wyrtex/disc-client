@@ -33,6 +33,22 @@ struct ChatView: View {
     @State private var profileUser: User?
     @StateObject private var recorder = VoiceRecorder()
     @State private var showTranslate = false
+    @State private var scrollTarget: String?
+    @State private var scrollAnchor: UnitPoint = .bottom
+    @State private var flashId: String?
+    @State private var mentionMap: [String: String] = [:]
+    @State private var suggestions: [Suggestion] = []
+    @State private var suggestionTask: Task<Void, Never>?
+
+    private struct Suggestion: Identifiable {
+        let id: String
+        let display: String
+        let token: String
+        let title: String
+        let subtitle: String?
+        let user: User?
+        let icon: String?
+    }
 
     private var guildId: String? { store.guildID(of: channel) }
 
@@ -82,6 +98,10 @@ struct ChatView: View {
             .task(id: translateKey) { await runIncomingTranslation() }
             .fullScreenCover(item: $viewer) { item in viewerCover(item) }
             .task { await poll() }
+            .task {
+                if let gid = guildId { await store.loadRoles(gid) }
+            }
+            .onChange(of: text) { _, _ in updateSuggestions() }
             .onAppear { store.lastChannel = channel }
             .onDisappear { recorder.cancel() }
     }
@@ -91,11 +111,13 @@ struct ChatView: View {
     private func chatCore(_ msgs: [Message]) -> some View {
         VStack(spacing: 0) {
             messageList(msgs)
+            if !suggestions.isEmpty { suggestionList }
             if let r = replyTo { replyBar(r) }
             if !pending.isEmpty { pendingStrip }
             if recorder.isRecording { recordingBar } else { inputBar }
         }
         .background(Theme.chat)
+        .environment(\.currentGuildId, guildId)
         .simultaneousGesture(backSwipe)
         .navigationBarTitleDisplayMode(.inline)
         .toolbarBackground(Theme.chat, for: .navigationBar)
@@ -203,9 +225,11 @@ struct ChatView: View {
     private func messageList(_ msgs: [Message]) -> some View {
         let s = tset
         let shown: Set<String> = s.incomingEnabled ? Set(msgs.suffix(s.count).map { $0.id }) : []
+        let detached = store.detachedChannels.contains(channel.id)
         return ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 0) {
+                    topSentinel
                     ForEach(Array(msgs.enumerated()), id: \.element.id) { i, m in
                         let header = needsHeader(i, msgs)
                         MessageRow(
@@ -214,11 +238,14 @@ struct ChatView: View {
                             translation: shown.contains(m.id)
                                 ? translator.incoming[translator.cacheKey(m, s.incomingTarget)]
                                 : nil,
+                            isMentioned: isMentioned(m),
+                            flash: flashId == m.id,
                             onImage: { url in viewer = ViewerItem(url: url) },
                             onProfile: { u in profileUser = u },
                             onReply: { replyTo = m },
                             onMenu: { actionMessage = m },
-                            onReact: { ref in Task { await store.toggleReaction(ref, on: m) } }
+                            onReact: { ref in Task { await store.toggleReaction(ref, on: m) } },
+                            onJump: { id in jump(to: id) }
                         )
                         .padding(.top, header ? 14 : 2)
                         .id(m.id)
@@ -229,9 +256,98 @@ struct ChatView: View {
             .scrollDismissesKeyboard(.interactively)
             .defaultScrollAnchor(.bottom)
             .onChange(of: msgs.last?.id) { _, newValue in
-                if let newValue { proxy.scrollTo(newValue, anchor: .bottom) }
+                if let newValue, !detached { proxy.scrollTo(newValue, anchor: .bottom) }
+            }
+            .onChange(of: scrollTarget) { _, id in
+                guard let id else { return }
+                proxy.scrollTo(id, anchor: scrollAnchor)
+                scrollTarget = nil
+            }
+            .overlay(alignment: .bottomTrailing) {
+                if detached {
+                    Button {
+                        Task { await store.returnToLatest(channel.id) }
+                    } label: {
+                        HStack(spacing: 6) {
+                            Image(systemName: "arrow.down")
+                            Text("К последним")
+                        }
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 9)
+                        .background(Theme.blurple, in: Capsule())
+                    }
+                    .padding(12)
+                }
             }
         }
+    }
+
+    /// Верх списка: когда он появляется на экране, подгружаем более старые сообщения.
+    private var topSentinel: some View {
+        Group {
+            if store.loadingOlder.contains(channel.id) {
+                ProgressView()
+                    .tint(.white)
+                    .frame(maxWidth: .infinity)
+                    .padding(10)
+            } else if store.reachedTop.contains(channel.id) {
+                Text("Это начало канала")
+                    .font(.system(size: 12))
+                    .foregroundStyle(Theme.muted)
+                    .frame(maxWidth: .infinity)
+                    .padding(10)
+            } else {
+                Color.clear.frame(height: 1)
+            }
+        }
+        .onAppear { loadOlder() }
+    }
+
+    private func loadOlder() {
+        Task {
+            guard let anchor = await store.loadOlder(channel.id) else { return }
+            scrollAnchor = .top
+            scrollTarget = anchor
+        }
+    }
+
+    /// Тап по «ответу»: переходим к исходному сообщению (если его нет в загруженных, подгружаем окно вокруг него).
+    private func jump(to id: String) {
+        let msgs = store.messages[channel.id] ?? []
+        if msgs.contains(where: { $0.id == id }) {
+            scrollAnchor = .center
+            scrollTarget = id
+            flash(id)
+        } else {
+            Task {
+                if await store.loadAround(channel.id, messageId: id) {
+                    try? await Task.sleep(nanoseconds: 200_000_000)
+                    scrollAnchor = .center
+                    scrollTarget = id
+                    flash(id)
+                }
+            }
+        }
+    }
+
+    private func flash(_ id: String) {
+        flashId = id
+        Task {
+            try? await Task.sleep(nanoseconds: 1_800_000_000)
+            if flashId == id { flashId = nil }
+        }
+    }
+
+    private func isMentioned(_ m: Message) -> Bool {
+        guard let me = store.me, m.author.id != me.id else { return false }
+        if m.mention_everyone { return true }
+        if m.mentions.contains(where: { $0.id == me.id }) { return true }
+        if let gid = guildId, let roles = store.memberRoles[gid], !roles.isDisjoint(with: m.mention_roles) {
+            return true
+        }
+        return false
     }
 
     private func needsHeader(_ i: Int, _ msgs: [Message]) -> Bool {
@@ -464,7 +580,8 @@ struct ChatView: View {
     }
 
     private func submit() {
-        let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let t0 = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let t = resolveMentions(t0)
         guard !t.isEmpty || !pending.isEmpty, !sending else { return }
         sending = true
         let files = pending.map { $0.file }
@@ -487,8 +604,181 @@ struct ChatView: View {
                 text = ""
                 pending = []
                 replyTo = nil
+                mentionMap = [:]
+                suggestions = []
             }
         }
+    }
+
+    // MARK: - Подсказки при вводе @ и #
+
+    private func resolveMentions(_ s: String) -> String {
+        var out = s
+        for (display, token) in mentionMap.sorted(by: { $0.key.count > $1.key.count }) {
+            out = out.replacingOccurrences(of: display, with: token)
+        }
+        return out
+    }
+
+    private func currentTrigger() -> (char: Character, query: String, range: Range<String.Index>)? {
+        guard let idx = text.lastIndex(where: { $0 == "@" || $0 == "#" }) else { return nil }
+        if idx != text.startIndex {
+            let before = text[text.index(before: idx)]
+            if !before.isWhitespace { return nil }
+        }
+        let query = String(text[text.index(after: idx)...])
+        if query.contains(where: { $0.isWhitespace }) || query.count > 32 { return nil }
+        return (text[idx], query, idx..<text.endIndex)
+    }
+
+    private func updateSuggestions() {
+        suggestionTask?.cancel()
+        guard let trig = currentTrigger() else {
+            suggestions = []
+            return
+        }
+        let q = trig.query.lowercased()
+
+        if trig.char == "#" {
+            suggestions = channelSuggestions(q)
+            return
+        }
+
+        var list = memberSuggestions(q) + roleSuggestions(q)
+        for special in ["everyone", "here"] where q.isEmpty || special.hasPrefix(q) {
+            list.append(Suggestion(
+                id: "special-\(special)",
+                display: "@\(special)",
+                token: "@\(special)",
+                title: "@\(special)",
+                subtitle: "Упомянуть всех",
+                user: nil,
+                icon: "megaphone.fill"
+            ))
+        }
+        suggestions = Array(list.prefix(8))
+
+        if let gid = guildId, !q.isEmpty {
+            suggestionTask = Task {
+                try? await Task.sleep(nanoseconds: 250_000_000)
+                if Task.isCancelled { return }
+                let remote = await store.searchMembers(guildId: gid, query: q)
+                if Task.isCancelled { return }
+                var current = suggestions
+                for u in remote where !current.contains(where: { $0.id == "u-\(u.id)" }) {
+                    current.append(userSuggestion(u))
+                }
+                suggestions = Array(current.prefix(8))
+            }
+        }
+    }
+
+    private func userSuggestion(_ u: User) -> Suggestion {
+        Suggestion(
+            id: "u-\(u.id)",
+            display: "@" + u.displayName,
+            token: "<@\(u.id)>",
+            title: u.displayName,
+            subtitle: u.username,
+            user: u,
+            icon: nil
+        )
+    }
+
+    private func memberSuggestions(_ q: String) -> [Suggestion] {
+        var users: [String: User] = [:]
+        for m in store.messages[channel.id] ?? [] {
+            users[m.author.id] = m.author
+            for u in m.mentions { users[u.id] = u }
+        }
+        for u in channel.recipients ?? [] { users[u.id] = u }
+        let matched = users.values
+            .filter { q.isEmpty || $0.displayName.lowercased().contains(q) || $0.username.lowercased().contains(q) }
+            .sorted { $0.displayName.lowercased() < $1.displayName.lowercased() }
+        return matched.map { userSuggestion($0) }
+    }
+
+    private func roleSuggestions(_ q: String) -> [Suggestion] {
+        guard let gid = guildId, let roles = store.guildRoles[gid] else { return [] }
+        let matched = roles.filter { $0.id != gid && (q.isEmpty || $0.name.lowercased().contains(q)) }
+        return matched.prefix(4).map { r in
+            Suggestion(
+                id: "r-\(r.id)",
+                display: "@" + r.name,
+                token: "<@&\(r.id)>",
+                title: r.name,
+                subtitle: "Роль",
+                user: nil,
+                icon: "person.2.fill"
+            )
+        }
+    }
+
+    private func channelSuggestions(_ q: String) -> [Suggestion] {
+        guard let gid = guildId, let list = store.guildChannels[gid] else { return [] }
+        let allowed: Set<Int> = [0, 2, 5, 13, 15]
+        let matched = list.filter { ch in
+            !ch.isCategory && allowed.contains(ch.type) && (q.isEmpty || (ch.name ?? "").lowercased().contains(q))
+        }
+        return matched.prefix(8).map { ch in
+            let locked = store.isLocked(ch, guildId: gid)
+            return Suggestion(
+                id: "c-\(ch.id)",
+                display: "#" + (ch.name ?? "канал"),
+                token: "<#\(ch.id)>",
+                title: ch.name ?? "канал",
+                subtitle: locked ? "Нет доступа" : nil,
+                user: nil,
+                icon: locked ? "lock.fill" : ch.icon
+            )
+        }
+    }
+
+    private func applySuggestion(_ sg: Suggestion) {
+        guard let trig = currentTrigger() else { return }
+        text.replaceSubrange(trig.range, with: sg.display + " ")
+        if sg.token != sg.display { mentionMap[sg.display] = sg.token }
+        suggestions = []
+    }
+
+    private var suggestionList: some View {
+        ScrollView {
+            VStack(spacing: 0) {
+                ForEach(suggestions) { sg in
+                    Button {
+                        applySuggestion(sg)
+                    } label: {
+                        HStack(spacing: 10) {
+                            if let u = sg.user {
+                                AvatarView(user: u, size: 28)
+                            } else {
+                                Image(systemName: sg.icon ?? "number")
+                                    .font(.system(size: 14))
+                                    .foregroundStyle(Theme.muted)
+                                    .frame(width: 28, height: 28)
+                            }
+                            VStack(alignment: .leading, spacing: 0) {
+                                Text(sg.title)
+                                    .font(.system(size: 15, weight: .semibold))
+                                    .foregroundStyle(Theme.text)
+                                if let sub = sg.subtitle {
+                                    Text(sub)
+                                        .font(.system(size: 12))
+                                        .foregroundStyle(Theme.muted)
+                                }
+                            }
+                            Spacer()
+                        }
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 8)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+        }
+        .frame(maxHeight: 250)
+        .background(Theme.panel)
     }
 
     private func importFiles(_ result: Result<[URL], Error>) {
@@ -542,11 +832,14 @@ struct MessageRow: View {
     let message: Message
     let showHeader: Bool
     let translation: TranslatedText?
+    let isMentioned: Bool
+    let flash: Bool
     let onImage: (URL) -> Void
     let onProfile: (User) -> Void
     let onReply: () -> Void
     let onMenu: () -> Void
     let onReact: (EmojiRef) -> Void
+    let onJump: (String) -> Void
 
     @State private var dragX: CGFloat = 0
 
@@ -561,12 +854,25 @@ struct MessageRow: View {
                 .offset(x: dragX)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+        .background(rowBackground)
+        .overlay(alignment: .leading) {
+            if isMentioned {
+                Rectangle().fill(Color(hex: 0xF0B232)).frame(width: 3)
+            }
+        }
+        .animation(.easeOut(duration: 0.3), value: flash)
         .contentShape(Rectangle())
         .simultaneousGesture(replySwipe)
         .onLongPressGesture(minimumDuration: 0.4) {
             UIImpactFeedbackGenerator(style: .medium).impactOccurred()
             onMenu()
         }
+    }
+
+    private var rowBackground: Color {
+        if flash { return Theme.blurple.opacity(0.28) }
+        if isMentioned { return Color(hex: 0xF0B232).opacity(0.10) }
+        return Color.clear
     }
 
     /// Свайп сообщения влево = ответить.
@@ -666,6 +972,8 @@ struct MessageRow: View {
                 .lineLimit(1)
         }
         .padding(.leading, 14)
+        .contentShape(Rectangle())
+        .onTapGesture { onJump(r.id) }
     }
 
     private func forwardedBlock(_ f: ForwardedContent) -> some View {
