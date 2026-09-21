@@ -13,6 +13,12 @@ struct ChannelTranslateSettings: Codable, Equatable {
     var outgoingLang = "en"
 }
 
+struct LangPair: Hashable, Identifiable {
+    let source: String
+    let target: String
+    var id: String { source + ">" + target }
+}
+
 struct TranslatedText {
     let text: String
     let sourceCode: String
@@ -94,9 +100,12 @@ enum TextProtect {
         let clean = parts.joined(separator: " ")
         guard hasLetters(clean) else { return nil }
         let r = NLLanguageRecognizer()
+        // Определяем язык только среди тех, что есть в списке. Иначе короткие фразы
+        // «превращаются» в норвежский, датский и прочее, чего в чате нет.
+        r.languageConstraints = Languages.all.map { NLLanguage(rawValue: $0.code) }
         r.processString(clean)
         let hyp = r.languageHypotheses(withMaximum: 3)
-        if let best = hyp.max(by: { $0.value < $1.value }), best.value >= 0.35 {
+        if let best = hyp.max(by: { $0.value < $1.value }), best.value >= 0.5 {
             return best.key.rawValue
         }
         // Короткие фразы вроде «hru?»: если это латиница без диакритики, считаем английским.
@@ -192,6 +201,8 @@ enum StyleFix {
 final class Translator: ObservableObject {
     @Published var configuration: TranslationSession.Configuration?
     @Published var incoming: [String: TranslatedText] = [:]
+    /// Пары языков, для которых не хватает пакета. Скачиваются только по кнопке.
+    @Published var pending: [LangPair] = []
     @Published var settings: [String: ChannelTranslateSettings] = [:] {
         didSet { save() }
     }
@@ -199,18 +210,21 @@ final class Translator: ObservableObject {
     private var skipped: Set<String> = []
     private var queue: [Job] = []
     private var current: Job?
+    private var running: Job?
 
     final class Job {
         let source: Locale.Language
         let target: Locale.Language
         let texts: [String]
+        let prepareOnly: Bool
         var startedAt = Date()
         var continuation: CheckedContinuation<[String?], Never>?
 
-        init(source: Locale.Language, target: Locale.Language, texts: [String]) {
+        init(source: Locale.Language, target: Locale.Language, texts: [String], prepareOnly: Bool = false) {
             self.source = source
             self.target = target
             self.texts = texts
+            self.prepareOnly = prepareOnly
         }
 
         func finish(_ results: [String?]) {
@@ -337,7 +351,14 @@ final class Translator: ObservableObject {
         let src = Locale.Language(identifier: source)
         let dst = Locale.Language(identifier: target)
         let status = await LanguageAvailability().status(from: src, to: dst)
-        if status == .unsupported {
+        switch status {
+        case .installed:
+            break
+        case .supported:
+            // Пакет не скачан: ничего не запрашиваем у системы, только запоминаем, чтобы предложить скачать.
+            notePending(source, target)
+            return Array(repeating: nil, count: texts.count)
+        default:
             return Array(repeating: nil, count: texts.count)
         }
         // Зависшее задание (например, окно скачивания языков закрыли) не должно блокировать очередь навсегда.
@@ -372,9 +393,49 @@ final class Translator: ObservableObject {
         }
     }
 
+    private func notePending(_ source: String, _ target: String) {
+        let p = LangPair(source: source, target: target)
+        if !pending.contains(p) { pending.append(p) }
+    }
+
+    /// Скачивание языковых пакетов пары (система покажет своё окно).
+    func prepare(_ pair: LangPair) async {
+        let job = Job(
+            source: Locale.Language(identifier: pair.source),
+            target: Locale.Language(identifier: pair.target),
+            texts: [],
+            prepareOnly: true
+        )
+        _ = await withCheckedContinuation { (cont: CheckedContinuation<[String?], Never>) in
+            job.continuation = cont
+            queue.append(job)
+            pump()
+        }
+        let status = await LanguageAvailability().status(from: job.source, to: job.target)
+        if status == .installed {
+            pending.removeAll { $0 == pair }
+        }
+        resetSkips()
+    }
+
+    /// Перевод строки субтитров.
+    func translateCaption(_ text: String, from source: String, to target: String) async -> String? {
+        let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard TextProtect.hasLetters(t) else { return nil }
+        if source == target || source.hasPrefix(target + "-") { return nil }
+        let r = await translate([t], from: source, to: target, timeout: 25)
+        return r.first ?? nil
+    }
+
     /// Вызывается из `.translationTask`.
     func run(_ session: TranslationSession) async {
-        guard let job = current else { return }
+        guard let job = current, running !== job else { return }
+        running = job
+        if job.prepareOnly {
+            do { try await session.prepareTranslation() } catch {}
+            finishCurrent(job, [])
+            return
+        }
         var results = [String?](repeating: nil, count: job.texts.count)
         do {
             var requests: [TranslationSession.Request] = []
@@ -396,6 +457,7 @@ final class Translator: ObservableObject {
     private func finishCurrent(_ job: Job, _ results: [String?]?) {
         job.finish(results ?? Array(repeating: nil, count: job.texts.count))
         if current === job { current = nil }
+        if running === job { running = nil }
         pump()
     }
 }

@@ -65,6 +65,7 @@ struct ChatView: View {
         let last: String?
         let total: Int
         let sheet: Bool
+        let pending: Int
     }
 
     private var translateKey: TranslateKey {
@@ -76,11 +77,40 @@ struct ChatView: View {
             target: s.incomingTarget,
             last: msgs.last?.id,
             total: msgs.count,
-            sheet: showTranslate
+            sheet: showTranslate,
+            pending: translator.pending.count
         )
     }
 
     private var canWrite: Bool { store.canSend(in: channel) }
+
+    /// Если для перевода не хватает языкового пакета, предлагаем скачать его (сами ничего не запрашиваем).
+    @ViewBuilder
+    private var translateBanner: some View {
+        let s = tset
+        if s.incomingEnabled, let p = translator.pending.first(where: { $0.target == s.incomingTarget }) {
+            HStack(spacing: 10) {
+                Image(systemName: "arrow.down.circle.fill")
+                    .foregroundStyle(Theme.link)
+                Text("Для перевода нужен языковой пакет: \(Languages.name(p.source)) → \(Languages.name(p.target))")
+                    .font(.system(size: 13))
+                    .foregroundStyle(Theme.text)
+                    .lineLimit(2)
+                Spacer(minLength: 4)
+                Button("Скачать") {
+                    Task { await translator.prepare(p) }
+                }
+                .font(.system(size: 13, weight: .semibold))
+                .padding(.horizontal, 12)
+                .padding(.vertical, 6)
+                .background(Theme.blurple, in: Capsule())
+                .foregroundStyle(.white)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .background(Theme.panel)
+        }
+    }
 
     private var authorsKey: Int {
         var set = Set<String>()
@@ -132,6 +162,7 @@ struct ChatView: View {
 
     private func chatCore(_ msgs: [Message]) -> some View {
         VStack(spacing: 0) {
+            translateBanner
             messageList(msgs)
             if !suggestions.isEmpty { suggestionList }
             if let e = editing { editBar(e) }
@@ -1025,6 +1056,11 @@ struct MessageRow: View {
                         RichText(raw: tr.text, mentions: message.mentions)
                     } else if !message.content.isEmpty && !hideText {
                         RichText(raw: message.content, mentions: message.mentions)
+                    }
+                    if message.edited && translation == nil {
+                        Text("(изменено)")
+                            .font(.system(size: 11))
+                            .foregroundStyle(Theme.muted)
                     }
                     if let f = message.forwarded { forwardedBlock(f) }
                     MessageMedia(message: message, onImage: onImage, onVideo: onVideo)

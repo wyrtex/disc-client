@@ -324,40 +324,22 @@ struct VoiceMemberRow: View {
 
 struct CaptionsPanel: View {
     @EnvironmentObject var store: Store
+    @EnvironmentObject var translator: Translator
     @ObservedObject var voice: VoiceSpike
+    @State private var showLanguages = false
 
     private func user(_ id: String) -> User? {
         voice.users[id] ?? store.voiceUsers[id] ?? (store.me?.id == id ? store.me : nil)
     }
 
-    private var langName: String {
-        TranscriptLanguage.all.first(where: { $0.code == voice.captionLang })?.name ?? voice.captionLang
+    private var pendingPair: LangPair? {
+        guard voice.captionTranslate else { return nil }
+        return translator.pending.first(where: { $0.target == voice.captionTarget })
     }
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack(spacing: 8) {
-                Image(systemName: "captions.bubble.fill")
-                    .foregroundStyle(Theme.muted)
-                Text("Субтитры")
-                    .font(.system(size: 14, weight: .bold))
-                    .foregroundStyle(Theme.text)
-                Spacer()
-                Menu {
-                    ForEach(TranscriptLanguage.all) { l in
-                        Button(l.name) { voice.setCaptionLanguage(l.code) }
-                    }
-                } label: {
-                    HStack(spacing: 4) {
-                        Text(langName)
-                        Image(systemName: "chevron.up.chevron.down").font(.system(size: 10))
-                    }
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(Theme.link)
-                }
-            }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 8)
+            header
 
             if !voice.captionStatus.isEmpty {
                 Text(voice.captionStatus)
@@ -368,23 +350,30 @@ struct CaptionsPanel: View {
                     .padding(.bottom, 4)
             }
 
+            if let p = pendingPair {
+                HStack(spacing: 8) {
+                    Text("Для перевода нужен языковой пакет: \(Languages.name(p.source)) → \(Languages.name(p.target))")
+                        .font(.system(size: 12))
+                        .foregroundStyle(Theme.text)
+                    Spacer(minLength: 4)
+                    Button("Скачать") {
+                        Task { await translator.prepare(p) }
+                    }
+                    .font(.system(size: 12, weight: .semibold))
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 5)
+                    .background(Theme.blurple, in: Capsule())
+                    .foregroundStyle(.white)
+                }
+                .padding(.horizontal, 14)
+                .padding(.bottom, 6)
+            }
+
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 8) {
                         ForEach(voice.captions) { c in
-                            HStack(alignment: .top, spacing: 8) {
-                                AvatarView(user: user(c.userId), size: 24)
-                                VStack(alignment: .leading, spacing: 1) {
-                                    Text(user(c.userId)?.displayName ?? (c.userId == voice.userId ? "Ты" : "…"))
-                                        .font(.system(size: 11, weight: .bold))
-                                        .foregroundStyle(Theme.muted)
-                                    Text(c.text)
-                                        .font(.system(size: 15))
-                                        .foregroundStyle(c.isFinal ? Theme.text : Theme.muted)
-                                }
-                                Spacer(minLength: 0)
-                            }
-                            .id(c.id)
+                            captionRow(c).id(c.id)
                         }
                     }
                     .padding(.horizontal, 14)
@@ -397,8 +386,140 @@ struct CaptionsPanel: View {
                 }
             }
         }
-        .frame(height: 210)
+        .frame(height: 230)
         .background(Theme.panel)
+        .sheet(isPresented: $showLanguages) {
+            CaptionLanguagesSheet(voice: voice)
+        }
+    }
+
+    private var header: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "captions.bubble.fill")
+                .foregroundStyle(Theme.muted)
+            Text("Субтитры")
+                .font(.system(size: 14, weight: .bold))
+                .foregroundStyle(Theme.text)
+            Button {
+                showLanguages = true
+            } label: {
+                Text("Авто · \(voice.captionLangs.count)")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(Theme.link)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 3)
+                    .background(Theme.chat, in: Capsule())
+            }
+            Spacer()
+            Button {
+                voice.captionTranslate.toggle()
+            } label: {
+                HStack(spacing: 4) {
+                    Image(systemName: "character.bubble")
+                    Text(voice.captionTranslate ? "Перевод" : "Оригинал")
+                }
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(voice.captionTranslate ? .white : Theme.muted)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 5)
+                .background(voice.captionTranslate ? Theme.blurple : Theme.chat, in: Capsule())
+            }
+            if voice.captionTranslate {
+                Menu {
+                    ForEach(Languages.all) { l in
+                        Button(l.name) { voice.captionTarget = l.code }
+                    }
+                } label: {
+                    HStack(spacing: 3) {
+                        Text(Languages.name(voice.captionTarget))
+                        Image(systemName: "chevron.up.chevron.down").font(.system(size: 9))
+                    }
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(Theme.link)
+                }
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+    }
+
+    private func captionRow(_ c: Caption) -> some View {
+        HStack(alignment: .top, spacing: 8) {
+            AvatarView(user: user(c.userId), size: 24)
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 6) {
+                    Text(user(c.userId)?.displayName ?? (c.userId == voice.userId ? "Ты" : "…"))
+                        .font(.system(size: 11, weight: .bold))
+                        .foregroundStyle(Theme.muted)
+                    if let l = c.lang {
+                        Text(SpeechLang.code(l).uppercased())
+                            .font(.system(size: 9, weight: .bold))
+                            .foregroundStyle(Theme.muted)
+                            .padding(.horizontal, 4)
+                            .padding(.vertical, 1)
+                            .background(Theme.chat, in: RoundedRectangle(cornerRadius: 4))
+                    }
+                }
+                if let tr = c.translated, voice.captionTranslate {
+                    Text(tr)
+                        .font(.system(size: 15))
+                        .foregroundStyle(c.isFinal ? Theme.text : Theme.muted)
+                    Text(c.text)
+                        .font(.system(size: 12))
+                        .foregroundStyle(Theme.muted)
+                } else {
+                    Text(c.text)
+                        .font(.system(size: 15))
+                        .foregroundStyle(c.isFinal ? Theme.text : Theme.muted)
+                }
+            }
+            Spacer(minLength: 0)
+        }
+    }
+}
+
+/// Какие языки распознаются автоматически. Для каждого включённого языка система скачивает модель.
+struct CaptionLanguagesSheet: View {
+    @ObservedObject var voice: VoiceSpike
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Section {
+                    ForEach(TranscriptLanguage.all) { l in
+                        Button {
+                            voice.toggleCaptionLanguage(l.code)
+                        } label: {
+                            HStack {
+                                Text(l.name)
+                                    .foregroundStyle(Theme.text)
+                                Spacer()
+                                if voice.captionLangs.contains(l.code) {
+                                    Image(systemName: "checkmark")
+                                        .foregroundStyle(Theme.blurple)
+                                }
+                            }
+                        }
+                        .listRowBackground(Theme.chat)
+                    }
+                } footer: {
+                    Text("Язык речи каждого собеседника определяется автоматически среди включённых. Чем больше языков включено, тем больше нагрузка на телефон. Модель нового языка скачивается один раз.")
+                        .foregroundStyle(Theme.muted)
+                }
+            }
+            .scrollContentBackground(.hidden)
+            .background(Theme.panel)
+            .navigationTitle("Языки субтитров")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Готово") { dismiss() }
+                }
+            }
+        }
+        .presentationDetents([.medium, .large])
+        .presentationBackground(Theme.panel)
     }
 }
 

@@ -17,6 +17,12 @@ struct DiscApp: App {
                 .environmentObject(store)
                 .environmentObject(translator)
                 .preferredColorScheme(.dark)
+                .onAppear {
+                    // Перевод субтитров голоса идёт через общую очередь переводчика.
+                    store.voice.translateCaption = { [translator] text, from, to in
+                        await translator.translateCaption(text, from: from, to: to)
+                    }
+                }
                 .onChange(of: scenePhase) { _, phase in
                     switch phase {
                     case .active:

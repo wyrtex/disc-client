@@ -33,12 +33,18 @@ struct MainView: View {
             }
             .toolbar(.hidden, for: .navigationBar)
         }
-        .translationTask(translator.configuration) { session in
+        // Пока открыт экран голоса, перевод обслуживает он сам: иначе системное окно скачивания
+        // языков окажется под ним.
+        .translationTask(showVoice ? nil : translator.configuration) { session in
             await translator.run(session)
         }
         .fullScreenCover(isPresented: $showVoice) {
             VoiceView(voice: store.voice) { showVoice = false }
                 .environmentObject(store)
+                .environmentObject(translator)
+                .translationTask(translator.configuration) { session in
+                    await translator.run(session)
+                }
         }
         .onChange(of: selection) { _, new in
             UserDefaults.standard.set(new, forKey: "lastSelection")

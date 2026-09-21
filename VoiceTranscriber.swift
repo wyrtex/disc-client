@@ -1,6 +1,7 @@
 import Foundation
 import Speech
 import AVFoundation
+import NaturalLanguage
 
 /// Общий интерфейс распознавания. Аудио приходит моно, 48 кГц.
 protocol TranscribeBackend: AnyObject {
@@ -11,14 +12,14 @@ protocol TranscribeBackend: AnyObject {
 }
 
 /// Субтитры голоса. Для каждого участника своя сессия распознавания.
-/// iOS 26+: новый SpeechAnalyzer (быстрые черновые результаты, длинная речь без обрывов).
-/// Раньше: Apple Speech (SFSpeechRecognizer).
-/// Язык выбирается вручную.
+/// iOS 26+: SpeechAnalyzer с автоопределением языка среди включённых языков.
+/// Раньше: Apple Speech (SFSpeechRecognizer) с первым включённым языком.
 final class VoiceTranscriber {
     struct Update {
         let userId: String
         let text: String
         let isFinal: Bool
+        let lang: String?
     }
 
     var onUpdate: ((Update) -> Void)?
@@ -44,17 +45,18 @@ final class VoiceTranscriber {
         }
     }
 
-    func configure(enabled: Bool, locale: String) {
+    /// `locales`: языки, среди которых определяется речь (например ["ru-RU", "en-US"]).
+    func configure(enabled: Bool, locales: [String]) {
         queue.async {
             self.backend?.shutdown()
             self.backend = nil
             self.streams = [:]
             self.enabled = enabled
-            guard enabled else {
+            guard enabled, !locales.isEmpty else {
                 self.stopTimer()
                 return
             }
-            self.backend = self.makeBackend(locale: locale)
+            self.backend = self.makeBackend(locales: locales)
             self.startTimer()
         }
     }
@@ -100,15 +102,15 @@ final class VoiceTranscriber {
 
     // MARK: Внутреннее
 
-    private func makeBackend(locale: String) -> TranscribeBackend? {
+    private func makeBackend(locales: [String]) -> TranscribeBackend? {
         let update: (Update) -> Void = { [weak self] u in self?.onUpdate?(u) }
         let status: (String) -> Void = { [weak self] s in self?.onStatus?(s) }
         #if compiler(>=6.2)
         if #available(iOS 26.0, *) {
-            return AnalyzerBackend(localeId: locale, onUpdate: update, onStatus: status)
+            return AnalyzerBackend(locales: locales, onUpdate: update, onStatus: status)
         }
         #endif
-        return LegacyBackend(localeId: locale, onUpdate: update, onStatus: status)
+        return LegacyBackend(localeId: locales[0], onUpdate: update, onStatus: status)
     }
 
     private func startTimer() {
@@ -133,7 +135,40 @@ final class VoiceTranscriber {
     }
 }
 
-// MARK: - iOS 26: SpeechAnalyzer
+// MARK: - Определение языка по тексту
+
+enum SpeechLang {
+    /// Код языка для NaturalLanguage и для перевода: ru-RU -> ru, zh-CN -> zh-Hans.
+    static func code(_ locale: String) -> String {
+        if locale.hasPrefix("zh") { return "zh-Hans" }
+        return String(locale.prefix(2))
+    }
+
+    static func name(_ locale: String) -> String {
+        TranscriptLanguage.all.first(where: { $0.code == locale })?.name ?? locale
+    }
+
+    static func words(_ text: String) -> Int {
+        text.split(whereSeparator: { !$0.isLetter && !$0.isNumber }).count
+    }
+
+    /// Вероятность того, что текст написан на этом языке.
+    static func probability(_ text: String, locale: String) -> Double {
+        let r = NLLanguageRecognizer()
+        r.processString(text)
+        let hyp = r.languageHypotheses(withMaximum: 6)
+        return hyp[NLLanguage(rawValue: code(locale))] ?? 0
+    }
+
+    /// Насколько результат похож на настоящую речь на этом языке.
+    static func score(_ text: String, locale: String) -> Double {
+        let w = words(text)
+        guard w > 0 else { return 0 }
+        return Double(min(w, 10)) * (0.15 + probability(text, locale: locale))
+    }
+}
+
+// MARK: - iOS 26: SpeechAnalyzer с автоопределением языка
 
 #if compiler(>=6.2)
 
@@ -146,21 +181,49 @@ final class AnalyzerBackend: TranscribeBackend {
         case shutdown
     }
 
-    private let localeId: String
+    /// Языки, для которых модель уже скачана и готова (заполняется фоновой задачей).
+    private final class ReadyLocales {
+        private let lock = NSLock()
+        private var map: [String: Locale] = [:]
+
+        func set(_ id: String, _ l: Locale) {
+            lock.lock(); map[id] = l; lock.unlock()
+        }
+
+        func get(_ id: String) -> Locale? {
+            lock.lock(); defer { lock.unlock() }
+            return map[id]
+        }
+
+        var ids: Set<String> {
+            lock.lock(); defer { lock.unlock() }
+            return Set(map.keys)
+        }
+    }
+
+    /// Состояние одного собеседника.
+    private final class UserState {
+        var knownLocale: String?
+        var active: LiveSession?
+        var probes: [String: LiveSession] = [:]
+        var probeSamples = 0
+        var round = 0
+    }
+
+    private let enabled: [String]
     private let onUpdate: (VoiceTranscriber.Update) -> Void
     private let onStatus: (String) -> Void
     private let continuation: AsyncStream<Command>.Continuation
     private var worker: Task<Void, Never>?
-
-    // Состояние трогает только рабочая задача (команды выполняются по очереди).
-    private var sessions: [String: LiveSession] = [:]
-    private var locale: Locale?
-    private var assetsReady = false
-    private var unsupported = false
+    private var prepareTask: Task<Void, Never>?
+    private let ready = ReadyLocales()
+    private var users: [String: UserState] = [:]
+    private var recent: [String] = []
     private let sourceFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 48000, channels: 1, interleaved: false)!
+    private let maxProbe = 4
 
-    init(localeId: String, onUpdate: @escaping (VoiceTranscriber.Update) -> Void, onStatus: @escaping (String) -> Void) {
-        self.localeId = localeId
+    init(locales: [String], onUpdate: @escaping (VoiceTranscriber.Update) -> Void, onStatus: @escaping (String) -> Void) {
+        self.enabled = locales
         self.onUpdate = onUpdate
         self.onStatus = onStatus
         let (stream, cont) = AsyncStream<Command>.makeStream()
@@ -172,91 +235,204 @@ final class AnalyzerBackend: TranscribeBackend {
                 if case .shutdown = cmd { return }
             }
         }
+        self.prepareTask = Task { [weak self] in
+            await self?.prepareAll()
+        }
     }
 
     func append(userId: String, mono: [Float]) { continuation.yield(.audio(userId, mono)) }
     func endUtterance(userId: String) { continuation.yield(.end(userId)) }
     func endAll() { continuation.yield(.endAll) }
     func shutdown() {
+        prepareTask?.cancel()
         continuation.yield(.shutdown)
         continuation.finish()
     }
 
-    private func handle(_ cmd: Command) async {
-        switch cmd {
-        case .audio(let uid, let samples):
-            guard !unsupported else { return }
-            if let s = await session(for: uid) { s.feed(samples) }
-        case .end(let uid):
-            if let s = sessions.removeValue(forKey: uid) { await s.finish() }
-        case .endAll, .shutdown:
-            let all = sessions
-            sessions = [:]
-            for s in all.values { await s.finish() }
+    // MARK: Подготовка языков (скачивание моделей)
+
+    private func prepareAll() async {
+        for (i, id) in enabled.enumerated() {
+            if Task.isCancelled { return }
+            guard let supported = await SpeechTranscriber.supportedLocale(equivalentTo: Locale(identifier: id)) else {
+                onStatus("Язык «\(SpeechLang.name(id))» не поддерживается распознаванием")
+                continue
+            }
+            do {
+                let t = SpeechTranscriber(locale: supported, transcriptionOptions: [], reportingOptions: [], attributeOptions: [])
+                if let request = try await AssetInventory.assetInstallationRequest(supporting: [t]) {
+                    onStatus("Скачиваю язык: \(SpeechLang.name(id)) (\(i + 1) из \(enabled.count))…")
+                    try await request.downloadAndInstall()
+                }
+                ready.set(id, supported)
+                onStatus("Распознавание речи: авто, готово языков: \(ready.ids.count) из \(enabled.count)")
+            } catch {
+                onStatus("Не удалось подготовить язык «\(SpeechLang.name(id))»: \(error.localizedDescription)")
+            }
         }
     }
 
-    private func session(for uid: String) async -> LiveSession? {
-        if let s = sessions[uid] { return s }
-        do {
-            if locale == nil {
-                let requested = Locale(identifier: localeId)
-                guard let supported = await SpeechTranscriber.supportedLocale(equivalentTo: requested) else {
-                    unsupported = true
-                    onStatus("Язык \(localeId) не поддерживается распознаванием")
-                    return nil
-                }
-                locale = supported
-            }
-            guard let locale else { return nil }
+    // MARK: Команды
 
+    private func handle(_ cmd: Command) async {
+        switch cmd {
+        case .audio(let uid, let samples):
+            await handleAudio(uid, samples)
+        case .end(let uid):
+            await finishUtterance(uid)
+        case .endAll, .shutdown:
+            for uid in Array(users.keys) { await finishUtterance(uid) }
+        }
+    }
+
+    private func state(_ uid: String) -> UserState {
+        if let s = users[uid] { return s }
+        let s = UserState()
+        users[uid] = s
+        return s
+    }
+
+    private func handleAudio(_ uid: String, _ samples: [Float]) async {
+        let st = state(uid)
+        if st.active == nil && st.probes.isEmpty {
+            await startUtterance(uid, st)
+        }
+        if let a = st.active {
+            a.feed(samples)
+            return
+        }
+        guard !st.probes.isEmpty else { return }
+        for s in st.probes.values { s.feed(samples) }
+        st.probeSamples += samples.count
+        await evaluateProbes(st, final: false)
+    }
+
+    /// Начало реплики: если язык говорящего известен, запускаем один распознаватель,
+    /// иначе несколько сразу (по одному на язык) и через пару секунд выбираем лучший.
+    private func startUtterance(_ uid: String, _ st: UserState) async {
+        let ids = ready.ids
+        guard !ids.isEmpty else { return }
+
+        if let known = st.knownLocale, ids.contains(known) {
+            st.active = await makeSession(uid, known, emitting: true)
+            return
+        }
+        if ids.count == 1, let only = ids.first {
+            st.knownLocale = only
+            st.active = await makeSession(uid, only, emitting: true)
+            return
+        }
+
+        // Порядок: недавно определённые языки, затем остальные по списку.
+        var order = recent.filter { ids.contains($0) }
+        for id in enabled where ids.contains(id) && !order.contains(id) { order.append(id) }
+        let start = (st.round * maxProbe) % max(1, order.count)
+        var candidates = Array(order.dropFirst(start).prefix(maxProbe))
+        if candidates.isEmpty { candidates = Array(order.prefix(maxProbe)) }
+
+        st.probeSamples = 0
+        for id in candidates {
+            if let s = await makeSession(uid, id, emitting: false) {
+                st.probes[id] = s
+            }
+        }
+    }
+
+    private func evaluateProbes(_ st: UserState, final: Bool) async {
+        let seconds = Double(st.probeSamples) / 48000
+        guard final || seconds >= 1.6 else { return }
+
+        var best: (id: String, score: Double)?
+        for (id, s) in st.probes {
+            let sc = SpeechLang.score(s.currentText, locale: id)
+            if best == nil || sc > best!.score { best = (id, sc) }
+        }
+        guard let best else { return }
+
+        let confident = best.score >= 2.2
+        guard confident || seconds >= 4.5 || final else { return }
+
+        if best.score > 0.4, let winner = st.probes.removeValue(forKey: best.id) {
+            discard(Array(st.probes.values))
+            st.probes = [:]
+            st.knownLocale = best.id
+            recent.removeAll { $0 == best.id }
+            recent.insert(best.id, at: 0)
+            winner.emitting = true
+            winner.emitNow()
+            st.active = winner
+        } else {
+            // Ни один язык не подошёл: в следующий раз пробуем другие.
+            discard(Array(st.probes.values))
+            st.probes = [:]
+            st.round += 1
+        }
+    }
+
+    private func discard(_ sessions: [LiveSession]) {
+        for s in sessions {
+            Task { await s.finish(emit: false) }
+        }
+    }
+
+    private func finishUtterance(_ uid: String) async {
+        guard let st = users[uid] else { return }
+        if st.active == nil, !st.probes.isEmpty {
+            await evaluateProbes(st, final: true)
+        }
+        if let a = st.active {
+            await a.finish(emit: true)
+            // Если язык явно не совпал с распознанным текстом, в следующий раз определяем заново.
+            let text = a.currentText
+            if SpeechLang.words(text) >= 4, let known = st.knownLocale,
+               SpeechLang.probability(text, locale: known) < 0.12 {
+                st.knownLocale = nil
+            }
+            st.active = nil
+        }
+        discard(Array(st.probes.values))
+        st.probes = [:]
+        st.probeSamples = 0
+    }
+
+    private func makeSession(_ uid: String, _ localeId: String, emitting: Bool) async -> LiveSession? {
+        guard let locale = ready.get(localeId) else { return nil }
+        do {
             let transcriber = SpeechTranscriber(
                 locale: locale,
                 transcriptionOptions: [],
                 reportingOptions: [.volatileResults],
                 attributeOptions: []
             )
-            if !assetsReady {
-                if let request = try await AssetInventory.assetInstallationRequest(supporting: [transcriber]) {
-                    onStatus("Скачиваю модель распознавания речи…")
-                    try await request.downloadAndInstall()
-                }
-                assetsReady = true
-                onStatus("Распознавание речи (\(localeId)): на устройстве")
-            }
             guard let format = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [transcriber]) else {
-                onStatus("Нет подходящего аудиоформата для распознавания")
                 return nil
             }
-            guard let converter = AVAudioConverter(from: sourceFormat, to: format) else {
-                onStatus("Не удалось подготовить аудио для распознавания")
-                return nil
-            }
+            guard let converter = AVAudioConverter(from: sourceFormat, to: format) else { return nil }
             let analyzer = SpeechAnalyzer(modules: [transcriber])
             let (inputStream, builder) = AsyncStream<AnalyzerInput>.makeStream()
             try await analyzer.start(inputSequence: inputStream)
-
-            let s = LiveSession(
+            return LiveSession(
                 userId: uid,
+                localeId: localeId,
                 transcriber: transcriber,
                 analyzer: analyzer,
                 builder: builder,
                 sourceFormat: sourceFormat,
                 targetFormat: format,
                 converter: converter,
+                emitting: emitting,
                 onUpdate: onUpdate
             )
-            sessions[uid] = s
-            return s
         } catch {
             onStatus("Ошибка распознавания: \(error.localizedDescription)")
             return nil
         }
     }
 
-    /// Одна непрерывная реплика одного участника.
+    /// Одна непрерывная реплика одного участника на одном языке.
     private final class LiveSession {
         let userId: String
+        let localeId: String
         let analyzer: SpeechAnalyzer
         let builder: AsyncStream<AnalyzerInput>.Continuation
         let sourceFormat: AVAudioFormat
@@ -266,17 +442,26 @@ final class AnalyzerBackend: TranscribeBackend {
         var resultsTask: Task<Void, Never>?
         var finalized: [String] = []
         var volatile = ""
+        var emitting: Bool
 
-        init(userId: String, transcriber: SpeechTranscriber, analyzer: SpeechAnalyzer,
+        var currentText: String {
+            var parts = finalized
+            if !volatile.isEmpty { parts.append(volatile) }
+            return parts.joined(separator: " ")
+        }
+
+        init(userId: String, localeId: String, transcriber: SpeechTranscriber, analyzer: SpeechAnalyzer,
              builder: AsyncStream<AnalyzerInput>.Continuation, sourceFormat: AVAudioFormat,
-             targetFormat: AVAudioFormat, converter: AVAudioConverter,
+             targetFormat: AVAudioFormat, converter: AVAudioConverter, emitting: Bool,
              onUpdate: @escaping (VoiceTranscriber.Update) -> Void) {
             self.userId = userId
+            self.localeId = localeId
             self.analyzer = analyzer
             self.builder = builder
             self.sourceFormat = sourceFormat
             self.targetFormat = targetFormat
             self.converter = converter
+            self.emitting = emitting
             self.onUpdate = onUpdate
             self.resultsTask = Task { [weak self] in
                 do {
@@ -301,12 +486,13 @@ final class AnalyzerBackend: TranscribeBackend {
             emit(final: false)
         }
 
+        func emitNow() { emit(final: false) }
+
         private func emit(final: Bool) {
-            var parts = finalized
-            if !volatile.isEmpty { parts.append(volatile) }
-            let text = parts.joined(separator: " ")
+            guard emitting else { return }
+            let text = currentText
             if !text.isEmpty {
-                onUpdate(VoiceTranscriber.Update(userId: userId, text: text, isFinal: final))
+                onUpdate(VoiceTranscriber.Update(userId: userId, text: text, isFinal: final, lang: localeId))
             }
         }
 
@@ -339,7 +525,9 @@ final class AnalyzerBackend: TranscribeBackend {
             }
         }
 
-        func finish() async {
+        /// Завершить: `emit` = показать итоговый текст, иначе просто выбросить (проигравший язык).
+        func finish(emit doEmit: Bool) async {
+            if !doEmit { emitting = false }
             builder.finish()
             // Страховка: если поток результатов не закрылся, через 3 секунды обрываем ожидание.
             let watchdog = Task { [weak self] in
@@ -349,18 +537,19 @@ final class AnalyzerBackend: TranscribeBackend {
             try? await analyzer.finalizeAndFinishThroughEndOfInput()
             await resultsTask?.value
             watchdog.cancel()
-            emit(final: true)
+            if doEmit { emit(final: true) }
         }
     }
 }
 
 #endif
 
-// MARK: - Запасной вариант: SFSpeechRecognizer
+// MARK: - Запасной вариант: SFSpeechRecognizer (один язык)
 
 final class LegacyBackend: TranscribeBackend {
     private let onUpdate: (VoiceTranscriber.Update) -> Void
     private let onStatus: (String) -> Void
+    private let localeId: String
     private let queue = DispatchQueue(label: "voice.transcriber.legacy")
     private var recognizer: SFSpeechRecognizer?
     private var sessions: [String: Session] = [:]
@@ -375,6 +564,7 @@ final class LegacyBackend: TranscribeBackend {
     }
 
     init(localeId: String, onUpdate: @escaping (VoiceTranscriber.Update) -> Void, onStatus: @escaping (String) -> Void) {
+        self.localeId = localeId
         self.onUpdate = onUpdate
         self.onStatus = onStatus
         let r = SFSpeechRecognizer(locale: Locale(identifier: localeId))
@@ -452,7 +642,7 @@ final class LegacyBackend: TranscribeBackend {
             let text = result.bestTranscription.formattedString.trimmingCharacters(in: .whitespacesAndNewlines)
             if !text.isEmpty {
                 session.lastText = text
-                onUpdate(VoiceTranscriber.Update(userId: userId, text: text, isFinal: result.isFinal))
+                onUpdate(VoiceTranscriber.Update(userId: userId, text: text, isFinal: result.isFinal, lang: localeId))
                 if result.isFinal { session.committed = true }
             }
             if result.isFinal { finish(userId, session) }
@@ -460,7 +650,7 @@ final class LegacyBackend: TranscribeBackend {
         if error != nil {
             // Ошибка «речь не распознана» не должна стирать уже показанный текст: фиксируем последнее.
             if !session.committed, !session.lastText.isEmpty {
-                onUpdate(VoiceTranscriber.Update(userId: userId, text: session.lastText, isFinal: true))
+                onUpdate(VoiceTranscriber.Update(userId: userId, text: session.lastText, isFinal: true, lang: localeId))
                 session.committed = true
             }
             finish(userId, session)

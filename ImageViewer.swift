@@ -15,18 +15,27 @@ struct ImageViewer: View {
             Color.black
                 .opacity(1 - progress * 0.95)
                 .ignoresSafeArea()
-            RemoteImage(url: url, contentMode: .fit) {
-                ProgressView().tint(.white)
+            Group {
+                if url.pathExtension.lowercased() == "gif" {
+                    AnimatedGIF(url: url, fit: true)
+                } else {
+                    RemoteImage(url: url, contentMode: .fit) {
+                        ProgressView().tint(.white)
+                    }
+                }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .scaleEffect(1 - progress * 0.25)
             .offset(offset)
         }
         .overlay(alignment: .topTrailing) {
-            Button(action: onClose) {
-                Image(systemName: "xmark.circle.fill")
-                    .font(.largeTitle)
-                    .foregroundStyle(.white.opacity(0.85))
+            HStack(spacing: 14) {
+                SaveMediaButton(url: url, isVideo: false)
+                Button(action: onClose) {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.largeTitle)
+                        .foregroundStyle(.white.opacity(0.85))
+                }
             }
             .padding()
             .opacity(1 - progress * 3)

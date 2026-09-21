@@ -201,26 +201,32 @@ final class GIFContainerView: UIView {
 
 struct GIFRepresentable: UIViewRepresentable {
     let image: UIImage
+    var fit = false
 
     func makeUIView(context: Context) -> GIFContainerView {
         let v = GIFContainerView()
+        v.imageView.contentMode = fit ? .scaleAspectFit : .scaleAspectFill
         v.imageView.image = image
         return v
     }
 
     func updateUIView(_ uiView: GIFContainerView, context: Context) {
+        uiView.imageView.contentMode = fit ? .scaleAspectFit : .scaleAspectFill
         if uiView.imageView.image !== image { uiView.imageView.image = image }
     }
 }
 
 struct AnimatedGIF: View {
     let url: URL
+    var fit = false
     @State private var image: UIImage?
 
     var body: some View {
         ZStack {
             if let image {
-                GIFRepresentable(image: image)
+                GIFRepresentable(image: image, fit: fit)
+            } else if fit {
+                ProgressView().tint(.white)
             } else {
                 Theme.input
             }
@@ -328,10 +334,13 @@ struct VideoViewer: View {
             Color.black.ignoresSafeArea()
             VideoPlayer(player: player)
                 .ignoresSafeArea()
-            Button(action: onClose) {
-                Image(systemName: "xmark.circle.fill")
-                    .font(.largeTitle)
-                    .foregroundStyle(.white.opacity(0.85))
+            HStack(spacing: 14) {
+                SaveMediaButton(url: url, isVideo: true)
+                Button(action: onClose) {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.largeTitle)
+                        .foregroundStyle(.white.opacity(0.85))
+                }
             }
             .padding()
         }

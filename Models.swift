@@ -440,6 +440,7 @@ struct Message: Decodable, Identifiable {
     let stickers: [StickerItem]
     let flags: Int
     let application_id: String?
+    let edited: Bool
     let reply: ReplyRef?
     let reactions: [Reaction]
     let forwarded: ForwardedContent?
@@ -448,7 +449,7 @@ struct Message: Decodable, Identifiable {
     enum CodingKeys: String, CodingKey {
         case id, channel_id, content, author, timestamp, attachments, mentions
         case mention_roles, mention_everyone, member
-        case embeds, components, sticker_items, flags, application_id
+        case embeds, components, sticker_items, flags, application_id, edited_timestamp
         case referenced_message, reactions, message_snapshots
     }
 
@@ -471,6 +472,7 @@ struct Message: Decodable, Identifiable {
         stickers = (try? c.decode([StickerItem].self, forKey: .sticker_items)) ?? []
         flags = (try? c.decode(Int.self, forKey: .flags)) ?? 0
         application_id = try? c.decodeIfPresent(String.self, forKey: .application_id)
+        edited = ((try? c.decode(String.self, forKey: .edited_timestamp)) != nil)
         if let mc = try? c.nestedContainer(keyedBy: MemberKeys.self, forKey: .member) {
             member_roles = (try? mc.decode([String].self, forKey: .roles)) ?? []
             member_nick = try? mc.decodeIfPresent(String.self, forKey: .nick)

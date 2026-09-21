@@ -463,6 +463,8 @@ struct Caption: Identifiable {
     var text: String
     var isFinal: Bool
     var date: Date
+    var lang: String?
+    var translated: String?
 }
 
 struct TranscriptLanguage: Identifiable {
@@ -508,7 +510,31 @@ final class VoiceSpike: ObservableObject {
     @Published var micAllowed = true
     @Published var encrypted = false
     @Published var captionsEnabled = false
-    @Published var captionLang = "en-US"
+    /// Языки, среди которых автоматически определяется речь.
+    @Published var captionLangs: [String] = VoiceSpike.loadCaptionLangs() {
+        didSet { UserDefaults.standard.set(captionLangs, forKey: "captionLangs") }
+    }
+    @Published var captionTranslate = UserDefaults.standard.bool(forKey: "captionTranslate") {
+        didSet { UserDefaults.standard.set(captionTranslate, forKey: "captionTranslate") }
+    }
+    @Published var captionTarget = UserDefaults.standard.string(forKey: "captionTarget") ?? "ru" {
+        didSet { UserDefaults.standard.set(captionTarget, forKey: "captionTarget") }
+    }
+    var translateCaption: ((String, String, String) async -> String?)?
+    private var captionTasks: [UUID: Task<Void, Never>] = [:]
+
+    nonisolated private static func loadCaptionLangs() -> [String] {
+        if let saved = UserDefaults.standard.stringArray(forKey: "captionLangs"), !saved.isEmpty {
+            return saved
+        }
+        var out = ["ru-RU", "en-US"]
+        // Язык системы тоже включаем, если он есть в списке.
+        let sys = Locale.preferredLanguages.first?.prefix(2) ?? ""
+        if let l = TranscriptLanguage.all.first(where: { $0.code.hasPrefix(String(sys)) }), !out.contains(l.code) {
+            out.append(l.code)
+        }
+        return out
+    }
     @Published var captionStatus = ""
     @Published var captions: [Caption] = []
     @Published var captionsVersion = 0
@@ -725,7 +751,7 @@ final class VoiceSpike: ObservableObject {
     func setCaptions(_ on: Bool) {
         if !on {
             captionsEnabled = false
-            transcriber.configure(enabled: false, locale: captionLang)
+            transcriber.configure(enabled: false, locales: captionLangs)
             return
         }
         Task { [weak self] in
@@ -738,7 +764,7 @@ final class VoiceSpike: ObservableObject {
             }
             if ok {
                 self.captionsEnabled = true
-                self.transcriber.configure(enabled: true, locale: self.captionLang)
+                self.transcriber.configure(enabled: true, locales: self.captionLangs)
             } else {
                 self.captionsEnabled = false
                 self.captionStatus = "Нет доступа к распознаванию речи. Разреши в Настройки → DiscClient."
@@ -746,23 +772,57 @@ final class VoiceSpike: ObservableObject {
         }
     }
 
-    func setCaptionLanguage(_ code: String) {
-        captionLang = code
+    /// Включить или выключить язык распознавания (при включении модель скачивается).
+    func toggleCaptionLanguage(_ code: String) {
+        if captionLangs.contains(code) {
+            guard captionLangs.count > 1 else { return }
+            captionLangs.removeAll { $0 == code }
+        } else {
+            captionLangs.append(code)
+        }
         if captionsEnabled {
-            transcriber.configure(enabled: true, locale: code)
+            transcriber.configure(enabled: true, locales: captionLangs)
         }
     }
 
     func handleTranscript(_ u: VoiceTranscriber.Update) {
+        let id: UUID
         if let idx = captions.lastIndex(where: { $0.userId == u.userId }), !captions[idx].isFinal {
             captions[idx].text = u.text
             captions[idx].isFinal = u.isFinal
             captions[idx].date = Date()
+            captions[idx].lang = u.lang
+            id = captions[idx].id
         } else {
-            captions.append(Caption(userId: u.userId, text: u.text, isFinal: u.isFinal, date: Date()))
+            let c = Caption(userId: u.userId, text: u.text, isFinal: u.isFinal, date: Date(), lang: u.lang, translated: nil)
+            captions.append(c)
+            id = c.id
         }
         if captions.count > 60 { captions.removeFirst(captions.count - 60) }
         captionsVersion += 1
+        scheduleTranslation(id, text: u.text, lang: u.lang, final: u.isFinal)
+    }
+
+    /// Перевод строки субтитров: для черновика с небольшой задержкой, для итогового текста сразу.
+    private func scheduleTranslation(_ id: UUID, text: String, lang: String?, final: Bool) {
+        captionTasks[id]?.cancel()
+        guard captionTranslate, let lang, let translate = translateCaption else { return }
+        let src = SpeechLang.code(lang)
+        let target = captionTarget
+        if src == target || src.hasPrefix(target + "-") {
+            if let i = captions.firstIndex(where: { $0.id == id }) { captions[i].translated = nil }
+            return
+        }
+        captionTasks[id] = Task { [weak self] in
+            if !final { try? await Task.sleep(nanoseconds: 900_000_000) }
+            if Task.isCancelled { return }
+            let tr = await translate(text, src, target)
+            if Task.isCancelled { return }
+            guard let self, let i = self.captions.firstIndex(where: { $0.id == id }) else { return }
+            self.captions[i].translated = tr
+            self.captionsVersion += 1
+            if final { self.captionTasks[id] = nil }
+        }
     }
 
     // MARK: Микрофон, наушники, маршрут звука

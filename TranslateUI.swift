@@ -16,6 +16,28 @@ struct TranslateSettingsSheet: View {
                     .foregroundStyle(Theme.text)
                     .frame(maxWidth: .infinity, alignment: .leading)
 
+                if !translator.pending.isEmpty {
+                    card {
+                        Text("Нужны языковые пакеты")
+                            .font(.system(size: 15, weight: .semibold))
+                        ForEach(translator.pending) { p in
+                            HStack {
+                                Text("\(Languages.name(p.source)) → \(Languages.name(p.target))")
+                                Spacer()
+                                Button("Скачать") {
+                                    Task { await translator.prepare(p) }
+                                }
+                                .font(.system(size: 14, weight: .semibold))
+                                .padding(.horizontal, 12)
+                                .padding(.vertical, 6)
+                                .background(Theme.blurple, in: Capsule())
+                                .foregroundStyle(.white)
+                            }
+                        }
+                        note("Пока пакет не скачан, сообщения на этом языке остаются в оригинале. Скачивает систему, дальше перевод идёт на устройстве.")
+                    }
+                }
+
                 card {
                     Toggle("Переводить сообщения в чате", isOn: binding.incomingEnabled)
                         .tint(Theme.blurple)
@@ -55,7 +77,7 @@ struct TranslateSettingsSheet: View {
                     Text("Стиль перевода")
                         .font(.system(size: 15, weight: .semibold))
                     note("Перевод повторяет стиль оригинала: если в исходном сообщении нет заглавной буквы или точки в конце, их не будет и в переводе. Остальные знаки препинания ставятся по правилам языка.")
-                    note("При первом переводе iOS предложит скачать языковые пакеты. Дальше перевод работает на устройстве.")
+                    note("Языковые пакеты скачиваются только по кнопке «Скачать». Сообщения на языках вне списка не переводятся и ничего не запрашивают.")
                 }
             }
             .padding(16)
