@@ -494,6 +494,11 @@ final class VoiceSpike: ObservableObject {
     @Published var captions: [Caption] = []
     @Published var captionsVersion = 0
     @Published var videoProbe = false
+    @Published var stageTopic: String?
+    @Published var stageSuppressed = true
+    @Published var handRaised = false
+    var patchVoiceState: ((String, [String: Any]) async -> Bool)?
+    var fetchStageTopic: ((String) async -> String?)?
 
     let transcriber = VoiceTranscriber()
 
@@ -537,6 +542,8 @@ final class VoiceSpike: ObservableObject {
     }()
 
     var isConnected: Bool { activeChannelId != nil }
+    var activeGuildId: String? { guildId }
+    var isStage: Bool { activeChannel?.type == 13 }
 
     // MARK: Лог
 
@@ -612,6 +619,9 @@ final class VoiceSpike: ObservableObject {
         flags = [:]
         lastHeard = [:]
         captions = []
+        stageTopic = nil
+        stageSuppressed = true
+        handRaised = false
         updateParticipants([])
         ImageLoader.shared.setLimit(2)
 
@@ -620,6 +630,9 @@ final class VoiceSpike: ObservableObject {
             guard let self else { return }
             self.micAllowed = await VoiceAudio.requestMicPermission()
             guard self.activeChannelId == cid else { return }
+            if channel.type == 13 {
+                self.stageTopic = await self.fetchStageTopic?(cid)
+            }
             self.add(self.micAllowed ? "Микрофон: доступ есть" : "Микрофон: доступа нет, будет только прослушивание")
             self.add("Запрашиваю вход в канал (op 4), DAVE v\(self.daveVersion)")
             self.ensureGateway?()
@@ -757,13 +770,48 @@ final class VoiceSpike: ObservableObject {
     }
 
     private func applyAudioState() {
-        gateway?.setMuted(muted || deafened)
+        gateway?.setMuted(muted || deafened || (isStage && stageSuppressed))
         gateway?.setDeafened(deafened)
         if userId.isEmpty == false {
             flags[userId] = VoiceFlags(mute: muted || deafened, deaf: deafened)
         }
         guard let cid = activeChannelId else { return }
         _ = sendGateway?(voiceStatePacket(guildId: guildId, channelId: cid))
+    }
+
+    /// Слушатель трибуны не передаёт звук, пока его не позвали на сцену.
+    private func refreshGatewayMute() {
+        gateway?.setMuted(muted || deafened || (isStage && stageSuppressed))
+    }
+
+    // MARK: Трибуна
+
+    private func patchStage(_ extra: [String: Any]) {
+        guard isStage, let gid = guildId, let cid = activeChannelId else { return }
+        var body: [String: Any] = ["channel_id": cid]
+        for (k, v) in extra { body[k] = v }
+        Task { [weak self] in
+            let ok = await self?.patchVoiceState?(gid, body) ?? false
+            if !ok { self?.add("Трибуна: Discord отклонил запрос") }
+        }
+    }
+
+    /// Поднять или опустить руку («попросить слово»).
+    func toggleHand() {
+        let raise = !handRaised
+        handRaised = raise
+        let stamp: Any = raise ? ISO8601DateFormatter().string(from: Date()) : NSNull()
+        patchStage(["request_to_speak_timestamp": stamp])
+    }
+
+    /// Выйти на сцену (нужны права модератора или приглашение).
+    func becomeSpeaker() {
+        patchStage(["suppress": false])
+    }
+
+    /// Вернуться в слушатели.
+    func becomeListener() {
+        patchStage(["suppress": true])
     }
 
     func setSpeaker(_ on: Bool) {
@@ -792,6 +840,15 @@ final class VoiceSpike: ObservableObject {
                 sessionId = sid
                 add("VOICE_STATE_UPDATE: получил session_id")
                 tryConnect()
+            }
+            if uid == userId, channel == activeChannelId, isStage {
+                let sup = d["suppress"] as? Bool ?? false
+                let raised = (d["request_to_speak_timestamp"] as? String) != nil
+                if sup != stageSuppressed || raised != handRaised {
+                    stageSuppressed = sup
+                    handRaised = raised
+                    refreshGatewayMute()
+                }
             }
             if let uid, channel == activeChannelId {
                 let mute = (d["self_mute"] as? Bool ?? false) || (d["mute"] as? Bool ?? false)
@@ -840,7 +897,7 @@ final class VoiceSpike: ObservableObject {
             daveVersion: daveVersion,
             audio: audio,
             micAllowed: micAllowed,
-            muted: muted,
+            muted: muted || (activeChannel?.type == 13 && stageSuppressed),
             deafened: deafened,
             videoProbe: videoProbe
         )

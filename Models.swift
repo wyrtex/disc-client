@@ -10,13 +10,16 @@ func snowflakeDate(_ id: String) -> Date? {
 func formatDate(_ d: Date?) -> String {
     guard let d else { return "—" }
     let f = DateFormatter()
+    f.locale = Locale(identifier: "ru_RU")
     f.dateStyle = .medium
     f.timeStyle = .none
     return f.string(from: d)
 }
 
 func relativeString(_ d: Date) -> String {
-    RelativeDateTimeFormatter().localizedString(for: d, relativeTo: Date())
+    let f = RelativeDateTimeFormatter()
+    f.locale = Locale(identifier: "ru_RU")
+    return f.localizedString(for: d, relativeTo: Date())
 }
 
 // MARK: - Пользователи и серверы
@@ -29,6 +32,7 @@ struct User: Decodable, Identifiable {
     let bot: Bool?
     let banner: String?
     let accent_color: Int?
+    let primary_guild: PrimaryGuild?
 
     var displayName: String { global_name ?? username }
 
@@ -43,6 +47,18 @@ struct User: Decodable, Identifiable {
     func bannerURL(size: Int = 600) -> URL? {
         guard let banner, !banner.isEmpty else { return nil }
         return URL(string: "https://cdn.discordapp.com/banners/\(id)/\(banner).png?size=\(size)")
+    }
+}
+
+/// Клановый тег пользователя (значок и 4 буквы рядом с ником).
+struct PrimaryGuild: Decodable {
+    let identity_guild_id: String?
+    let tag: String?
+    let badge: String?
+
+    var badgeURL: URL? {
+        guard let g = identity_guild_id, let b = badge else { return nil }
+        return URL(string: "https://cdn.discordapp.com/guild-tag-badges/\(g)/\(b).png?size=64")
     }
 }
 
@@ -90,6 +106,7 @@ struct GuildRole: Decodable, Identifiable {
 
 struct GuildMember: Decodable {
     let roles: [String]
+    let communication_disabled_until: String?
 }
 
 struct GuildEmoji: Decodable, Identifiable {
@@ -110,9 +127,18 @@ struct MutualGuild: Decodable {
     let id: String
 }
 
+struct ProfileBadge: Decodable, Identifiable {
+    let id: String
+    let description: String?
+    let icon: String
+
+    var url: URL? { URL(string: "https://cdn.discordapp.com/badge-icons/\(icon).png") }
+}
+
 struct GuildMemberInfo: Decodable {
     let roles: [String]?
     let joined_at: String?
+    let nick: String?
 
     var joinedDate: Date? {
         guard let joined_at else { return nil }
@@ -129,9 +155,11 @@ struct ProfileResponse: Decodable {
     let user_profile: UserProfileInfo?
     let mutual_guilds: [MutualGuild]?
     let guild_member: GuildMemberInfo?
+    let badges: [ProfileBadge]?
+    let mutual_friends_count: Int?
 
     enum CodingKeys: String, CodingKey {
-        case user, user_profile, mutual_guilds, guild_member
+        case user, user_profile, mutual_guilds, guild_member, badges, mutual_friends_count
     }
 
     init(from decoder: Decoder) throws {
@@ -140,6 +168,8 @@ struct ProfileResponse: Decodable {
         user_profile = try? c.decode(UserProfileInfo.self, forKey: .user_profile)
         mutual_guilds = try? c.decode([MutualGuild].self, forKey: .mutual_guilds)
         guild_member = try? c.decode(GuildMemberInfo.self, forKey: .guild_member)
+        badges = try? c.decode([ProfileBadge].self, forKey: .badges)
+        mutual_friends_count = try? c.decode(Int.self, forKey: .mutual_friends_count)
     }
 }
 
@@ -395,6 +425,8 @@ struct Message: Decodable, Identifiable {
     let mentions: [User]
     let mention_roles: [String]
     let mention_everyone: Bool
+    let member_roles: [String]
+    let member_nick: String?
     let reply: ReplyRef?
     let reactions: [Reaction]
     let forwarded: ForwardedContent?
@@ -402,9 +434,11 @@ struct Message: Decodable, Identifiable {
 
     enum CodingKeys: String, CodingKey {
         case id, channel_id, content, author, timestamp, attachments, mentions
-        case mention_roles, mention_everyone
+        case mention_roles, mention_everyone, member
         case referenced_message, reactions, message_snapshots
     }
+
+    enum MemberKeys: String, CodingKey { case roles, nick }
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -418,6 +452,13 @@ struct Message: Decodable, Identifiable {
         mentions = (try? c.decode([User].self, forKey: .mentions)) ?? []
         mention_roles = (try? c.decode([String].self, forKey: .mention_roles)) ?? []
         mention_everyone = (try? c.decode(Bool.self, forKey: .mention_everyone)) ?? false
+        if let mc = try? c.nestedContainer(keyedBy: MemberKeys.self, forKey: .member) {
+            member_roles = (try? mc.decode([String].self, forKey: .roles)) ?? []
+            member_nick = try? mc.decodeIfPresent(String.self, forKey: .nick)
+        } else {
+            member_roles = []
+            member_nick = nil
+        }
         reply = try? c.decode(ReplyRef.self, forKey: .referenced_message)
         reactions = (try? c.decode([Reaction].self, forKey: .reactions)) ?? []
         forwarded = (try? c.decode([ForwardedContent].self, forKey: .message_snapshots))?.first

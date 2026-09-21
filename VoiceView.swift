@@ -21,13 +21,15 @@ struct VoiceView: View {
                     Text("Ты не подключён к голосовому каналу")
                         .foregroundStyle(Theme.muted)
                     Spacer()
+                } else if voice.isStage {
+                    StageContent(voice: voice)
                 } else {
                     participants
                 }
                 if voice.captionsEnabled {
                     CaptionsPanel(voice: voice)
                 }
-                controls
+                if voice.isStage { stageControls } else { controls }
             }
         }
         .sheet(isPresented: $showAudio) {
@@ -95,6 +97,64 @@ struct VoiceView: View {
                 }
             }
             .padding(16)
+        }
+    }
+
+    // MARK: Кнопки управления трибуны
+
+    private var stageControls: some View {
+        HStack(spacing: 12) {
+            if voice.stageSuppressed {
+                labeledControl(icon: "hand.raised.fill", label: voice.handRaised ? "Опустить" : "Рука", active: voice.handRaised) {
+                    voice.toggleHand()
+                }
+                labeledControl(icon: "mic.fill", label: "На сцену", active: false) {
+                    voice.becomeSpeaker()
+                }
+            } else {
+                labeledControl(
+                    icon: voice.muted ? "mic.slash.fill" : "mic.fill",
+                    label: "Микрофон",
+                    active: voice.muted
+                ) { voice.toggleMute() }
+                labeledControl(icon: "person.fill.xmark", label: "Слушать", active: false) {
+                    voice.becomeListener()
+                }
+            }
+            labeledControl(icon: "captions.bubble.fill", label: "Субтитры", active: voice.captionsEnabled) {
+                voice.setCaptions(!voice.captionsEnabled)
+            }
+            labeledControl(icon: voice.speakerOn ? "speaker.wave.3.fill" : "ear.fill", label: "Звук", active: false) {
+                showAudio = true
+            }
+            VStack(spacing: 4) {
+                Button {
+                    voice.leave()
+                    onMinimize()
+                } label: {
+                    Image(systemName: "phone.down.fill")
+                        .font(.system(size: 20))
+                        .foregroundStyle(.white)
+                        .frame(width: 54, height: 54)
+                        .background(Color.red, in: Circle())
+                }
+                Text("Выйти").font(.system(size: 10)).foregroundStyle(Theme.muted)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.top, 10)
+        .padding(.bottom, 22)
+        .frame(maxWidth: .infinity)
+        .background(Theme.panel)
+    }
+
+    private func labeledControl(icon: String, label: String, active: Bool, action: @escaping () -> Void) -> some View {
+        VStack(spacing: 4) {
+            controlButton(icon: icon, active: active, action: action)
+            Text(label)
+                .font(.system(size: 10))
+                .foregroundStyle(Theme.muted)
+                .lineLimit(1)
         }
     }
 
@@ -348,6 +408,11 @@ struct VoiceBar: View {
     @ObservedObject var voice: VoiceSpike
     let onOpen: () -> Void
 
+    private var barIcon: String {
+        if voice.isStage && voice.stageSuppressed { return "hand.raised.fill" }
+        return (voice.muted || voice.deafened) ? "mic.slash.fill" : "mic.fill"
+    }
+
     var body: some View {
         if let ch = voice.activeChannel {
             HStack(spacing: 10) {
@@ -363,9 +428,13 @@ struct VoiceBar: View {
                 }
                 Spacer()
                 Button {
-                    voice.toggleMute()
+                    if voice.isStage && voice.stageSuppressed {
+                        voice.toggleHand()
+                    } else {
+                        voice.toggleMute()
+                    }
                 } label: {
-                    Image(systemName: (voice.muted || voice.deafened) ? "mic.slash.fill" : "mic.fill")
+                    Image(systemName: barIcon)
                         .font(.system(size: 15))
                         .foregroundStyle(Theme.text)
                         .frame(width: 34, height: 34)
@@ -579,5 +648,148 @@ struct VoiceLogView: View {
         .presentationDetents([.large])
         .presentationDragIndicator(.visible)
         .presentationBackground(Theme.panel)
+    }
+}
+
+
+// MARK: - Трибуна: спикеры и слушатели
+
+struct StageContent: View {
+    @EnvironmentObject var store: Store
+    @ObservedObject var voice: VoiceSpike
+
+    private var members: [VoiceMemberState] {
+        guard let gid = voice.activeGuildId, let cid = voice.activeChannelId else { return [] }
+        return store.members(in: cid, guildId: gid)
+    }
+
+    private var speakers: [VoiceMemberState] {
+        members.filter { !$0.suppress }
+    }
+
+    private var audience: [VoiceMemberState] {
+        members
+            .filter { $0.suppress }
+            .sorted { a, b in
+                if a.requestToSpeak != b.requestToSpeak { return a.requestToSpeak }
+                return a.userId < b.userId
+            }
+    }
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 18) {
+                if let topic = voice.stageTopic, !topic.isEmpty {
+                    Text(topic)
+                        .font(.system(size: 17, weight: .semibold))
+                        .foregroundStyle(Theme.text)
+                }
+
+                sectionTitle("Спикеры", count: speakers.count)
+                if speakers.isEmpty {
+                    Text("Сейчас никто не выступает")
+                        .font(.system(size: 14))
+                        .foregroundStyle(Theme.muted)
+                }
+                LazyVGrid(
+                    columns: [GridItem(.flexible(), spacing: 12), GridItem(.flexible(), spacing: 12)],
+                    spacing: 12
+                ) {
+                    ForEach(speakers, id: \.userId) { m in
+                        StageSpeakerTile(voice: voice, state: m)
+                    }
+                }
+
+                sectionTitle("Слушатели", count: audience.count)
+                LazyVGrid(
+                    columns: Array(repeating: GridItem(.flexible(), spacing: 8), count: 4),
+                    spacing: 14
+                ) {
+                    ForEach(audience, id: \.userId) { m in
+                        AudienceCell(state: m)
+                    }
+                }
+            }
+            .padding(16)
+        }
+        .task {
+            if let gid = voice.activeGuildId { store.resolveVoiceUsers(guildId: gid) }
+        }
+    }
+
+    private func sectionTitle(_ title: String, count: Int) -> some View {
+        Text("\(title.uppercased()) · \(count)")
+            .font(.system(size: 12, weight: .bold))
+            .foregroundStyle(Theme.muted)
+    }
+}
+
+struct StageSpeakerTile: View {
+    @EnvironmentObject var store: Store
+    @ObservedObject var voice: VoiceSpike
+    let state: VoiceMemberState
+
+    private var user: User? {
+        store.voiceUsers[state.userId] ?? voice.users[state.userId] ?? (store.me?.id == state.userId ? store.me : nil)
+    }
+
+    var body: some View {
+        TimelineView(.periodic(from: .now, by: 0.25)) { ctx in
+            let speaking = ctx.date.timeIntervalSince(voice.lastHeard[state.userId] ?? .distantPast) < 0.6
+            VStack(spacing: 8) {
+                AvatarView(user: user, size: 72)
+                Text(user.map { $0.displayName + (state.userId == voice.userId ? " (ты)" : "") } ?? "…")
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(Theme.text)
+                    .lineLimit(1)
+            }
+            .frame(maxWidth: .infinity)
+            .frame(height: 140)
+            .background(Theme.panel, in: RoundedRectangle(cornerRadius: 14))
+            .overlay(
+                RoundedRectangle(cornerRadius: 14)
+                    .stroke(speaking ? Theme.green : Color.clear, lineWidth: 3)
+            )
+            .overlay(alignment: .topTrailing) {
+                if state.mute || state.deaf {
+                    Image(systemName: state.deaf ? "speaker.slash.fill" : "mic.slash.fill")
+                        .font(.system(size: 11, weight: .bold))
+                        .foregroundStyle(.white)
+                        .frame(width: 22, height: 22)
+                        .background(Color.red, in: Circle())
+                        .padding(8)
+                }
+            }
+        }
+    }
+}
+
+struct AudienceCell: View {
+    @EnvironmentObject var store: Store
+    let state: VoiceMemberState
+
+    private var user: User? {
+        store.voiceUsers[state.userId] ?? (store.me?.id == state.userId ? store.me : nil)
+    }
+
+    var body: some View {
+        VStack(spacing: 4) {
+            AvatarView(user: user, size: 52)
+                .overlay(alignment: .bottomTrailing) {
+                    if state.requestToSpeak {
+                        Image(systemName: "hand.raised.fill")
+                            .font(.system(size: 10, weight: .bold))
+                            .foregroundStyle(.black)
+                            .frame(width: 22, height: 22)
+                            .background(Color(hex: 0xF0B232), in: Circle())
+                            .overlay(Circle().stroke(Theme.chat, lineWidth: 2))
+                            .offset(x: 4, y: 4)
+                    }
+                }
+            Text(user?.displayName ?? "…")
+                .font(.system(size: 11))
+                .foregroundStyle(Theme.muted)
+                .lineLimit(1)
+        }
     }
 }

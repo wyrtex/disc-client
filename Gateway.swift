@@ -182,6 +182,9 @@ final class Gateway {
                 onMessage?(msg)
             } else if t.hasPrefix("VOICE_"), let d = obj["d"] as? [String: Any] {
                 onEvent?(t, d)
+            } else if t == "MESSAGE_UPDATE" || t == "MESSAGE_DELETE" || t == "GUILD_MEMBERS_CHUNK",
+                      let d = obj["d"] as? [String: Any] {
+                onEvent?(t, d)
             }
         default:
             break

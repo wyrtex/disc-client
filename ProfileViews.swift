@@ -12,27 +12,40 @@ struct UserProfileSheet: View {
 
     private var shown: User { profile?.user ?? user }
     private var isMe: Bool { user.id == store.me?.id }
+    private var memberRoleIds: [String] { profile?.guild_member?.roles ?? [] }
+
+    private var displayName: String {
+        if let nick = profile?.guild_member?.nick, !nick.isEmpty { return nick }
+        return shown.displayName
+    }
+
+    private var nameColor: Color {
+        store.roleColor(guildId: guildId, userId: user.id, fallbackRoles: memberRoleIds) ?? Theme.text
+    }
+
+    private var guild: Guild? {
+        guard let guildId else { return nil }
+        return store.guilds.first(where: { $0.id == guildId })
+    }
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 0) {
                 header
-                VStack(alignment: .leading, spacing: 12) {
-                    names
-                    if let bio = profile?.user_profile?.bio, !bio.isEmpty {
-                        infoCard("Обо мне", bio)
-                    }
-                    infoCard("В Discord с", formatDate(snowflakeDate(user.id)))
-                    if let joined = profile?.guild_member?.joinedDate {
-                        infoCard("На сервере с", formatDate(joined))
-                    }
-                    rolesSection
-                    mutualSection
+                VStack(alignment: .leading, spacing: 18) {
+                    nameBlock
+                    chipsRow
+                    mutualRow
                     if !isMe && user.bot != true {
                         messageButton
                     }
+                    tabHeader
+                    biography
+                    membership
+                    rolesSection
                 }
-                .padding(16)
+                .padding(.horizontal, 16)
+                .padding(.bottom, 32)
             }
         }
         .background(Theme.chat)
@@ -45,32 +58,34 @@ struct UserProfileSheet: View {
         }
     }
 
+    // MARK: Шапка
+
     private var header: some View {
         ZStack(alignment: .bottomLeading) {
             RemoteImage(url: shown.bannerURL()) {
                 bannerColor
             }
             .frame(maxWidth: .infinity)
-            .frame(height: 110)
+            .frame(height: 130)
             .clipped()
-            AvatarView(user: shown, size: 84)
+            AvatarView(user: shown, size: 92)
                 .overlay(Circle().stroke(Theme.chat, lineWidth: 6))
-                .offset(x: 16, y: 42)
+                .offset(x: 14, y: 46)
         }
-        .padding(.bottom, 46)
+        .padding(.bottom, 50)
     }
 
     private var bannerColor: Color {
         if let c = shown.accent_color { return Color(hex: UInt32(c)) }
-        return Theme.blurple.opacity(0.7)
+        return Theme.blurple.opacity(0.75)
     }
 
-    private var names: some View {
-        VStack(alignment: .leading, spacing: 2) {
+    private var nameBlock: some View {
+        VStack(alignment: .leading, spacing: 3) {
             HStack(spacing: 6) {
-                Text(shown.displayName)
-                    .font(.system(size: 22, weight: .bold))
-                    .foregroundStyle(.white)
+                Text(displayName)
+                    .font(.system(size: 26, weight: .bold))
+                    .foregroundStyle(nameColor)
                 if shown.bot == true {
                     Text("APP")
                         .font(.system(size: 10, weight: .bold))
@@ -80,52 +95,181 @@ struct UserProfileSheet: View {
                         .background(Theme.blurple, in: RoundedRectangle(cornerRadius: 4))
                 }
             }
-            Text(shown.username)
-                .font(.system(size: 15))
-                .foregroundStyle(Theme.muted)
-            if let p = profile?.user_profile?.pronouns, !p.isEmpty {
-                Text(p)
-                    .font(.system(size: 13))
+            HStack(spacing: 6) {
+                Text(shown.username)
+                    .font(.system(size: 15))
                     .foregroundStyle(Theme.muted)
+                if let p = profile?.user_profile?.pronouns, !p.isEmpty {
+                    Text("•").foregroundStyle(Theme.muted)
+                    Text(p)
+                        .font(.system(size: 15))
+                        .foregroundStyle(Theme.muted)
+                }
             }
         }
     }
 
-    private func infoCard(_ title: String, _ value: String) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text(title.uppercased())
-                .font(.system(size: 12, weight: .bold))
-                .foregroundStyle(Theme.muted)
-            Text(value)
-                .font(.system(size: 15))
-                .foregroundStyle(Theme.normalText)
+    /// Клановый тег и значки профиля.
+    @ViewBuilder
+    private var chipsRow: some View {
+        let tag = shown.primary_guild?.tag ?? ""
+        let badges = profile?.badges ?? []
+        if !tag.isEmpty || !badges.isEmpty {
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
+                    if !tag.isEmpty {
+                        HStack(spacing: 5) {
+                            RemoteImage(url: shown.primary_guild?.badgeURL, contentMode: .fit) { Color.clear }
+                                .frame(width: 18, height: 18)
+                            Text(tag)
+                                .font(.system(size: 14, weight: .semibold))
+                                .foregroundStyle(Theme.text)
+                        }
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 6)
+                        .background(Theme.panel, in: Capsule())
+                    }
+                    if !badges.isEmpty {
+                        HStack(spacing: 10) {
+                            ForEach(badges) { b in
+                                RemoteImage(url: b.url, contentMode: .fit) { Color.clear }
+                                    .frame(width: 22, height: 22)
+                            }
+                        }
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 6)
+                        .background(Theme.panel, in: Capsule())
+                    }
+                }
+            }
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(12)
-        .background(Theme.panel, in: RoundedRectangle(cornerRadius: 10))
+    }
+
+    private var mutualText: String? {
+        var parts: [String] = []
+        if let f = profile?.mutual_friends_count, f > 0 {
+            parts.append("\(f) \(plural(f, "общий друг", "общих друга", "общих друзей"))")
+        }
+        if let g = profile?.mutual_guilds?.count, g > 0 {
+            parts.append("\(g) \(plural(g, "общий сервер", "общих сервера", "общих серверов"))")
+        }
+        return parts.isEmpty ? nil : parts.joined(separator: "  •  ")
     }
 
     @ViewBuilder
+    private var mutualRow: some View {
+        if let t = mutualText {
+            Text(t)
+                .font(.system(size: 15))
+                .foregroundStyle(Theme.normalText)
+        }
+    }
+
+    private func plural(_ n: Int, _ one: String, _ few: String, _ many: String) -> String {
+        let m10 = n % 10
+        let m100 = n % 100
+        if m10 == 1 && m100 != 11 { return one }
+        if (2...4).contains(m10) && !(12...14).contains(m100) { return few }
+        return many
+    }
+
+    private var messageButton: some View {
+        Button {
+            dismiss()
+            Task { await store.openDM(with: user) }
+        } label: {
+            HStack(spacing: 8) {
+                Image(systemName: "bubble.left.fill")
+                Text("Сообщение")
+                    .font(.system(size: 16, weight: .semibold))
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 14)
+            .background(Theme.input, in: RoundedRectangle(cornerRadius: 12))
+            .foregroundStyle(Theme.text)
+        }
+    }
+
+    // MARK: Вкладка и разделы
+
+    private var tabHeader: some View {
+        VStack(spacing: 8) {
+            Text("Главное")
+                .font(.system(size: 16, weight: .semibold))
+                .foregroundStyle(Theme.link)
+                .frame(maxWidth: .infinity)
+            Rectangle()
+                .fill(Theme.link)
+                .frame(height: 3)
+                .clipShape(Capsule())
+            Rectangle()
+                .fill(Color.white.opacity(0.08))
+                .frame(height: 1)
+                .offset(y: -8)
+        }
+    }
+
+    private func sectionTitle(_ s: String) -> some View {
+        Text(s)
+            .font(.system(size: 16, weight: .semibold))
+            .foregroundStyle(Theme.text)
+    }
+
+    @ViewBuilder
+    private var biography: some View {
+        if let bio = profile?.user_profile?.bio, !bio.isEmpty {
+            VStack(alignment: .leading, spacing: 8) {
+                sectionTitle("Биография")
+                Text(DiscordText.attributed(bio, mentions: []))
+                    .font(.system(size: 16))
+                    .foregroundStyle(Theme.normalText)
+                    .tint(Theme.link)
+            }
+        }
+    }
+
+    private var membership: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            sectionTitle(guild == nil ? "В Discord с" : "В числе участников с")
+            HStack(spacing: 10) {
+                Image(systemName: "gamecontroller.fill")
+                    .foregroundStyle(Theme.muted)
+                Text(formatDate(snowflakeDate(user.id)))
+                    .font(.system(size: 16))
+                    .foregroundStyle(Theme.normalText)
+                if let joined = profile?.guild_member?.joinedDate {
+                    Text("•").foregroundStyle(Theme.muted)
+                    if let g = guild {
+                        RemoteImage(url: g.iconURL) { Theme.panel }
+                            .frame(width: 22, height: 22)
+                            .clipShape(RoundedRectangle(cornerRadius: 6))
+                    }
+                    Text(formatDate(joined))
+                        .font(.system(size: 16))
+                        .foregroundStyle(Theme.normalText)
+                }
+            }
+        }
+    }
+
+    // MARK: Роли
+
+    @ViewBuilder
     private var rolesSection: some View {
-        let ids = profile?.guild_member?.roles ?? []
+        let ids = memberRoleIds
         let all = guildId.flatMap { store.guildRoles[$0] } ?? []
         let mine = all
             .filter { ids.contains($0.id) && $0.id != guildId }
             .sorted { ($0.position ?? 0) > ($1.position ?? 0) }
         if !mine.isEmpty {
-            VStack(alignment: .leading, spacing: 8) {
-                Text("РОЛИ")
-                    .font(.system(size: 12, weight: .bold))
-                    .foregroundStyle(Theme.muted)
-                FlowLayout(spacing: 6) {
+            VStack(alignment: .leading, spacing: 10) {
+                sectionTitle("Роли")
+                FlowLayout(spacing: 8) {
                     ForEach(mine) { r in
                         roleChip(r)
                     }
                 }
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(12)
-            .background(Theme.panel, in: RoundedRectangle(cornerRadius: 10))
         }
     }
 
@@ -134,63 +278,15 @@ struct UserProfileSheet: View {
             if let c = r.color, c > 0 { return Color(hex: UInt32(c)) }
             return Theme.muted
         }()
-        return HStack(spacing: 6) {
-            Circle().fill(color).frame(width: 10, height: 10)
+        return HStack(spacing: 7) {
+            Circle().fill(color).frame(width: 12, height: 12)
             Text(r.name)
-                .font(.system(size: 13, weight: .medium))
+                .font(.system(size: 14, weight: .medium))
                 .foregroundStyle(Theme.normalText)
         }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 5)
-        .background(Theme.chat, in: RoundedRectangle(cornerRadius: 8))
-    }
-
-    @ViewBuilder
-    private var mutualSection: some View {
-        let mutual = (profile?.mutual_guilds ?? []).compactMap { m in
-            store.guilds.first { $0.id == m.id }
-        }
-        if !mutual.isEmpty {
-            VStack(alignment: .leading, spacing: 8) {
-                Text("ОБЩИЕ СЕРВЕРЫ: \(mutual.count)")
-                    .font(.system(size: 12, weight: .bold))
-                    .foregroundStyle(Theme.muted)
-                ForEach(mutual) { g in
-                    HStack(spacing: 10) {
-                        RemoteImage(url: g.iconURL) {
-                            Theme.chat
-                        }
-                        .frame(width: 28, height: 28)
-                        .clipShape(RoundedRectangle(cornerRadius: 8))
-                        Text(g.name)
-                            .font(.system(size: 15))
-                            .foregroundStyle(Theme.normalText)
-                            .lineLimit(1)
-                        Spacer()
-                    }
-                }
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(12)
-            .background(Theme.panel, in: RoundedRectangle(cornerRadius: 10))
-        }
-    }
-
-    private var messageButton: some View {
-        Button {
-            dismiss()
-            Task { await store.openDM(with: user) }
-        } label: {
-            HStack {
-                Image(systemName: "bubble.left.fill")
-                Text("Написать сообщение")
-                    .font(.system(size: 16, weight: .semibold))
-            }
-            .frame(maxWidth: .infinity)
-            .padding(.vertical, 13)
-            .background(Theme.blurple, in: RoundedRectangle(cornerRadius: 10))
-            .foregroundStyle(.white)
-        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 7)
+        .background(Theme.panel, in: RoundedRectangle(cornerRadius: 9))
     }
 }
 

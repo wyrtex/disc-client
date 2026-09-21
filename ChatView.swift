@@ -39,6 +39,7 @@ struct ChatView: View {
     @State private var mentionMap: [String: String] = [:]
     @State private var suggestions: [Suggestion] = []
     @State private var suggestionTask: Task<Void, Never>?
+    @State private var editing: Message?
 
     private struct Suggestion: Identifiable {
         let id: String
@@ -78,6 +79,21 @@ struct ChatView: View {
         )
     }
 
+    private var canWrite: Bool { store.canSend(in: channel) }
+
+    private var authorsKey: Int {
+        var set = Set<String>()
+        for m in (store.messages[channel.id] ?? []).suffix(100) { set.insert(m.author.id) }
+        return set.count
+    }
+
+    private func requestVisibleMembers() {
+        guard let gid = guildId else { return }
+        var ids = Set<String>()
+        for m in (store.messages[channel.id] ?? []).suffix(100) { ids.insert(m.author.id) }
+        store.requestMembers(guildId: gid, userIds: Array(ids))
+    }
+
     private var canSend: Bool {
         !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !pending.isEmpty
     }
@@ -101,6 +117,7 @@ struct ChatView: View {
             .task {
                 if let gid = guildId { await store.loadRoles(gid) }
             }
+            .task(id: authorsKey) { requestVisibleMembers() }
             .onChange(of: text) { _, _ in updateSuggestions() }
             .onAppear { store.lastChannel = channel }
             .onDisappear { recorder.cancel() }
@@ -112,9 +129,16 @@ struct ChatView: View {
         VStack(spacing: 0) {
             messageList(msgs)
             if !suggestions.isEmpty { suggestionList }
+            if let e = editing { editBar(e) }
             if let r = replyTo { replyBar(r) }
             if !pending.isEmpty { pendingStrip }
-            if recorder.isRecording { recordingBar } else { inputBar }
+            if recorder.isRecording {
+                recordingBar
+            } else if canWrite {
+                inputBar
+            } else {
+                noWriteBar
+            }
         }
         .background(Theme.chat)
         .environment(\.currentGuildId, guildId)
@@ -186,7 +210,9 @@ struct ChatView: View {
             message: m,
             channel: channel,
             guildId: guildId,
-            onReply: { replyTo = m }
+            onReply: { replyTo = m },
+            onEdit: { startEdit(m) },
+            onDelete: { Task { _ = await store.delete(m) } }
         )
         .environmentObject(store)
         .presentationDetents([.medium, .large])
@@ -240,6 +266,8 @@ struct ChatView: View {
                                 : nil,
                             isMentioned: isMentioned(m),
                             flash: flashId == m.id,
+                            authorName: store.guildNick(guildId: guildId, user: m.author, fallbackNick: m.member_nick),
+                            authorColor: store.roleColor(guildId: guildId, userId: m.author.id, fallbackRoles: m.member_roles),
                             onImage: { url in viewer = ViewerItem(url: url) },
                             onProfile: { u in profileUser = u },
                             onReply: { replyTo = m },
@@ -361,6 +389,52 @@ struct ChatView: View {
     }
 
     // MARK: - Ответ и вложения перед отправкой
+
+    private var noWriteBar: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "lock.fill")
+            Text("У вас нет разрешения отправлять сообщения в этом канале")
+                .multilineTextAlignment(.leading)
+        }
+        .font(.system(size: 14))
+        .foregroundStyle(Theme.muted)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 14)
+        .background(Theme.input.opacity(0.7), in: RoundedRectangle(cornerRadius: 12))
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .background(Theme.chat)
+    }
+
+    private func startEdit(_ m: Message) {
+        replyTo = nil
+        pending = []
+        editing = m
+        text = m.content
+    }
+
+    private func editBar(_ m: Message) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: "pencil")
+                .font(.system(size: 13))
+                .foregroundStyle(Theme.muted)
+            Text("Редактирование сообщения")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(Theme.text)
+            Spacer()
+            Button {
+                editing = nil
+                text = ""
+            } label: {
+                Image(systemName: "xmark.circle.fill")
+                    .foregroundStyle(Theme.muted)
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .background(Theme.panel)
+    }
 
     private func replyBar(_ r: Message) -> some View {
         HStack(spacing: 8) {
@@ -582,6 +656,21 @@ struct ChatView: View {
     private func submit() {
         let t0 = text.trimmingCharacters(in: .whitespacesAndNewlines)
         let t = resolveMentions(t0)
+        if let e = editing {
+            guard !t.isEmpty, !sending else { return }
+            sending = true
+            Task {
+                let ok = await store.edit(e, content: t)
+                sending = false
+                if ok {
+                    editing = nil
+                    text = ""
+                    mentionMap = [:]
+                    suggestions = []
+                }
+            }
+            return
+        }
         guard !t.isEmpty || !pending.isEmpty, !sending else { return }
         sending = true
         let files = pending.map { $0.file }
@@ -834,6 +923,8 @@ struct MessageRow: View {
     let translation: TranslatedText?
     let isMentioned: Bool
     let flash: Bool
+    let authorName: String
+    let authorColor: Color?
     let onImage: (URL) -> Void
     let onProfile: (User) -> Void
     let onReply: () -> Void
@@ -855,11 +946,13 @@ struct MessageRow: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(rowBackground)
-        .overlay(alignment: .leading) {
+        .overlay {
             if isMentioned {
-                Rectangle().fill(Color(hex: 0xF0B232)).frame(width: 3)
+                RoundedRectangle(cornerRadius: 8)
+                    .strokeBorder(Color(hex: 0xF0B232), lineWidth: 1.5)
             }
         }
+        .padding(.horizontal, 3)
         .animation(.easeOut(duration: 0.3), value: flash)
         .contentShape(Rectangle())
         .simultaneousGesture(replySwipe)
@@ -938,9 +1031,9 @@ struct MessageRow: View {
 
     private var header: some View {
         HStack(alignment: .firstTextBaseline, spacing: 6) {
-            Text(message.author.displayName)
+            Text(authorName)
                 .font(.system(size: 16, weight: .semibold))
-                .foregroundStyle(.white)
+                .foregroundStyle(authorColor ?? Color.white)
                 .lineLimit(1)
                 .onTapGesture { onProfile(message.author) }
             if message.author.bot == true {

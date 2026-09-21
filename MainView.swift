@@ -1,5 +1,6 @@
 import SwiftUI
 import Translation
+import UniformTypeIdentifiers
 
 struct MainView: View {
     @EnvironmentObject var store: Store
@@ -83,9 +84,35 @@ struct RailItem<Content: View>: View {
     }
 }
 
+/// Перетаскивание сервера в левой колонке: зажми иконку и веди на новое место.
+struct GuildDropDelegate: DropDelegate {
+    let target: Guild
+    let move: (String, String) -> Void
+    let finish: () -> Void
+    @Binding var dragging: Guild?
+
+    func dropEntered(info: DropInfo) {
+        guard let dragging, dragging.id != target.id else { return }
+        withAnimation(.easeInOut(duration: 0.15)) {
+            move(dragging.id, target.id)
+        }
+    }
+
+    func dropUpdated(info: DropInfo) -> DropProposal? {
+        DropProposal(operation: .move)
+    }
+
+    func performDrop(info: DropInfo) -> Bool {
+        dragging = nil
+        finish()
+        return true
+    }
+}
+
 struct ServerRail: View {
     @EnvironmentObject var store: Store
     @Binding var selection: String?
+    @State private var dragging: Guild?
 
     var body: some View {
         ScrollView(showsIndicators: false) {
@@ -110,6 +137,17 @@ struct ServerRail: View {
                                     .offset(x: 5, y: 5)
                             }
                     }
+                    .opacity(dragging?.id == g.id ? 0.4 : 1)
+                    .onDrag {
+                        dragging = g
+                        return NSItemProvider(object: g.id as NSString)
+                    }
+                    .onDrop(of: [UTType.text], delegate: GuildDropDelegate(
+                        target: g,
+                        move: { from, to in store.moveGuild(from, to: to) },
+                        finish: { store.saveGuildOrder() },
+                        dragging: $dragging
+                    ))
                 }
             }
             .padding(.vertical, 10)
@@ -311,21 +349,46 @@ struct ChannelPanel: View {
             ForEach(store.dms) { ch in
                 NavigationLink(value: ch) {
                     HStack(spacing: 12) {
-                        AvatarView(user: ch.recipients?.first, size: 40)
-                        Text(ch.title)
-                            .font(.system(size: 16, weight: .medium))
-                            .foregroundStyle(Theme.normalText)
-                            .lineLimit(1)
-                        Spacer()
+                        AvatarView(user: ch.recipients?.first, size: 44)
+                        VStack(alignment: .leading, spacing: 2) {
+                            HStack(alignment: .firstTextBaseline) {
+                                Text(ch.title)
+                                    .font(.system(size: 16, weight: .semibold))
+                                    .foregroundStyle(Theme.text)
+                                    .lineLimit(1)
+                                Spacer(minLength: 6)
+                                if let d = store.dmPreviews[ch.id]?.date {
+                                    Text(shortTime(d))
+                                        .font(.system(size: 12))
+                                        .foregroundStyle(Theme.muted)
+                                }
+                            }
+                            if let p = store.dmPreviews[ch.id] {
+                                Text(store.previewText(p))
+                                    .font(.system(size: 14))
+                                    .foregroundStyle(Theme.muted)
+                                    .lineLimit(1)
+                            }
+                        }
                     }
                     .padding(.horizontal, 16)
                     .padding(.vertical, 6)
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
+                .task(id: ch.last_message_id) {
+                    await store.loadDMPreview(ch)
+                }
             }
         }
         .padding(.top, 8)
+    }
+
+    private func shortTime(_ d: Date) -> String {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "ru_RU")
+        f.dateFormat = Calendar.current.isDateInToday(d) ? "HH:mm" : "dd.MM"
+        return f.string(from: d)
     }
 
     // MARK: Каналы сервера

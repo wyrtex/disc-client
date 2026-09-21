@@ -9,9 +9,12 @@ struct MessageActionSheet: View {
     let channel: Channel
     let guildId: String?
     let onReply: () -> Void
+    let onEdit: () -> Void
+    let onDelete: () -> Void
 
     enum Mode { case menu, picker, forward }
     @State private var mode: Mode = .menu
+    @State private var confirmDelete = false
 
     private let quick = ["👍", "❤️", "😂", "😮", "😢", "🙏"]
 
@@ -31,6 +34,13 @@ struct MessageActionSheet: View {
                     dismiss()
                 }
             }
+        }
+        .confirmationDialog("Удалить сообщение?", isPresented: $confirmDelete, titleVisibility: .visible) {
+            Button("Удалить", role: .destructive) {
+                dismiss()
+                onDelete()
+            }
+            Button("Отмена", role: .cancel) {}
         }
     }
 
@@ -78,6 +88,27 @@ struct MessageActionSheet: View {
                         UIPasteboard.general.string = message.content
                         dismiss()
                     }
+                }
+                if message.author.id == store.me?.id {
+                    actionRow("pencil", "Редактировать") {
+                        dismiss()
+                        onEdit()
+                    }
+                    Button {
+                        confirmDelete = true
+                    } label: {
+                        HStack(spacing: 12) {
+                            Image(systemName: "trash.fill")
+                                .frame(width: 24)
+                            Text("Удалить")
+                                .font(.system(size: 16, weight: .medium))
+                            Spacer()
+                        }
+                        .foregroundStyle(Color.red)
+                        .padding(14)
+                        .background(Theme.chat, in: RoundedRectangle(cornerRadius: 10))
+                    }
+                    .buttonStyle(.plain)
                 }
             }
             .padding(16)

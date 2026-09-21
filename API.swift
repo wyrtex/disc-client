@@ -92,8 +92,11 @@ final class API {
     }
 
     /// Запрос, у которого нет тела в ответе (реакции и т.п.).
-    func noContent(_ method: String, _ path: String) async throws {
-        let req = try baseRequest(method, path)
+    func noContent(_ method: String, _ path: String, body: [String: Any]? = nil) async throws {
+        var req = try baseRequest(method, path)
+        if let body {
+            req.httpBody = try JSONSerialization.data(withJSONObject: body)
+        }
         let (data, resp) = try await session.data(for: req)
         try check(data, resp)
     }
