@@ -9,6 +9,7 @@ struct MainView: View {
     @State private var collapsed: Set<String> = []
     @State private var confirmLogout = false
     @State private var showVoice = false
+    @State private var showLab = false
 
     var body: some View {
         NavigationStack(path: $store.path) {
@@ -54,7 +55,12 @@ struct MainView: View {
                 selection = nil
             }
         }
+        .sheet(isPresented: $showLab) {
+            VoiceLabView()
+                .environmentObject(store)
+        }
         .confirmationDialog("Аккаунт", isPresented: $confirmLogout, titleVisibility: .hidden) {
+            Button("Голосовая лаборатория") { showLab = true }
             Button("Выйти из аккаунта", role: .destructive) { store.logout() }
             Button("Отмена", role: .cancel) {}
         }
