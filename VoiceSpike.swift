@@ -32,6 +32,7 @@ final class VoiceGateway {
     var onLocalSpeaking: ((Bool) -> Void)?
     var onMicLevel: ((Float) -> Void)?
     var vadThreshold: () -> Double = { -45 }
+    var volumeForUser: ((String) -> Float)?
 
     var transcriber: VoiceTranscriber?
     private let videoProbe: Bool
@@ -181,7 +182,7 @@ final class VoiceGateway {
                 let s = UInt32(truncatingIfNeeded: ssrc)
                 ssrcMap[s] = uid
                 media?.setSsrc(s, user: uid)
-                audio.setVolume(volume(for: uid), forUser: uid)
+                audio.setVolume(volumeForUser?(uid) ?? 1, forUser: uid)
             }
         case 9:
             log("op 9 Resumed")
@@ -385,7 +386,7 @@ final class VoiceGateway {
             }
             for (ssrc, uid) in ssrcMap {
                 m.setSsrc(ssrc, user: uid)
-                audio.setVolume(volume(for: uid), forUser: uid)
+                audio.setVolume(volumeForUser?(uid) ?? 1, forUser: uid)
             }
             m.setMuted(muted || deafened)
             audio.setDeafened(deafened)
@@ -1039,6 +1040,7 @@ final class VoiceSpike: ObservableObject {
         vg.transcriber = transcriber
         let settings = shared
         vg.vadThreshold = { settings.vad }
+        vg.volumeForUser = { [weak self] uid in self?.volume(for: uid) ?? 1 }
         vg.onLog = { [weak self] s in
             Task { @MainActor in self?.add(s) }
         }
