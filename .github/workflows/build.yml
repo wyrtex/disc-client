@@ -55,6 +55,9 @@ jobs:
       - name: Fetch sherpa-onnx (Pocket TTS)
         run: bash fetch-sherpa.sh
 
+      - name: Fetch sing-box (built-in VPN)
+        run: bash fetch-singbox.sh
+
       - name: Install XcodeGen
         run: brew install xcodegen
 
