@@ -482,7 +482,9 @@ final class VoiceLab: NSObject, ObservableObject, AVAudioRecorderDelegate {
     @Published var recordSeconds = 0
     @Published var refDurations: [RefSlot: Double] = [:]
     @Published var selectedRef: RefSlot = .ru
-    @Published var steps = 2
+    // Шагов расчёта (LSD/flow steps) у этой модели по умолчанию мало — 2 даёт быстрый,
+    // но смазанный, "гудящий" звук. 8 заметно чище ценой времени расчёта.
+    @Published var steps = 8
     @Published var threads = 2
     @Published var testText = "Hello everyone! I am testing my voice. Let's see how it sounds, and whether my accent stays."
     @Published var metrics = ""
@@ -973,8 +975,9 @@ struct VoiceLabView: View {
                 Text("Качество/скорость: \(lab.steps)")
                     .foregroundStyle(Theme.text)
                 Spacer()
-                Stepper("", value: $lab.steps, in: 1...6).labelsHidden()
+                Stepper("", value: $lab.steps, in: 1...16).labelsHidden()
             }
+            note("Это главный рычаг качества. 1–3 звучит смазанно и гулко — почти всегда причина «не тот голос». Начни с 8, если медленно — снижай, если всё ещё гудит — подними до 12.")
             HStack {
                 Text("Потоков процессора: \(lab.threads)")
                     .foregroundStyle(Theme.text)
