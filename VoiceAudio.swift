@@ -54,8 +54,12 @@ final class VoiceAudio {
         let node = AVAudioPlayerNode()
         var pending = 0
         var lastCompletion = Date()
+        var userId: String?
     }
     private var channels: [UInt32: PlayerChannel] = [:]
+    /// Локальная громкость на участника (0…2, по умолчанию 1). Применяется здесь же, ни на что
+    /// кроме воспроизведения у тебя не влияет.
+    private var userVolumes: [String: Float] = [:]
 
     var speakerOn = true
 
@@ -288,7 +292,21 @@ final class VoiceAudio {
 
     // MARK: Воспроизведение
 
-    func play(ssrc: UInt32, interleaved: [Float], frames: Int) {
+    /// Громкость конкретного участника: 0 = выключен, 1 = обычная, до 2 = усиленная.
+    func setVolume(_ volume: Float, forUser user: String) {
+        let clamped = max(0, min(2, volume))
+        control.async { [weak self] in
+            guard let self else { return }
+            self.stateLock.lock()
+            self.userVolumes[user] = clamped
+            for c in self.channels.values where c.userId == user {
+                c.node.volume = clamped
+            }
+            self.stateLock.unlock()
+        }
+    }
+
+    func play(ssrc: UInt32, interleaved: [Float], frames: Int, user: String? = nil) {
         guard frames > 0,
               let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(frames)),
               let data = buffer.floatChannelData else { return }
@@ -307,8 +325,14 @@ final class VoiceAudio {
         let ch: PlayerChannel
         if let existing = channels[ssrc] {
             ch = existing
+            if let user, ch.userId != user {
+                ch.userId = user
+                ch.node.volume = userVolumes[user] ?? 1
+            }
         } else {
             let c = PlayerChannel()
+            c.userId = user
+            c.node.volume = user.flatMap { userVolumes[$0] } ?? 1
             channels[ssrc] = c
             engine.attach(c.node)
             engine.connect(c.node, to: engine.mainMixerNode, format: format)

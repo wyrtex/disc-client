@@ -181,6 +181,7 @@ final class VoiceGateway {
                 let s = UInt32(truncatingIfNeeded: ssrc)
                 ssrcMap[s] = uid
                 media?.setSsrc(s, user: uid)
+                audio.setVolume(volume(for: uid), forUser: uid)
             }
         case 9:
             log("op 9 Resumed")
@@ -382,7 +383,10 @@ final class VoiceGateway {
                 let d: [String: Any] = ["speaking": on ? 1 : 0, "delay": 0, "ssrc": Int(self.ownSsrc)]
                 self.send(["op": 5, "d": d])
             }
-            for (ssrc, uid) in ssrcMap { m.setSsrc(ssrc, user: uid) }
+            for (ssrc, uid) in ssrcMap {
+                m.setSsrc(ssrc, user: uid)
+                audio.setVolume(volume(for: uid), forUser: uid)
+            }
             m.setMuted(muted || deafened)
             audio.setDeafened(deafened)
             media = m
@@ -542,6 +546,7 @@ final class VoiceSpike: ObservableObject {
     @Published var stageTopic: String?
     @Published var stageSuppressed = true
     @Published var handRaised = false
+    private var volumeCache: [String: Float] = [:]
     var patchVoiceState: ((String, [String: Any]) async -> Bool)?
     var fetchStageTopic: ((String) async -> String?)?
 
@@ -856,6 +861,27 @@ final class VoiceSpike: ObservableObject {
         }
         guard let cid = activeChannelId else { return }
         _ = sendGateway?(voiceStatePacket(guildId: guildId, channelId: cid))
+    }
+
+    // MARK: Громкость участников (только у тебя, не транслируется остальным)
+
+    private static func volumeKey(_ user: String) -> String { "voiceVolume." + user }
+
+    /// Текущая громкость участника (0…2). Читает сохранённое значение при первом обращении.
+    func volume(for user: String) -> Float {
+        if let v = volumeCache[user] { return v }
+        let saved = UserDefaults.standard.object(forKey: VoiceSpike.volumeKey(user)) as? Float
+        let v = saved ?? 1.0
+        volumeCache[user] = v
+        return v
+    }
+
+    /// Меняет громкость участника и запоминает выбор на будущее.
+    func setVolume(_ v: Float, for user: String) {
+        let clamped = max(0, min(2, v))
+        volumeCache[user] = clamped
+        UserDefaults.standard.set(clamped, forKey: VoiceSpike.volumeKey(user))
+        audio.setVolume(clamped, forUser: user)
     }
 
     // MARK: Фон

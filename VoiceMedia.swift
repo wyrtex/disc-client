@@ -290,7 +290,7 @@ final class VoiceMedia {
             return
         }
         stats.played += 1
-        audio.play(ssrc: packetSsrc, interleaved: pcm.samples, frames: pcm.frames)
+        audio.play(ssrc: packetSsrc, interleaved: pcm.samples, frames: pcm.frames, user: user)
         transcriber?.feed(userId: user, interleaved: pcm.samples, channels: 2, frames: pcm.frames, rtpTimestamp: packetTs)
 
         let now = Date()

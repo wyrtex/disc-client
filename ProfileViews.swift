@@ -8,7 +8,10 @@ struct UserProfileSheet: View {
 
     let user: User
     let guildId: String?
+    /// Если открыт из голосового канала — здесь можно настроить громкость участника.
+    var voice: VoiceSpike? = nil
     @State private var profile: ProfileResponse?
+    @State private var volume: Float = 1
 
     private var shown: User { profile?.user ?? user }
     private var isMe: Bool { user.id == store.me?.id }
@@ -36,6 +39,9 @@ struct UserProfileSheet: View {
                     nameBlock
                     chipsRow
                     mutualRow
+                    if let voice, !isMe {
+                        volumeSlider(voice)
+                    }
                     if !isMe && user.bot != true {
                         messageButton
                     }
@@ -56,6 +62,47 @@ struct UserProfileSheet: View {
             profile = await store.loadProfile(user, guildId: guildId)
             if let g = guildId { await store.loadRoles(g) }
         }
+        .onAppear {
+            if let voice { volume = voice.volume(for: user.id) }
+        }
+    }
+
+    // MARK: Громкость (только в голосовом канале)
+
+    private func volumeSlider(_ voice: VoiceSpike) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Label("Громкость", systemImage: "speaker.wave.2.fill")
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(Theme.text)
+                Spacer()
+                Text("\(Int(volume * 100))%")
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(Theme.muted)
+                    .monospacedDigit()
+            }
+            HStack(spacing: 10) {
+                Image(systemName: "speaker.fill")
+                    .font(.system(size: 12))
+                    .foregroundStyle(Theme.muted)
+                Slider(value: $volume, in: 0...2, step: 0.05)
+                    .tint(Theme.blurple)
+                    .onChange(of: volume) { _, v in voice.setVolume(v, for: user.id) }
+                Image(systemName: "speaker.wave.3.fill")
+                    .font(.system(size: 12))
+                    .foregroundStyle(Theme.muted)
+            }
+            if volume != 1 {
+                Button("Сбросить на 100%") {
+                    volume = 1
+                    voice.setVolume(1, for: user.id)
+                }
+                .font(.system(size: 13))
+                .foregroundStyle(Theme.link)
+            }
+        }
+        .padding(12)
+        .background(Theme.panel, in: RoundedRectangle(cornerRadius: 12))
     }
 
     // MARK: Шапка

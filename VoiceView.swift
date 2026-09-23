@@ -10,6 +10,8 @@ struct VoiceView: View {
 
     @State private var showAudio = false
     @State private var showLog = false
+    @State private var showChat = false
+    @State private var volumeUser: User?
 
     var body: some View {
         ZStack {
@@ -37,6 +39,16 @@ struct VoiceView: View {
         }
         .sheet(isPresented: $showLog) {
             VoiceLogView(voice: voice)
+        }
+        .sheet(isPresented: $showChat) {
+            if let ch = voice.activeChannel {
+                NavigationStack {
+                    ChatView(channel: ch)
+                }
+            }
+        }
+        .sheet(item: $volumeUser) { u in
+            UserProfileSheet(user: u, guildId: voice.activeGuildId, voice: voice)
         }
     }
 
@@ -70,6 +82,16 @@ struct VoiceView: View {
                 .foregroundStyle(voice.encrypted ? Theme.green : Theme.muted)
             }
             Spacer()
+            Button {
+                showChat = true
+            } label: {
+                Image(systemName: "bubble.left.and.bubble.right.fill")
+                    .font(.system(size: 16))
+                    .foregroundStyle(Theme.muted)
+                    .frame(width: 40, height: 40)
+                    .background(Theme.input, in: Circle())
+            }
+            .disabled(voice.activeChannel == nil)
             Button {
                 showLog = true
             } label: {
@@ -215,6 +237,7 @@ struct ParticipantTile: View {
     @EnvironmentObject var store: Store
     @ObservedObject var voice: VoiceSpike
     let id: String
+    @State private var showProfile = false
 
     private var user: User? {
         voice.users[id] ?? store.voiceUsers[id] ?? (store.me?.id == id ? store.me : nil)
@@ -249,6 +272,15 @@ struct ParticipantTile: View {
                     }
                 }
                 .padding(8)
+            }
+            .contentShape(RoundedRectangle(cornerRadius: 14))
+            .onLongPressGesture {
+                if user != nil { showProfile = true }
+            }
+        }
+        .sheet(isPresented: $showProfile) {
+            if let user {
+                UserProfileSheet(user: user, guildId: voice.activeGuildId, voice: voice)
             }
         }
     }
