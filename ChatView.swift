@@ -154,8 +154,15 @@ struct ChatView: View {
             }
             .task(id: authorsKey) { requestVisibleMembers() }
             .onChange(of: text) { _, _ in updateSuggestions() }
-            .onAppear { store.lastChannel = channel }
-            .onDisappear { recorder.cancel() }
+            .onAppear {
+                store.lastChannel = channel
+                store.openChannelId = channel.id
+                store.markRead(channel.id, upTo: channel.last_message_id)
+            }
+            .onDisappear {
+                if store.openChannelId == channel.id { store.openChannelId = nil }
+                recorder.cancel()
+            }
     }
 
     // MARK: - Каркас
@@ -232,6 +239,7 @@ struct ChatView: View {
 
     private func poll() async {
         await store.loadMessages(channel.id)
+        store.markRead(channel.id)
         // Запасное обновление на случай, если Gateway не доставил сообщение.
         while !Task.isCancelled {
             try? await Task.sleep(nanoseconds: 4_000_000_000)
@@ -406,13 +414,7 @@ struct ChatView: View {
     }
 
     private func isMentioned(_ m: Message) -> Bool {
-        guard let me = store.me, m.author.id != me.id else { return false }
-        if m.mention_everyone { return true }
-        if m.mentions.contains(where: { $0.id == me.id }) { return true }
-        if let gid = guildId, let roles = store.memberRoles[gid], !roles.isDisjoint(with: m.mention_roles) {
-            return true
-        }
-        return false
+        store.isMentioned(m, guildId: guildId)
     }
 
     private func needsHeader(_ i: Int, _ msgs: [Message]) -> Bool {

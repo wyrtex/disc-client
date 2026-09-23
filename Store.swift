@@ -90,6 +90,14 @@ final class Store: ObservableObject {
     }
 
     var lastChannel: Channel?
+
+    // MARK: - Непрочитанное (белый кружок) и упоминания (красный кружок)
+
+    /// Канал, открытый прямо сейчас в ChatView — для него новые сообщения не считаются непрочитанными.
+    var openChannelId: String?
+    @Published var unreadChannels: Set<String> = []
+    @Published var mentionChannels: Set<String> = []
+    private var lastRead: [String: String] = UserDefaults.standard.dictionary(forKey: "lastRead") as? [String: String] ?? [:]
     let voice = VoiceSpike()
     private(set) var api: API?
     private var gateway: Gateway?
@@ -238,6 +246,7 @@ final class Store: ObservableObject {
             Task { @MainActor in
                 guard let self else { return }
                 self.noteDMMessage(msg)
+                self.noteIncomingForUnread(msg)
                 guard self.messages[msg.channel_id] != nil else { return }
                 self.merge([msg], into: msg.channel_id)
             }
@@ -307,6 +316,12 @@ final class Store: ObservableObject {
                 }
             }
             guildChannels[guild.id] = all
+            for ch in all {
+                guard let last = ch.last_message_id else { continue }
+                if let known = lastRead[ch.id], known != last {
+                    unreadChannels.insert(ch.id)
+                }
+            }
         } catch {
             self.error = error.localizedDescription
         }
@@ -656,6 +671,54 @@ final class Store: ObservableObject {
         } catch {
             self.error = error.localizedDescription
         }
+    }
+
+    /// Похоже ли сообщение на упоминание текущего пользователя (себя, @everyone/@here или своей роли).
+    func isMentioned(_ m: Message, guildId: String?) -> Bool {
+        guard let me, m.author.id != me.id else { return false }
+        if m.mention_everyone { return true }
+        if m.mentions.contains(where: { $0.id == me.id }) { return true }
+        if let gid = guildId, let roles = memberRoles[gid], !roles.isDisjoint(with: m.mention_roles) {
+            return true
+        }
+        return false
+    }
+
+    /// Новое сообщение из Gateway: если канал сейчас не открыт, отмечаем непрочитанным (и упоминанием, если задели тебя).
+    private func noteIncomingForUnread(_ msg: Message) {
+        guard let me, msg.author.id != me.id else { return }
+        if msg.channel_id == openChannelId {
+            markRead(msg.channel_id, upTo: msg.id)
+            return
+        }
+        unreadChannels.insert(msg.channel_id)
+        let gid = guildID(of: msg.channel_id)
+        if isMentioned(msg, guildId: gid) {
+            mentionChannels.insert(msg.channel_id)
+        }
+    }
+
+    private func guildID(of channelId: String) -> String? {
+        for (gid, list) in guildChannels where list.contains(where: { $0.id == channelId }) {
+            return gid
+        }
+        return nil
+    }
+
+    /// Отметить канал прочитанным: убираем кружки, запоминаем последнее увиденное сообщение.
+    func markRead(_ channelId: String, upTo messageId: String? = nil) {
+        unreadChannels.remove(channelId)
+        mentionChannels.remove(channelId)
+        let id = messageId ?? messages[channelId]?.last?.id
+        guard let id else { return }
+        lastRead[channelId] = id
+        UserDefaults.standard.set(lastRead, forKey: "lastRead")
+    }
+
+    /// Красный кружок на иконке сервера: хотя бы один канал внутри с непрочитанным упоминанием.
+    func guildHasMentions(_ guildId: String) -> Bool {
+        guard let list = guildChannels[guildId] else { return false }
+        return list.contains { mentionChannels.contains($0.id) }
     }
 
     // MARK: - Правка и удаление своих сообщений

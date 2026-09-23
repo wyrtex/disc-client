@@ -156,6 +156,15 @@ struct ServerRail: View {
                                 GuildVoiceBadge(state: store.guildVoiceSummary(g.id))
                                     .offset(x: 5, y: 5)
                             }
+                            .overlay(alignment: .topTrailing) {
+                                if store.guildHasMentions(g.id) {
+                                    Circle()
+                                        .fill(Color.red)
+                                        .frame(width: 14, height: 14)
+                                        .overlay(Circle().stroke(Theme.rail, lineWidth: 2))
+                                        .offset(x: 3, y: -3)
+                                }
+                            }
                     }
                     .opacity(dragging?.id == g.id ? 0.4 : 1)
                     .onDrag {
@@ -484,16 +493,23 @@ struct ChannelPanel: View {
     }
 
     private func rowLabel(_ ch: Channel, locked: Bool) -> some View {
-        HStack(spacing: 8) {
+        let mentioned = store.mentionChannels.contains(ch.id)
+        let unread = mentioned || store.unreadChannels.contains(ch.id)
+        return HStack(spacing: 8) {
             Image(systemName: locked ? "lock.fill" : ch.icon)
                 .font(.system(size: 15))
                 .frame(width: 22)
+            if unread {
+                Circle()
+                    .fill(mentioned ? Color.red : Color.white)
+                    .frame(width: 8, height: 8)
+            }
             Text(ch.title)
-                .font(.system(size: 16, weight: .medium))
+                .font(.system(size: 16, weight: unread ? .semibold : .medium))
                 .lineLimit(1)
             Spacer()
         }
-        .foregroundStyle(Theme.muted)
+        .foregroundStyle(unread ? Theme.text : Theme.muted)
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
         .padding(.horizontal, 8)
