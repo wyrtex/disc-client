@@ -170,86 +170,116 @@ enum SpeechLang {
 
 // MARK: - iOS 26: SpeechAnalyzer с автоопределением языка
 
+/// Выполняет `operation`; если она не укладывается в `seconds`, отменяет её и возвращает nil,
+/// не дожидаясь зависшего вызова. Так подвисшая модель одного участника не блокирует остальных.
+private func withTimeout<T: Sendable>(_ seconds: Double, _ operation: @escaping @Sendable () async throws -> T) async -> T? {
+    await withTaskGroup(of: T?.self) { group in
+        group.addTask {
+            try? await operation()
+        }
+        group.addTask {
+            try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+            return nil
+        }
+        // group.next() отдаёт T?? — nil снаружи означает "задач не осталось" (не должно случиться,
+        // их всегда две), поэтому схлопываем в T? через ?? nil.
+        let first = await group.next() ?? nil
+        group.cancelAll()
+        return first
+    }
+}
+
 #if compiler(>=6.2)
+
+/// Общий предел одновременно живых моделей распознавания на всех участников сразу —
+/// чтобы 5+ человек одновременно не запускали по 4 модели каждый и не душили телефон.
+@available(iOS 26.0, *)
+private actor AnalyzerGate {
+    private var used = 0
+    private let limit: Int
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    init(limit: Int) { self.limit = limit }
+
+    func acquire() async {
+        if used < limit {
+            used += 1
+            return
+        }
+        await withCheckedContinuation { waiters.append($0) }
+    }
+
+    func release() {
+        if waiters.isEmpty {
+            used = max(0, used - 1)
+        } else {
+            waiters.removeFirst().resume()
+        }
+    }
+}
+
+/// Языки, для которых модель уже скачана и готова. Общая для всех участников, заполняется один раз.
+@available(iOS 26.0, *)
+private actor ReadyLocales {
+    private var map: [String: Locale] = [:]
+
+    func set(_ id: String, _ l: Locale) { map[id] = l }
+    func get(_ id: String) -> Locale? { map[id] }
+    var ids: Set<String> { Set(map.keys) }
+}
 
 @available(iOS 26.0, *)
 final class AnalyzerBackend: TranscribeBackend {
-    private enum Command {
-        case audio(String, [Float])
-        case end(String)
-        case endAll
-        case shutdown
-    }
-
-    /// Языки, для которых модель уже скачана и готова (заполняется фоновой задачей).
-    private final class ReadyLocales {
-        private let lock = NSLock()
-        private var map: [String: Locale] = [:]
-
-        func set(_ id: String, _ l: Locale) {
-            lock.lock(); map[id] = l; lock.unlock()
-        }
-
-        func get(_ id: String) -> Locale? {
-            lock.lock(); defer { lock.unlock() }
-            return map[id]
-        }
-
-        var ids: Set<String> {
-            lock.lock(); defer { lock.unlock() }
-            return Set(map.keys)
-        }
-    }
-
-    /// Состояние одного собеседника.
-    private final class UserState {
-        var knownLocale: String?
-        var active: LiveSession?
-        var probes: [String: LiveSession] = [:]
-        var probeSamples = 0
-        var round = 0
-    }
-
     private let enabled: [String]
     private let onUpdate: (VoiceTranscriber.Update) -> Void
     private let onStatus: (String) -> Void
-    private let continuation: AsyncStream<Command>.Continuation
-    private var worker: Task<Void, Never>?
-    private var prepareTask: Task<Void, Never>?
     private let ready = ReadyLocales()
-    private var users: [String: UserState] = [:]
-    private var recent: [String] = []
+    private let gate = AnalyzerGate(limit: 4)
+    private var prepareTask: Task<Void, Never>?
+    private var pipelines: [String: UserPipeline] = [:]
     private let sourceFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 48000, channels: 1, interleaved: false)!
-    private let maxProbe = 4
 
     init(locales: [String], onUpdate: @escaping (VoiceTranscriber.Update) -> Void, onStatus: @escaping (String) -> Void) {
         self.enabled = locales
         self.onUpdate = onUpdate
         self.onStatus = onStatus
-        let (stream, cont) = AsyncStream<Command>.makeStream()
-        self.continuation = cont
-        self.worker = Task { [weak self] in
-            for await cmd in stream {
-                guard let self else { return }
-                await self.handle(cmd)
-                if case .shutdown = cmd { return }
-            }
-        }
-        self.prepareTask = Task { [weak self] in
-            await self?.prepareAll()
-        }
+        prepareTask = Task { [weak self] in await self?.prepareAll() }
     }
 
-    func append(userId: String, mono: [Float]) { continuation.yield(.audio(userId, mono)) }
-    func endUtterance(userId: String) { continuation.yield(.end(userId)) }
-    func endAll() { continuation.yield(.endAll) }
+    /// Своя независимая "дорожка" на каждого участника: у неё свой Task и своя очередь команд,
+    /// так что зависание у одного человека физически не может задержать субтитры другого.
+    private func pipeline(for uid: String) -> UserPipeline {
+        if let p = pipelines[uid] { return p }
+        let p = UserPipeline(
+            userId: uid,
+            enabledLocales: enabled,
+            ready: ready,
+            gate: gate,
+            sourceFormat: sourceFormat,
+            onUpdate: onUpdate,
+            onStatus: onStatus
+        )
+        pipelines[uid] = p
+        return p
+    }
+
+    func append(userId: String, mono: [Float]) {
+        pipeline(for: userId).enqueueAudio(mono)
+    }
+
+    func endUtterance(userId: String) {
+        pipelines[userId]?.enqueueEnd()
+    }
+
+    func endAll() {
+        for p in pipelines.values { p.enqueueEnd() }
+    }
+
     func shutdown() {
         prepareTask?.cancel()
-        continuation.yield(.shutdown)
-        continuation.finish()
+        for p in pipelines.values { p.shutdown() }
+        pipelines = [:]
     }
-
-    // MARK: Подготовка языков (скачивание моделей)
 
     private func prepareAll() async {
         for (i, id) in enabled.enumerated() {
@@ -264,86 +294,138 @@ final class AnalyzerBackend: TranscribeBackend {
                     onStatus("Скачиваю язык: \(SpeechLang.name(id)) (\(i + 1) из \(enabled.count))…")
                     try await request.downloadAndInstall()
                 }
-                ready.set(id, supported)
-                onStatus("Распознавание речи: авто, готово языков: \(ready.ids.count) из \(enabled.count)")
+                await ready.set(id, supported)
+                let count = await ready.ids.count
+                onStatus("Распознавание речи: авто, готово языков: \(count) из \(enabled.count)")
             } catch {
                 onStatus("Не удалось подготовить язык «\(SpeechLang.name(id))»: \(error.localizedDescription)")
             }
         }
     }
+}
 
-    // MARK: Команды
-
-    private func handle(_ cmd: Command) async {
-        switch cmd {
-        case .audio(let uid, let samples):
-            await handleAudio(uid, samples)
-        case .end(let uid):
-            await finishUtterance(uid)
-        case .endAll, .shutdown:
-            for uid in Array(users.keys) { await finishUtterance(uid) }
-        }
+/// Полностью независимая обработка одного участника: свой Task, своя очередь, свои модели.
+/// Любой вызов в SpeechAnalyzer защищён таймаутом в 5 секунд — если модель зависла и не может
+/// разобрать слово, эта попытка бросается и дорожка тут же освобождается для следующей реплики.
+@available(iOS 26.0, *)
+private final class UserPipeline {
+    private enum Command {
+        case audio([Float])
+        case end
+        case shutdown
     }
 
-    private func state(_ uid: String) -> UserState {
-        if let s = users[uid] { return s }
-        let s = UserState()
-        users[uid] = s
-        return s
-    }
+    private let userId: String
+    private let enabledLocales: [String]
+    private let ready: ReadyLocales
+    private let gate: AnalyzerGate
+    private let sourceFormat: AVAudioFormat
+    private let onUpdate: (VoiceTranscriber.Update) -> Void
+    private let onStatus: (String) -> Void
+    private let continuation: AsyncStream<Command>.Continuation
+    private var worker: Task<Void, Never>?
+    private let maxProbe = 2
+    private static let stepTimeout = 5.0
 
-    private func handleAudio(_ uid: String, _ samples: [Float]) async {
-        let st = state(uid)
-        if st.active == nil && st.probes.isEmpty {
-            await startUtterance(uid, st)
-        }
-        if let a = st.active {
-            a.feed(samples)
-            return
-        }
-        guard !st.probes.isEmpty else { return }
-        for s in st.probes.values { s.feed(samples) }
-        st.probeSamples += samples.count
-        await evaluateProbes(st, final: false)
-    }
+    // Состояние трогает только worker Task этого участника — конкурентного доступа тут нет.
+    private var knownLocale: String?
+    private var active: LiveSession?
+    private var probes: [String: LiveSession] = [:]
+    private var probeSamples = 0
+    private var round = 0
+    private var recentOrder: [String] = []
 
-    /// Начало реплики: если язык говорящего известен, запускаем один распознаватель,
-    /// иначе несколько сразу (по одному на язык) и через пару секунд выбираем лучший.
-    private func startUtterance(_ uid: String, _ st: UserState) async {
-        let ids = ready.ids
-        guard !ids.isEmpty else { return }
-
-        if let known = st.knownLocale, ids.contains(known) {
-            st.active = await makeSession(uid, known, emitting: true)
-            return
-        }
-        if ids.count == 1, let only = ids.first {
-            st.knownLocale = only
-            st.active = await makeSession(uid, only, emitting: true)
-            return
-        }
-
-        // Порядок: недавно определённые языки, затем остальные по списку.
-        var order = recent.filter { ids.contains($0) }
-        for id in enabled where ids.contains(id) && !order.contains(id) { order.append(id) }
-        let start = (st.round * maxProbe) % max(1, order.count)
-        var candidates = Array(order.dropFirst(start).prefix(maxProbe))
-        if candidates.isEmpty { candidates = Array(order.prefix(maxProbe)) }
-
-        st.probeSamples = 0
-        for id in candidates {
-            if let s = await makeSession(uid, id, emitting: false) {
-                st.probes[id] = s
+    init(userId: String, enabledLocales: [String], ready: ReadyLocales, gate: AnalyzerGate,
+         sourceFormat: AVAudioFormat, onUpdate: @escaping (VoiceTranscriber.Update) -> Void,
+         onStatus: @escaping (String) -> Void) {
+        self.userId = userId
+        self.enabledLocales = enabledLocales
+        self.ready = ready
+        self.gate = gate
+        self.sourceFormat = sourceFormat
+        self.onUpdate = onUpdate
+        self.onStatus = onStatus
+        let (stream, cont) = AsyncStream<Command>.makeStream()
+        self.continuation = cont
+        self.worker = Task { [weak self] in
+            for await cmd in stream {
+                guard let self else { return }
+                await self.handle(cmd)
+                if case .shutdown = cmd { return }
             }
         }
     }
 
-    private func evaluateProbes(_ st: UserState, final: Bool) async {
-        let seconds = Double(st.probeSamples) / 48000
+    func enqueueAudio(_ mono: [Float]) { continuation.yield(.audio(mono)) }
+    func enqueueEnd() { continuation.yield(.end) }
+    func shutdown() {
+        continuation.yield(.shutdown)
+        continuation.finish()
+    }
+
+    private func handle(_ cmd: Command) async {
+        switch cmd {
+        case .audio(let samples):
+            await handleAudio(samples)
+        case .end:
+            await finishUtterance()
+        case .shutdown:
+            await finishUtterance()
+            discard(Array(probes.values))
+            probes = [:]
+        }
+    }
+
+    private func handleAudio(_ samples: [Float]) async {
+        if active == nil && probes.isEmpty {
+            await startUtterance()
+        }
+        if let a = active {
+            a.feed(samples)
+            return
+        }
+        guard !probes.isEmpty else { return }
+        for s in probes.values { s.feed(samples) }
+        probeSamples += samples.count
+        await evaluateProbes(final: false)
+    }
+
+    /// Начало реплики: если язык говорящего уже известен — одна модель, иначе пробуем сразу
+    /// несколько (не больше maxProbe, чтобы не перегружать телефон) и выбираем лучшую.
+    private func startUtterance() async {
+        let ids = await ready.ids
+        guard !ids.isEmpty else { return }
+
+        if let known = knownLocale, ids.contains(known) {
+            active = await makeSession(known, emitting: true)
+            return
+        }
+        if ids.count == 1, let only = ids.first {
+            knownLocale = only
+            active = await makeSession(only, emitting: true)
+            return
+        }
+
+        var order = recentOrder.filter { ids.contains($0) }
+        for id in enabledLocales where ids.contains(id) && !order.contains(id) { order.append(id) }
+        let start = (round * maxProbe) % max(1, order.count)
+        var candidates = Array(order.dropFirst(start).prefix(maxProbe))
+        if candidates.isEmpty { candidates = Array(order.prefix(maxProbe)) }
+
+        probeSamples = 0
+        for id in candidates {
+            if let s = await makeSession(id, emitting: false) {
+                probes[id] = s
+            }
+        }
+    }
+
+    private func evaluateProbes(final: Bool) async {
+        let seconds = Double(probeSamples) / 48000
         guard final || seconds >= 1.6 else { return }
 
         var best: (id: String, score: Double)?
-        for (id, s) in st.probes {
+        for (id, s) in probes {
             let sc = SpeechLang.score(s.currentText, locale: id)
             if best == nil || sc > best!.score { best = (id, sc) }
         }
@@ -352,52 +434,55 @@ final class AnalyzerBackend: TranscribeBackend {
         let confident = best.score >= 2.2
         guard confident || seconds >= 4.5 || final else { return }
 
-        if best.score > 0.4, let winner = st.probes.removeValue(forKey: best.id) {
-            discard(Array(st.probes.values))
-            st.probes = [:]
-            st.knownLocale = best.id
-            recent.removeAll { $0 == best.id }
-            recent.insert(best.id, at: 0)
+        if best.score > 0.4, let winner = probes.removeValue(forKey: best.id) {
+            discard(Array(probes.values))
+            probes = [:]
+            knownLocale = best.id
+            recentOrder.removeAll { $0 == best.id }
+            recentOrder.insert(best.id, at: 0)
             winner.emitting = true
             winner.emitNow()
-            st.active = winner
+            active = winner
         } else {
-            // Ни один язык не подошёл: в следующий раз пробуем другие.
-            discard(Array(st.probes.values))
-            st.probes = [:]
-            st.round += 1
+            discard(Array(probes.values))
+            probes = [:]
+            round += 1
         }
     }
 
     private func discard(_ sessions: [LiveSession]) {
         for s in sessions {
-            Task { await s.finish(emit: false) }
-        }
-    }
-
-    private func finishUtterance(_ uid: String) async {
-        guard let st = users[uid] else { return }
-        if st.active == nil, !st.probes.isEmpty {
-            await evaluateProbes(st, final: true)
-        }
-        if let a = st.active {
-            await a.finish(emit: true)
-            // Если язык явно не совпал с распознанным текстом, в следующий раз определяем заново.
-            let text = a.currentText
-            if SpeechLang.words(text) >= 4, let known = st.knownLocale,
-               SpeechLang.probability(text, locale: known) < 0.12 {
-                st.knownLocale = nil
+            let gate = self.gate
+            Task {
+                await s.finish(emit: false, timeout: UserPipeline.stepTimeout)
+                await gate.release()
             }
-            st.active = nil
         }
-        discard(Array(st.probes.values))
-        st.probes = [:]
-        st.probeSamples = 0
     }
 
-    private func makeSession(_ uid: String, _ localeId: String, emitting: Bool) async -> LiveSession? {
-        guard let locale = ready.get(localeId) else { return nil }
-        do {
+    private func finishUtterance() async {
+        if active == nil, !probes.isEmpty {
+            await evaluateProbes(final: true)
+        }
+        if let a = active {
+            await a.finish(emit: true, timeout: UserPipeline.stepTimeout)
+            await gate.release()
+            let text = a.currentText
+            if SpeechLang.words(text) >= 4, let known = knownLocale,
+               SpeechLang.probability(text, locale: known) < 0.12 {
+                knownLocale = nil
+            }
+            active = nil
+        }
+        discard(Array(probes.values))
+        probes = [:]
+        probeSamples = 0
+    }
+
+    private func makeSession(_ localeId: String, emitting: Bool) async -> LiveSession? {
+        guard let locale = await ready.get(localeId) else { return nil }
+        await gate.acquire()
+        let created = await withTimeout(UserPipeline.stepTimeout) { [sourceFormat] () async throws -> LiveSession in
             let transcriber = SpeechTranscriber(
                 locale: locale,
                 transcriptionOptions: [],
@@ -405,15 +490,17 @@ final class AnalyzerBackend: TranscribeBackend {
                 attributeOptions: []
             )
             guard let format = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [transcriber]) else {
-                return nil
+                throw LabError.engine("нет подходящего аудиоформата")
             }
-            guard let converter = AVAudioConverter(from: sourceFormat, to: format) else { return nil }
+            guard let converter = AVAudioConverter(from: sourceFormat, to: format) else {
+                throw LabError.engine("не удалось подготовить конвертер")
+            }
             let analyzer = SpeechAnalyzer(modules: [transcriber])
             let (inputStream, builder) = AsyncStream<AnalyzerInput>.makeStream()
             try await analyzer.start(inputSequence: inputStream)
             return LiveSession(
-                userId: uid,
                 localeId: localeId,
+                userId: "",
                 transcriber: transcriber,
                 analyzer: analyzer,
                 builder: builder,
@@ -421,124 +508,146 @@ final class AnalyzerBackend: TranscribeBackend {
                 targetFormat: format,
                 converter: converter,
                 emitting: emitting,
-                onUpdate: onUpdate
+                onUpdate: { _ in }
             )
-        } catch {
-            onStatus("Ошибка распознавания: \(error.localizedDescription)")
+        }
+        guard let created else {
+            await gate.release()
+            onStatus("Модель для \(SpeechLang.name(localeId)) не запустилась вовремя — пробую позже")
             return nil
+        }
+        // userId/onUpdate нельзя захватить в @Sendable-замыкании выше без сложностей — доопределяем здесь.
+        created.bind(userId: userId, onUpdate: onUpdate)
+        return created
+    }
+}
+
+/// Одна непрерывная реплика одного участника на одном языке.
+/// `@unchecked Sendable`: создаётся и используется только из одного worker Task на участника
+/// (плюс свой собственный resultsTask, который трогает только finalized/volatile этого же объекта);
+/// нужен, чтобы можно было создать сессию под общим таймаутом (пересекает границу TaskGroup).
+@available(iOS 26.0, *)
+private final class LiveSession: @unchecked Sendable {
+    let localeId: String
+    private(set) var userId: String
+    let analyzer: SpeechAnalyzer
+    let builder: AsyncStream<AnalyzerInput>.Continuation
+    let sourceFormat: AVAudioFormat
+    let targetFormat: AVAudioFormat
+    let converter: AVAudioConverter
+    private var onUpdate: (VoiceTranscriber.Update) -> Void
+    var resultsTask: Task<Void, Never>?
+    var finalized: [String] = []
+    var volatile = ""
+    var emitting: Bool
+
+    var currentText: String {
+        var parts = finalized
+        if !volatile.isEmpty { parts.append(volatile) }
+        return parts.joined(separator: " ")
+    }
+
+    init(localeId: String, userId: String, transcriber: SpeechTranscriber, analyzer: SpeechAnalyzer,
+         builder: AsyncStream<AnalyzerInput>.Continuation, sourceFormat: AVAudioFormat,
+         targetFormat: AVAudioFormat, converter: AVAudioConverter, emitting: Bool,
+         onUpdate: @escaping (VoiceTranscriber.Update) -> Void) {
+        self.localeId = localeId
+        self.userId = userId
+        self.analyzer = analyzer
+        self.builder = builder
+        self.sourceFormat = sourceFormat
+        self.targetFormat = targetFormat
+        self.converter = converter
+        self.emitting = emitting
+        self.onUpdate = onUpdate
+        self.resultsTask = Task { [weak self] in
+            do {
+                for try await result in transcriber.results {
+                    guard let self else { return }
+                    let text = String(result.text.characters).trimmingCharacters(in: .whitespacesAndNewlines)
+                    self.apply(text: text, isFinal: result.isFinal)
+                }
+            } catch {
+                // Поток результатов оборвался с ошибкой: оставляем то, что успели распознать.
+            }
         }
     }
 
-    /// Одна непрерывная реплика одного участника на одном языке.
-    private final class LiveSession {
-        let userId: String
-        let localeId: String
-        let analyzer: SpeechAnalyzer
-        let builder: AsyncStream<AnalyzerInput>.Continuation
-        let sourceFormat: AVAudioFormat
-        let targetFormat: AVAudioFormat
-        let converter: AVAudioConverter
-        let onUpdate: (VoiceTranscriber.Update) -> Void
-        var resultsTask: Task<Void, Never>?
-        var finalized: [String] = []
-        var volatile = ""
-        var emitting: Bool
+    /// Привязка настоящего userId/onUpdate после создания (см. makeSession — объект собирается
+    /// внутри @Sendable-замыкания, где userId ещё недоступен напрямую).
+    func bind(userId: String, onUpdate: @escaping (VoiceTranscriber.Update) -> Void) {
+        self.userId = userId
+        self.onUpdate = onUpdate
+    }
 
-        var currentText: String {
-            var parts = finalized
-            if !volatile.isEmpty { parts.append(volatile) }
-            return parts.joined(separator: " ")
+    private func apply(text: String, isFinal: Bool) {
+        if isFinal {
+            if !text.isEmpty { finalized.append(text) }
+            volatile = ""
+        } else {
+            volatile = text
         }
+        emit(final: false)
+    }
 
-        init(userId: String, localeId: String, transcriber: SpeechTranscriber, analyzer: SpeechAnalyzer,
-             builder: AsyncStream<AnalyzerInput>.Continuation, sourceFormat: AVAudioFormat,
-             targetFormat: AVAudioFormat, converter: AVAudioConverter, emitting: Bool,
-             onUpdate: @escaping (VoiceTranscriber.Update) -> Void) {
-            self.userId = userId
-            self.localeId = localeId
-            self.analyzer = analyzer
-            self.builder = builder
-            self.sourceFormat = sourceFormat
-            self.targetFormat = targetFormat
-            self.converter = converter
-            self.emitting = emitting
-            self.onUpdate = onUpdate
-            self.resultsTask = Task { [weak self] in
-                do {
-                    for try await result in transcriber.results {
-                        guard let self else { return }
-                        let text = String(result.text.characters).trimmingCharacters(in: .whitespacesAndNewlines)
-                        self.apply(text: text, isFinal: result.isFinal)
-                    }
-                } catch {
-                    // Поток результатов завершился ошибкой: оставляем то, что успели распознать.
-                }
-            }
+    func emitNow() { emit(final: false) }
+
+    private func emit(final: Bool) {
+        guard emitting else { return }
+        let text = currentText
+        if !text.isEmpty {
+            onUpdate(VoiceTranscriber.Update(userId: userId, text: text, isFinal: final, lang: localeId))
         }
+    }
 
-        private func apply(text: String, isFinal: Bool) {
-            if isFinal {
-                if !text.isEmpty { finalized.append(text) }
-                volatile = ""
-            } else {
-                volatile = text
+    func feed(_ samples: [Float]) {
+        let n = samples.count
+        guard n > 0,
+              let src = AVAudioPCMBuffer(pcmFormat: sourceFormat, frameCapacity: AVAudioFrameCount(n)),
+              let ch = src.floatChannelData else { return }
+        src.frameLength = AVAudioFrameCount(n)
+        let dst = ch[0]
+        for i in 0..<n { dst[i] = samples[i] }
+
+        let ratio = targetFormat.sampleRate / sourceFormat.sampleRate
+        let capacity = AVAudioFrameCount((Double(n) * ratio).rounded(.up)) + 32
+        guard let out = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: capacity) else { return }
+
+        var error: NSError?
+        var provided = false
+        let status = converter.convert(to: out, error: &error) { _, inputStatus in
+            if provided {
+                inputStatus.pointee = .noDataNow
+                return nil
             }
-            emit(final: false)
+            provided = true
+            inputStatus.pointee = .haveData
+            return src
         }
-
-        func emitNow() { emit(final: false) }
-
-        private func emit(final: Bool) {
-            guard emitting else { return }
-            let text = currentText
-            if !text.isEmpty {
-                onUpdate(VoiceTranscriber.Update(userId: userId, text: text, isFinal: final, lang: localeId))
-            }
+        if status != .error, out.frameLength > 0 {
+            builder.yield(AnalyzerInput(buffer: out))
         }
+    }
 
-        func feed(_ samples: [Float]) {
-            let n = samples.count
-            guard n > 0,
-                  let src = AVAudioPCMBuffer(pcmFormat: sourceFormat, frameCapacity: AVAudioFrameCount(n)),
-                  let ch = src.floatChannelData else { return }
-            src.frameLength = AVAudioFrameCount(n)
-            let dst = ch[0]
-            for i in 0..<n { dst[i] = samples[i] }
+    /// Завершить: `emit` = показать итоговый текст, иначе просто выбросить (проигравший вариант языка).
+    /// Каждый шаг ограничен таймаутом — если модель зависла, бросаем попытку и не ждём её вечно.
+    func finish(emit doEmit: Bool, timeout: Double) async {
+        if !doEmit { emitting = false }
+        builder.finish()
 
-            let ratio = targetFormat.sampleRate / sourceFormat.sampleRate
-            let capacity = AVAudioFrameCount((Double(n) * ratio).rounded(.up)) + 32
-            guard let out = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: capacity) else { return }
-
-            var error: NSError?
-            var provided = false
-            let status = converter.convert(to: out, error: &error) { _, inputStatus in
-                if provided {
-                    inputStatus.pointee = .noDataNow
-                    return nil
-                }
-                provided = true
-                inputStatus.pointee = .haveData
-                return src
-            }
-            if status != .error, out.frameLength > 0 {
-                builder.yield(AnalyzerInput(buffer: out))
-            }
+        let finalizeOk = await withTimeout(timeout) { [analyzer] in
+            try await analyzer.finalizeAndFinishThroughEndOfInput()
         }
-
-        /// Завершить: `emit` = показать итоговый текст, иначе просто выбросить (проигравший язык).
-        func finish(emit doEmit: Bool) async {
-            if !doEmit { emitting = false }
-            builder.finish()
-            // Страховка: если поток результатов не закрылся, через 3 секунды обрываем ожидание.
-            let watchdog = Task { [weak self] in
-                try? await Task.sleep(nanoseconds: 3_000_000_000)
-                self?.resultsTask?.cancel()
+        if finalizeOk == nil {
+            // Не уложились в таймаут: не ждём эту модель дальше, бросаем как есть.
+            resultsTask?.cancel()
+        } else {
+            _ = await withTimeout(timeout) { [resultsTask] in
+                await resultsTask?.value
             }
-            try? await analyzer.finalizeAndFinishThroughEndOfInput()
-            await resultsTask?.value
-            watchdog.cancel()
-            if doEmit { emit(final: true) }
+            resultsTask?.cancel()
         }
+        if doEmit { emit(final: true) }
     }
 }
 
