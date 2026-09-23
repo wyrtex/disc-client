@@ -20,6 +20,7 @@ struct LoginView: View {
     @EnvironmentObject var store: Store
     @State private var token = ""
     @State private var showWeb = false
+    @State private var webStuck = false
 
     var body: some View {
         ZStack {
@@ -80,12 +81,40 @@ struct LoginView: View {
                 .padding(20)
             }
         }
-        .sheet(isPresented: $showWeb) {
-            WebLoginView { t in
-                showWeb = false
-                Task { await store.login(token: t) }
+        .sheet(isPresented: $showWeb, onDismiss: { webStuck = false }) {
+            ZStack(alignment: .bottom) {
+                WebLoginView(
+                    onToken: { t in
+                        showWeb = false
+                        Task { await store.login(token: t) }
+                    },
+                    onStuck: { webStuck = true }
+                )
+                .ignoresSafeArea()
+
+                if webStuck {
+                    VStack(spacing: 10) {
+                        Text("Не получается найти токен на странице")
+                            .font(.system(size: 14, weight: .semibold))
+                            .foregroundStyle(.white)
+                        Text("Discord мог обновить сайт. Войди на странице как обычно и подожди ещё немного, или используй вход по токену ниже.")
+                            .font(.system(size: 12))
+                            .foregroundStyle(.white.opacity(0.85))
+                            .multilineTextAlignment(.center)
+                        Button("Закрыть и ввести токен вручную") {
+                            showWeb = false
+                        }
+                        .font(.system(size: 13, weight: .semibold))
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 8)
+                        .background(Theme.blurple, in: Capsule())
+                        .foregroundStyle(.white)
+                    }
+                    .padding(16)
+                    .frame(maxWidth: .infinity)
+                    .background(.black.opacity(0.85))
+                }
             }
-            .ignoresSafeArea()
         }
     }
 

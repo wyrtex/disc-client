@@ -3,15 +3,20 @@ import WebKit
 
 struct WebLoginView: UIViewRepresentable {
     var onToken: (String) -> Void
+    /// Вызывается, когда автоматическое извлечение токена долго не получается —
+    /// чтобы интерфейс мог показать подсказку и предложить запасной вариант.
+    var onStuck: () -> Void = {}
 
-    func makeCoordinator() -> Coordinator { Coordinator(onToken: onToken) }
+    func makeCoordinator() -> Coordinator { Coordinator(onToken: onToken, onStuck: onStuck) }
 
     func makeUIView(context: Context) -> WKWebView {
         let cfg = WKWebViewConfiguration()
         cfg.websiteDataStore = .nonPersistent()
         cfg.defaultWebpagePreferences.preferredContentMode = .desktop
         let web = WKWebView(frame: .zero, configuration: cfg)
-        web.customUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"
+        // Более свежий User-Agent: со старым UA Discord иногда показывает
+        // «обновите браузер» и не догружает свой JS.
+        web.customUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.3 Safari/605.1.15"
         context.coordinator.web = web
         if let url = URL(string: "https://discord.com/login") {
             web.load(URLRequest(url: url))
@@ -24,39 +29,75 @@ struct WebLoginView: UIViewRepresentable {
 
     final class Coordinator: NSObject {
         let onToken: (String) -> Void
+        let onStuck: () -> Void
         weak var web: WKWebView?
         var timer: Timer?
         var done = false
+        var attempts = 0
+        var stuckReported = false
 
-        init(onToken: @escaping (String) -> Void) {
+        init(onToken: @escaping (String) -> Void, onStuck: @escaping () -> Void) {
             self.onToken = onToken
+            self.onStuck = onStuck
         }
 
         deinit { timer?.invalidate() }
 
         func startPolling() {
-            timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
+            // Странице и её скриптам нужно время на загрузку — первая проверка чуть позже.
+            timer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { [weak self] _ in
                 self?.check()
             }
         }
 
+        /// Похоже ли значение на настоящий токен Discord (не пустая строка и не случайный мусор).
+        private func looksLikeToken(_ s: String) -> Bool {
+            guard s.count > 20, s.count < 220 else { return false }
+            return s.range(of: #"^[\w-]{15,}\.[\w-]{5,}\.[\w-]{15,}$"#, options: .regularExpression) != nil
+                || s.range(of: #"^mfa\.[\w-]{80,}$"#, options: .regularExpression) != nil
+        }
+
         private func check() {
             guard !done, let web else { return }
+            attempts += 1
             let js = """
             (function(){
               try {
-                var t = '';
-                window.webpackChunkdiscord_app.push([[Math.random()], {}, function(r){
-                  if (!r || !r.c) return;
-                  for (var k in r.c) {
-                    try {
-                      var m = r.c[k].exports;
-                      if (m && m.default && typeof m.default.getToken === 'function') { var v = m.default.getToken(); if (v) t = v; }
-                      else if (m && typeof m.getToken === 'function') { var w = m.getToken(); if (w) t = w; }
-                    } catch (e) {}
-                  }
-                }]);
-                if (t) return t;
+                var found = '';
+                var chunkName = null;
+                for (var k in window) {
+                  if (k.indexOf('webpackChunk') === 0) { chunkName = k; break; }
+                }
+                if (chunkName && window[chunkName] && window[chunkName].push) {
+                  window[chunkName].push([[Symbol()], {}, function(req){
+                    if (!req || !req.c) return;
+                    for (var key in req.c) {
+                      try {
+                        var exp = req.c[key].exports;
+                        if (!exp || exp === window) continue;
+                        if (typeof exp.getToken === 'function') {
+                          var v = exp.getToken();
+                          if (v) { found = v; return; }
+                        }
+                        if (exp.default && typeof exp.default.getToken === 'function') {
+                          var v2 = exp.default.getToken();
+                          if (v2) { found = v2; return; }
+                        }
+                        for (var sub in exp) {
+                          try {
+                            var candidate = exp[sub];
+                            if (candidate && typeof candidate.getToken === 'function' &&
+                                candidate[Symbol.toStringTag] !== 'IntlMessagesProxy') {
+                              var v3 = candidate.getToken();
+                              if (v3) { found = v3; return; }
+                            }
+                          } catch (inner) {}
+                        }
+                      } catch (e) {}
+                    }
+                  }]);
+                }
+                if (found) return found;
               } catch (e) {}
               try {
                 var f = document.createElement('iframe');
@@ -69,11 +110,19 @@ struct WebLoginView: UIViewRepresentable {
             })()
             """
             web.evaluateJavaScript(js) { [weak self] result, _ in
-                guard let self, !self.done,
-                      let t = result as? String, t.count > 20 else { return }
-                self.done = true
-                self.timer?.invalidate()
-                self.onToken(t)
+                guard let self, !self.done else { return }
+                if let t = result as? String, self.looksLikeToken(t) {
+                    self.done = true
+                    self.timer?.invalidate()
+                    self.onToken(t)
+                    return
+                }
+                // Долго ничего не находится — сайт мог не догрузить скрипты, или Discord
+                // снова поменял внутреннее устройство страницы. Сообщаем интерфейсу один раз.
+                if self.attempts >= 20 && !self.stuckReported {
+                    self.stuckReported = true
+                    self.onStuck()
+                }
             }
         }
     }
