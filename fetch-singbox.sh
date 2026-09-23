@@ -61,3 +61,21 @@ rm -rf "$WORKDIR"
 
 ls Vendor/Libbox.xcframework
 echo "Libbox.xcframework собран (теги: ${TAGS})" >> "$GITHUB_STEP_SUMMARY"
+
+# Диагностика: печатаем настоящие объявления из сгенерированного заголовка, чтобы не гадать
+# вслепую про имена и сигнатуры методов — берём только то, что реально нужно для интеграции.
+HEADER=$(find Vendor/Libbox.xcframework -name "Libbox.h" -path "*ios-arm64/*" | head -1)
+if [ -z "$HEADER" ]; then
+  HEADER=$(find Vendor/Libbox.xcframework -name "Libbox.h" | head -1)
+fi
+if [ -n "$HEADER" ]; then
+  {
+    echo "### Настоящие объявления из Libbox.h (для интеграции)"
+    echo '```objc'
+    grep -n -A2 -B2       -e "PlatformInterface"       -e "@interface LibboxBoxService"       -e "LibboxNewService"       -e "NewStandaloneCommandClient"       -e "@protocol LibboxLocalDNSTransportProtocol"       -e "@protocol LibboxNetworkInterfaceIteratorProtocol"       -e "@protocol LibboxInterfaceUpdateListenerProtocol"       -e "@protocol LibboxStringIteratorProtocol"       -e "@protocol LibboxTunOptionsProtocol"       -e "LibboxNotification"       -e "LibboxWIFIState"       "$HEADER" | head -400
+    echo '```'
+  } >> "$GITHUB_STEP_SUMMARY"
+else
+  echo "Не нашёл Libbox.h внутри framework — структура папок другая, чем ожидалось." >> "$GITHUB_STEP_SUMMARY"
+  find Vendor/Libbox.xcframework -maxdepth 4 >> "$GITHUB_STEP_SUMMARY"
+fi
