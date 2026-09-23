@@ -10,6 +10,7 @@ struct MainView: View {
     @State private var confirmLogout = false
     @State private var showVoice = false
     @State private var showLab = false
+    @State private var showVPN = false
 
     var body: some View {
         NavigationStack(path: $store.path) {
@@ -59,8 +60,12 @@ struct MainView: View {
             VoiceLabView()
                 .environmentObject(store)
         }
+        .sheet(isPresented: $showVPN) {
+            VPNSettingsView()
+        }
         .confirmationDialog("Аккаунт", isPresented: $confirmLogout, titleVisibility: .hidden) {
             Button("Голосовая лаборатория") { showLab = true }
+            Button("Встроенный VPN") { showVPN = true }
             Button("Выйти из аккаунта", role: .destructive) { store.logout() }
             Button("Отмена", role: .cancel) {}
         }

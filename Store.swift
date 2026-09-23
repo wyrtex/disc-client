@@ -109,9 +109,18 @@ final class Store: ObservableObject {
         } else {
             proxy = ProxySettings()
         }
+        VPNManager.shared.onProxyChange = { [weak self] p in
+            Task { @MainActor in self?.proxy = p }
+        }
         if let saved = Keychain.load() {
             isRestoring = !restoreFromCache()
             Task { await autoLogin(saved) }
+            if VPNManager.shared.autoConnect {
+                Task {
+                    await VPNManager.shared.loadSubscription()
+                    await VPNManager.shared.connectBest()
+                }
+            }
         }
     }
 

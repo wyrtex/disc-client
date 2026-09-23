@@ -24,6 +24,9 @@ targets:
       - framework: Vendor/SherpaOnnxC.xcframework
         embed: true
         codeSign: true
+      - framework: Vendor/Libbox.xcframework
+        embed: true
+        codeSign: true
     configFiles:
       Debug: Vendor/dave-link.xcconfig
       Release: Vendor/dave-link.xcconfig
