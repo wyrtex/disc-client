@@ -21,7 +21,6 @@ struct LoginView: View {
     @State private var token = ""
     @State private var showWeb = false
     @State private var webStuck = false
-    @State private var showVPN = false
 
     var body: some View {
         ZStack {
@@ -72,20 +71,6 @@ struct LoginView: View {
                     .disabled(token.isEmpty || store.isLoading)
 
                     proxySection
-
-                    Button {
-                        showVPN = true
-                    } label: {
-                        Label("Встроенный VPN", systemImage: "shield.lefthalf.filled")
-                            .frame(maxWidth: .infinity)
-                            .padding(.vertical, 10)
-                            .background(Theme.input)
-                            .foregroundStyle(.white)
-                            .clipShape(RoundedRectangle(cornerRadius: 10))
-                    }
-                    .sheet(isPresented: $showVPN) {
-                        VPNSettingsView()
-                    }
 
                     if let error = store.error {
                         Text(error)
@@ -158,7 +143,7 @@ struct LoginView: View {
                     .clipShape(RoundedRectangle(cornerRadius: 8))
                     .foregroundStyle(.white)
             }
-            Text("Это ручной прокси для своих адресов. Для площадок из подписки удобнее «Встроенный VPN» ниже — он сам включает и настраивает этот прокси.")
+            Text("Пока встроенного туннеля нет: включи Happ на телефоне, а прокси оставь выключенным.")
                 .font(.footnote)
                 .foregroundStyle(Theme.muted)
         }
