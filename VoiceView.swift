@@ -264,8 +264,17 @@ struct VoiceView: View {
 
     // MARK: Участники
 
+    /// Кто сейчас транслирует экран. Берём и из событий голосового канала, и из общего списка
+    /// голосовых состояний сервера: демонстрации, начатые ДО нашего входа, видны только там.
     private var streamingIds: [String] {
-        voice.participantIds.filter { voice.flags[$0]?.stream == true }
+        var ids = Set(voice.participantIds.filter { voice.flags[$0]?.stream == true })
+        if let gid = voice.activeGuildId, let cid = voice.activeChannelId {
+            for m in store.members(in: cid, guildId: gid) where m.stream {
+                ids.insert(m.userId)
+            }
+        }
+        ids.remove(voice.userId)
+        return ids.sorted()
     }
 
     private var participants: some View {
@@ -462,10 +471,18 @@ struct ParticipantTile: View {
         voice.users[id] ?? store.voiceUsers[id] ?? (store.me?.id == id ? store.me : nil)
     }
 
+    /// Состояние из общего списка голосовых состояний сервера (на случай, если камеру или
+    /// демонстрацию включили до нашего входа и голосовой канал об этом не сообщил).
+    private var rosterFlags: VoiceFlags {
+        guard let gid = voice.activeGuildId,
+              let m = store.voiceRoster[gid]?[id] else { return VoiceFlags() }
+        return VoiceFlags(mute: m.mute, deaf: m.deaf, video: m.video, stream: m.stream)
+    }
+
     var body: some View {
         TimelineView(.periodic(from: .now, by: 0.25)) { ctx in
             let speaking = ctx.date.timeIntervalSince(voice.lastHeard[id] ?? .distantPast) < 0.6
-            let flag = voice.flags[id] ?? VoiceFlags()
+            let flag = voice.flags[id] ?? rosterFlags
             VStack(spacing: 8) {
                 AvatarView(user: user, size: 76)
                 Text(name)
