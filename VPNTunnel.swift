@@ -36,8 +36,8 @@ enum VPNState: Equatable {
 #if canImport(Libbox)
 final class PlatformShim: NSObject, LibboxPlatformInterfaceProtocol {
     func localDNSTransport() -> (any LibboxLocalDNSTransportProtocol)? { nil }
-    func usePlatformAutoDetectControl() -> Bool { false }
-    func autoDetectControl(_ fd: Int32) throws {}
+    func usePlatformAutoDetectInterfaceControl() -> Bool { false }
+    func autoDetectInterfaceControl(_ fd: Int32) throws {}
     func openTun(_ options: LibboxTunOptionsProtocol?) throws -> Int32 {
         throw VPNError.unsupported("TUN не используется: только локальный прокси")
     }

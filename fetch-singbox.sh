@@ -4,7 +4,11 @@
 # поэтому в теги сборки не включаем with_wireguard/with_gvisor и т.п.
 set -euo pipefail
 
-SINGBOX_TAG="v1.14.1"
+# Закреплена v1.10.0 (стабильный официальный релиз), а не более свежая:
+# начиная где-то между 1.10 и 1.14 SagerNet переделал мобильный API libbox
+# в клиент-серверную модель (CommandServer/CommandClient) и убрал простой
+# BoxService/NewService, который нужен для локального прокси без TUN.
+SINGBOX_TAG="v1.10.0"
 GOMOBILE_VERSION="v0.1.12"
 GO_VERSION="1.23.4"
 
