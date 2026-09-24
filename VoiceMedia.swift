@@ -129,6 +129,8 @@ final class VoiceMedia {
     private var keepaliveTimer: DispatchSourceTimer?
     private var keepaliveCounter: UInt64 = 0
     private var otherPackets: [String: Int] = [:]
+    private var otherBytes: [String: Int] = [:]
+    private var seenVideoPayloadTypes = Set<Int>()
     private var lastOtherLogged = ""
     private var firstTransportFailLogged = false
     private var firstDaveFailLogged = false
@@ -240,7 +242,9 @@ final class VoiceMedia {
 
     private func reportStats() {
         if !otherPackets.isEmpty {
-            let text = otherPackets.sorted { $0.key < $1.key }.map { "\($0.key): \($0.value)" }.joined(separator: ", ")
+            let text = otherPackets.sorted { $0.key < $1.key }
+                .map { "\($0.key): \($0.value) шт, \(otherBytes[$0.key] ?? 0) байт" }
+                .joined(separator: ", ")
             if text != lastOtherLogged {
                 lastOtherLogged = text
                 log?("Прочие RTP-пакеты (возможно, видео): \(text)")
@@ -269,7 +273,16 @@ final class VoiceMedia {
         guard let user = ssrcToUser[packetSsrc] else {
             stats.unknownSsrc += 1
             let pt = bytes.count > 1 ? Int(bytes[1] & 0x7F) : -1
-            otherPackets["pt\(pt) ssrc\(packetSsrc)", default: 0] += 1
+            let key = "pt\(pt) ssrc\(packetSsrc)"
+            otherPackets[key, default: 0] += 1
+            otherBytes[key, default: 0] += bytes.count
+            // Первый раз, когда видим чужой поток похожий на видео (наш заявленный H264 — payload type 101),
+            // сразу пишем отдельную заметную строку, не дожидаясь периодической сводки раз в 3 секунды.
+            if !seenVideoPayloadTypes.contains(pt) {
+                seenVideoPayloadTypes.insert(pt)
+                let head = bytes.prefix(16).map { String(format: "%02x", $0) }.joined()
+                log?("[видео/демо] Первый пакет с неизвестным ssrc \(packetSsrc), payload type \(pt), размер \(bytes.count) байт, начало: \(head)")
+            }
             return
         }
         // Пакет тишины от сервера: три байта F8 FF FE.

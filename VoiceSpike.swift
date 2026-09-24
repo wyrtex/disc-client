@@ -203,6 +203,8 @@ final class VoiceGateway {
                 media?.removeUser(id)
                 onUsers?(Array(userIds))
             }
+        case 12:
+            log("[видео/демо] Пришёл op 12 от сервера: \(d)")
         case 18, 20:
             log("op \(op): \(d)")
         case 21:
@@ -269,6 +271,11 @@ final class VoiceGateway {
             if let vs = first["ssrc"] as? Int { readyVideoSsrc = UInt32(truncatingIfNeeded: vs) }
             if let rtx = first["rtx_ssrc"] as? Int { readyVideoRtxSsrc = UInt32(truncatingIfNeeded: rtx) }
             log("Ready: Discord выдал ssrc для видео заранее: \(readyVideoSsrc.map(String.init) ?? "нет")")
+        }
+        // Видео-диагностика: печатаем Ready целиком — вдруг там есть данные о чужих потоках,
+        // которые уже идут в канале на момент нашего входа (обычные поля ssrc/ip/port/modes уже разобраны выше).
+        if videoProbe {
+            log("[видео-диагностика] Ready целиком: \(d)")
         }
         discover(ip: ip, port: port, ssrc: UInt32(truncatingIfNeeded: ssrc), modes: modes)
     }
@@ -1092,11 +1099,17 @@ final class VoiceSpike: ObservableObject {
             if let uid, channel == activeChannelId {
                 let mute = (d["self_mute"] as? Bool ?? false) || (d["mute"] as? Bool ?? false)
                 let deaf = (d["self_deaf"] as? Bool ?? false) || (d["deaf"] as? Bool ?? false)
+                let video = d["self_video"] as? Bool ?? false
+                let stream = d["self_stream"] as? Bool ?? false
+                let prev = flags[uid]
+                if video != (prev?.video ?? false) || stream != (prev?.stream ?? false) {
+                    add("[видео/демо] \(uid): камера \(video ? "включена" : "выключена"), демонстрация \(stream ? "включена" : "выключена") — сырые данные: \(d)")
+                }
                 flags[uid] = VoiceFlags(
                     mute: mute,
                     deaf: deaf,
-                    video: d["self_video"] as? Bool ?? false,
-                    stream: d["self_stream"] as? Bool ?? false
+                    video: video,
+                    stream: stream
                 )
                 if users[uid] == nil,
                    let member = d["member"] as? [String: Any],
