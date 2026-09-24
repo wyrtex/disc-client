@@ -264,12 +264,21 @@ struct VoiceView: View {
 
     // MARK: Участники
 
+    private var streamingIds: [String] {
+        voice.participantIds.filter { voice.flags[$0]?.stream == true }
+    }
+
     private var participants: some View {
         ScrollView {
             LazyVGrid(
                 columns: [GridItem(.flexible(), spacing: 12), GridItem(.flexible(), spacing: 12)],
                 spacing: 12
             ) {
+                // Как в официальном клиенте: у того, кто транслирует экран, есть отдельная
+                // плитка с кнопкой "Смотреть стрим", вдобавок к обычной плитке с аватаркой.
+                ForEach(streamingIds, id: \.self) { id in
+                    StreamTile(voice: voice, id: id)
+                }
                 ForEach(voice.participantIds, id: \.self) { id in
                     ParticipantTile(voice: voice, id: id)
                 }
@@ -384,6 +393,60 @@ struct VoiceView: View {
                 .frame(width: 54, height: 54)
                 .background(active ? Color.white : Theme.input, in: Circle())
         }
+    }
+}
+
+// MARK: - Плитка "Смотреть стрим" (демонстрация экрана участника)
+
+struct StreamTile: View {
+    @EnvironmentObject var store: Store
+    @ObservedObject var voice: VoiceSpike
+    let id: String
+
+    private var user: User? {
+        voice.users[id] ?? store.voiceUsers[id] ?? (store.me?.id == id ? store.me : nil)
+    }
+
+    var body: some View {
+        Button {
+            voice.watchStream(id)
+        } label: {
+            ZStack(alignment: .bottomLeading) {
+                RoundedRectangle(cornerRadius: 14)
+                    .fill(
+                        LinearGradient(
+                            colors: [Color(hex: 0x2B2D31), Color(hex: 0x1E1F22)],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        )
+                    )
+
+                Text("Смотреть стрим")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(Theme.text)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 9)
+                    .background(.white, in: Capsule())
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
+
+                HStack(spacing: 5) {
+                    Image(systemName: "tv.fill")
+                        .font(.system(size: 10))
+                    Text(user?.displayName ?? "…")
+                        .font(.system(size: 12, weight: .semibold))
+                        .lineLimit(1)
+                }
+                .foregroundStyle(.white)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 5)
+                .background(Color.black.opacity(0.6), in: Capsule())
+                .padding(8)
+            }
+        }
+        .buttonStyle(.plain)
+        .frame(maxWidth: .infinity)
+        .frame(height: 150)
+        .clipShape(RoundedRectangle(cornerRadius: 14))
     }
 }
 
