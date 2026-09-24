@@ -36,6 +36,12 @@ final class VoiceGateway {
 
     var transcriber: VoiceTranscriber?
     private let videoProbe: Bool
+    /// Соединение только для просмотра чужой демонстрации (отдельный сервер стрима).
+    private let viewer: Bool
+    var streamDisplay: StreamDisplay?
+    var onFirstVideoFrame: (() -> Void)?
+    private var streamRx: StreamVideoReceiver?
+    private var knownVideo: [UInt32: String] = [:]
     private let audio: VoiceAudio
     private let micAllowed: Bool
     private var ownSsrc: UInt32 = 0
@@ -47,8 +53,9 @@ final class VoiceGateway {
 
     init(endpoint: String, serverId: String, channelId: String, userId: String, sessionId: String, token: String,
          session: URLSession, daveVersion: Int, audio: VoiceAudio, micAllowed: Bool,
-         muted: Bool, deafened: Bool, videoProbe: Bool) {
+         muted: Bool, deafened: Bool, videoProbe: Bool, viewer: Bool = false) {
         self.videoProbe = videoProbe
+        self.viewer = viewer
         self.channelId = channelId
         self.audio = audio
         self.micAllowed = micAllowed
@@ -102,6 +109,8 @@ final class VoiceGateway {
     }
 
     func stop() {
+        streamRx?.stop()
+        streamRx = nil
         media?.stop()
         media = nil
         dave = nil
@@ -205,6 +214,24 @@ final class VoiceGateway {
             }
         case 12:
             log("[видео/демо] Пришёл op 12 от сервера: \(d)")
+            if let uid = d["user_id"] as? String {
+                var ssrcs = Set<UInt32>()
+                if let v = d["video_ssrc"] as? Int, v != 0 { ssrcs.insert(UInt32(truncatingIfNeeded: v)) }
+                for s in (d["streams"] as? [[String: Any]]) ?? [] {
+                    let active = (s["active"] as? Bool) ?? true
+                    if active, let x = s["ssrc"] as? Int, x != 0 { ssrcs.insert(UInt32(truncatingIfNeeded: x)) }
+                }
+                for s in ssrcs {
+                    knownVideo[s] = uid
+                    streamRx?.setVideo(ssrc: s, user: uid)
+                }
+                if viewer, !ssrcs.isEmpty {
+                    var wants: [String: Any] = ["any": 100]
+                    for s in ssrcs { wants[String(s)] = 100 }
+                    send(["op": 15, "d": wants])
+                    log("Демонстрация: запросил видео ssrc \(ssrcs.map(String.init).joined(separator: ", ")) в максимальном качестве")
+                }
+            }
         case 18, 20:
             log("op \(op): \(d)")
         case 21:
@@ -351,7 +378,7 @@ final class VoiceGateway {
         d["codecs"] = [
             ["name": "opus", "type": "audio", "priority": 1000, "payload_type": 120],
             ["name": "H264", "type": "video", "priority": 1000, "payload_type": 101,
-             "rtx_payload_type": 102, "encode": true, "decode": videoProbe]
+             "rtx_payload_type": 102, "encode": !viewer, "decode": videoProbe || viewer]
         ]
         d["experiments"] = [String]()
         send(["op": 1, "d": d])
@@ -372,6 +399,29 @@ final class VoiceGateway {
         onState?("Подключено, обмен ключами DAVE…")
         if daveVersion > 0 {
             dave?.onSessionDescription(version: daveVer ?? 0)
+        }
+
+        if viewer {
+            log("Демонстрация: кодек видео от сервера — \(d["video_codec"] ?? "не указан")")
+            guard mode == "aead_aes256_gcm_rtpsize", keyBytes.count == 32, let conn = udp, let display = streamDisplay else {
+                log("Демонстрация: режим \(mode) не поддерживается или нет UDP")
+                return
+            }
+            let rx = StreamVideoReceiver(
+                connection: conn,
+                secretKey: Data(keyBytes),
+                dave: daveVersion > 0 ? dave : nil,
+                display: display
+            )
+            rx.log = { [weak self] s in self?.log(s) }
+            rx.onFirstFrame = { [weak self] in self?.onFirstVideoFrame?() }
+            for (ssrc, uid) in knownVideo { rx.setVideo(ssrc: ssrc, user: uid) }
+            streamRx = rx
+            rx.start()
+            send(["op": 15, "d": ["any": 100]])
+            onState?("Жду картинку…")
+            log("Приём демонстрации запущен")
+            return
         }
 
         if mode == "aead_aes256_gcm_rtpsize", keyBytes.count == 32, let conn = udp {
@@ -576,6 +626,16 @@ final class VoiceSpike: ObservableObject {
     @Published var videoOn = false
     @Published var cameraError: String?
     let camera = CameraSource()
+
+    // Просмотр чужой демонстрации экрана (Go Live): отдельное соединение со своим сервером.
+    @Published var watchingStream: String?
+    @Published var streamStatus = ""
+    let streamDisplay = StreamDisplay()
+    private var streamKey: String?
+    private var streamRtcServerId: String?
+    private var streamEndpoint: String?
+    private var streamToken: String?
+    private var streamGateway: VoiceGateway?
     @Published var vadThreshold: Double = -45 {
         didSet { shared.vad = vadThreshold }
     }
@@ -777,6 +837,7 @@ final class VoiceSpike: ObservableObject {
     }
 
         func leave(silent: Bool = false) {
+        if watchingStream != nil { stopWatching() }
         if videoOn {
             videoOn = false
             camera.stop()
@@ -1119,6 +1180,31 @@ final class VoiceSpike: ObservableObject {
                     users[uid] = user
                 }
             }
+        case "STREAM_CREATE", "STREAM_UPDATE":
+            add("[видео/демо] \(t): \(d)")
+            if let key = d["stream_key"] as? String, key == streamKey {
+                if let rtc = d["rtc_server_id"] as? String {
+                    streamRtcServerId = rtc
+                } else if let rtc = d["rtc_server_id"] as? Int {
+                    streamRtcServerId = String(rtc)
+                }
+                tryConnectStream()
+            }
+        case "STREAM_SERVER_UPDATE":
+            add("[видео/демо] STREAM_SERVER_UPDATE: \(d["endpoint"] ?? "?")")
+            if let key = d["stream_key"] as? String, key == streamKey,
+               let token = d["token"] as? String, let ep = d["endpoint"] as? String {
+                streamEndpoint = ep
+                streamToken = token
+                tryConnectStream()
+            }
+        case "STREAM_DELETE":
+            add("[видео/демо] STREAM_DELETE: \(d)")
+            if let key = d["stream_key"] as? String, key == streamKey {
+                let reason = d["reason"] as? String ?? ""
+                stopWatching(notify: false)
+                if reason == "stream_full" { add("Демонстрация: слишком много зрителей") }
+            }
         case "VOICE_SERVER_UPDATE":
             if let token = d["token"] as? String, let ep = d["endpoint"] as? String {
                 server = (token: token, endpoint: ep)
@@ -1130,6 +1216,89 @@ final class VoiceSpike: ObservableObject {
         default:
             break
         }
+    }
+
+    // MARK: Просмотр демонстрации экрана
+
+    /// Начать смотреть демонстрацию участника: просим у основного шлюза (op 20 Watch Stream)
+    /// отдельный сервер стрима, дальше ждём STREAM_CREATE и STREAM_SERVER_UPDATE.
+    func watchStream(_ uid: String) {
+        guard isConnected, let cid = activeChannelId else { return }
+        if watchingStream == uid { return }
+        if watchingStream != nil { stopWatching() }
+        let key: String
+        if let gid = guildId {
+            key = "guild:\(gid):\(cid):\(uid)"
+        } else {
+            key = "call:\(cid):\(uid)"
+        }
+        streamKey = key
+        watchingStream = uid
+        streamStatus = "Подключаюсь к демонстрации…"
+        streamDisplay.reset()
+        let sent = sendGateway?(["op": 20, "d": ["stream_key": key]]) ?? false
+        add("[видео/демо] Прошу посмотреть демонстрацию (op 20), stream_key \(key)\(sent ? "" : " — НЕ отправлено, основной шлюз не подключён")")
+    }
+
+    func stopWatching(notify: Bool = true) {
+        if notify, let key = streamKey {
+            _ = sendGateway?(["op": 19, "d": ["stream_key": key]])
+            add("[видео/демо] Перестал смотреть демонстрацию (op 19)")
+        }
+        streamGateway?.stop()
+        streamGateway = nil
+        streamKey = nil
+        streamRtcServerId = nil
+        streamEndpoint = nil
+        streamToken = nil
+        watchingStream = nil
+        streamStatus = ""
+        streamDisplay.reset()
+    }
+
+    private func tryConnectStream() {
+        guard streamGateway == nil,
+              let rtc = streamRtcServerId,
+              let ep = streamEndpoint,
+              let token = streamToken,
+              let sid = sessionId else { return }
+        // Группа MLS (DAVE) у стрима — это rtc_server_id минус один, а не id канала.
+        guard let rtcNum = UInt64(rtc), rtcNum > 0 else {
+            add("[видео/демо] Некорректный rtc_server_id: \(rtc)")
+            return
+        }
+        add("[видео/демо] Подключаюсь к серверу демонстрации \(ep), rtc_server_id \(rtc)")
+        let vg = VoiceGateway(
+            endpoint: ep,
+            serverId: rtc,
+            channelId: String(rtcNum - 1),
+            userId: userId,
+            sessionId: sid,
+            token: token,
+            session: session,
+            daveVersion: daveVersion,
+            audio: audio,
+            micAllowed: false,
+            muted: true,
+            deafened: false,
+            videoProbe: true,
+            viewer: true
+        )
+        vg.streamDisplay = streamDisplay
+        vg.onLog = { [weak self] s in
+            Task { @MainActor in self?.add("[стрим] " + s) }
+        }
+        vg.onState = { [weak self] s in
+            Task { @MainActor in
+                guard let self, self.watchingStream != nil else { return }
+                if self.streamStatus != "" { self.streamStatus = s }
+            }
+        }
+        vg.onFirstVideoFrame = { [weak self] in
+            Task { @MainActor in self?.streamStatus = "" }
+        }
+        streamGateway = vg
+        vg.start()
     }
 
     private func tryConnect() {

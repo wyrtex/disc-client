@@ -13,6 +13,7 @@ struct VoiceView: View {
     @State private var showChat = false
     @State private var volumeUser: User?
     @State private var fullscreenSelf = false
+    @State private var fullscreenStream = false
 
     var body: some View {
         ZStack {
@@ -26,17 +27,22 @@ struct VoiceView: View {
                     Spacer()
                 } else if voice.isStage {
                     StageContent(voice: voice)
-                } else if voice.videoOn {
+                } else if voice.videoOn || voice.watchingStream != nil {
                     VStack(spacing: 12) {
-                        selfVideoTile
-                        if !fullscreenSelf {
+                        if voice.watchingStream != nil && !fullscreenSelf {
+                            streamTile
+                        }
+                        if voice.videoOn && !fullscreenStream {
+                            selfVideoTile
+                        }
+                        if !fullscreenSelf && !fullscreenStream {
                             participants
                         }
                     }
                 } else {
                     participants
                 }
-                if voice.captionsEnabled && !fullscreenSelf {
+                if voice.captionsEnabled && !fullscreenSelf && !fullscreenStream {
                     CaptionsPanel(voice: voice)
                 }
                 if voice.isStage { stageControls } else { controls }
@@ -66,6 +72,78 @@ struct VoiceView: View {
         } message: {
             Text(voice.cameraError ?? "")
         }
+    }
+
+    // MARK: Чужая демонстрация экрана
+
+    private var streamerName: String {
+        guard let uid = voice.watchingStream else { return "" }
+        return voice.users[uid]?.displayName ?? store.voiceUsers[uid]?.displayName ?? "Демонстрация"
+    }
+
+    private var streamTile: some View {
+        ZStack(alignment: .bottomLeading) {
+            StreamPlayerView(display: voice.streamDisplay)
+                .clipShape(RoundedRectangle(cornerRadius: fullscreenStream ? 0 : 14))
+
+            if !voice.streamStatus.isEmpty {
+                VStack(spacing: 8) {
+                    ProgressView().tint(.white)
+                    Text(voice.streamStatus)
+                        .font(.system(size: 13))
+                        .foregroundStyle(.white.opacity(0.85))
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+
+            HStack(spacing: 6) {
+                Text("LIVE")
+                    .font(.system(size: 10, weight: .heavy))
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 2)
+                    .background(Color.red, in: RoundedRectangle(cornerRadius: 4))
+                Text(streamerName)
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(.white)
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 5)
+            .background(Color.black.opacity(0.55), in: Capsule())
+            .padding(10)
+
+            VStack {
+                HStack(spacing: 8) {
+                    Spacer()
+                    Button {
+                        fullscreenStream.toggle()
+                    } label: {
+                        Image(systemName: fullscreenStream ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right")
+                            .font(.system(size: 13, weight: .bold))
+                            .foregroundStyle(.white)
+                            .frame(width: 32, height: 32)
+                            .background(Color.black.opacity(0.55), in: Circle())
+                    }
+                    Button {
+                        fullscreenStream = false
+                        voice.stopWatching()
+                    } label: {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 13, weight: .bold))
+                            .foregroundStyle(.white)
+                            .frame(width: 32, height: 32)
+                            .background(Color.black.opacity(0.55), in: Circle())
+                    }
+                }
+                .padding(10)
+                Spacer()
+            }
+        }
+        .frame(maxWidth: .infinity)
+        .frame(maxHeight: fullscreenStream ? .infinity : 220)
+        .frame(height: fullscreenStream ? nil : 220)
+        .padding(.horizontal, fullscreenStream ? 0 : 16)
+        .padding(.top, fullscreenStream ? 0 : 4)
     }
 
     // MARK: Своё видео с камеры
@@ -352,6 +430,9 @@ struct ParticipantTile: View {
                 .padding(8)
             }
             .contentShape(RoundedRectangle(cornerRadius: 14))
+            .onTapGesture {
+                if flag.stream && id != voice.userId { voice.watchStream(id) }
+            }
             .onLongPressGesture {
                 if user != nil { showProfile = true }
             }

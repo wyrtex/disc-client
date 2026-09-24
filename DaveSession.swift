@@ -147,6 +147,30 @@ final class DaveSession {
         return Data(out.prefix(written))
     }
 
+    /// Расшифровка целого H264-кадра (Annex-B) от пользователя: камера или демонстрация.
+    func decryptVideo(userId: String, frame: Data) -> Data? {
+        lock.lock(); defer { lock.unlock() }
+        guard let dec = decryptors[userId] else { return nil }
+        let capacity = daveDecryptorGetMaxPlaintextByteSize(dec, DAVE_MEDIA_TYPE_VIDEO, frame.count)
+        var out = [UInt8](repeating: 0, count: max(capacity, 1))
+        var written: Int = 0
+        let result: DAVEDecryptorResultCode = frame.withUnsafeBytes { (raw: UnsafeRawBufferPointer) -> DAVEDecryptorResultCode in
+            out.withUnsafeMutableBufferPointer { buf -> DAVEDecryptorResultCode in
+                daveDecryptorDecrypt(
+                    dec,
+                    DAVE_MEDIA_TYPE_VIDEO,
+                    raw.bindMemory(to: UInt8.self).baseAddress,
+                    frame.count,
+                    buf.baseAddress,
+                    capacity,
+                    &written
+                )
+            }
+        }
+        guard result == DAVE_DECRYPTOR_RESULT_CODE_SUCCESS, written > 0 else { return nil }
+        return Data(out.prefix(written))
+    }
+
     private func decryptor(for userId: String) -> DAVEDecryptorHandle? {
         if let d = decryptors[userId] { return d }
         guard let d = daveDecryptorCreate() else { return nil }
@@ -437,6 +461,7 @@ final class DaveSession {
     func userConnected(_ ids: [String]) {}
     func userDisconnected(_ id: String) {}
     func decrypt(userId: String, frame: Data) -> Data? { return nil }
+    func decryptVideo(userId: String, frame: Data) -> Data? { return nil }
     func encrypt(frame: Data, ssrc: UInt32) -> Data? { return nil }
     func encryptVideo(frame: Data, ssrc: UInt32) -> Data? { return nil }
     func setSelfSsrc(_ ssrc: UInt32) {}

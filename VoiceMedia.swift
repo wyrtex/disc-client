@@ -433,9 +433,19 @@ final class VoiceMedia {
     func sendVideoFrame(nalUnits: [Data], timestamp: UInt32) {
         queue.async { [weak self] in
             guard let self, self.videoSsrc != 0 else { return }
-            for (i, nal) in nalUnits.enumerated() {
-                let isLastNal = i == nalUnits.count - 1
-                self.sendNAL(nal, timestamp: timestamp, markLast: isLastNal)
+            // DAVE шифрует кадр целиком (в формате Annex-B, со стартовыми кодами), а не каждый
+            // NAL или RTP-пакет отдельно. Потом кадр снова делим на NAL-юниты и пакуем в RTP.
+            var frame = H264AnnexB.join(nalUnits)
+            if let dave = self.dave {
+                guard let enc = dave.encryptVideo(frame: frame, ssrc: self.videoSsrc) else {
+                    self.stats.encryptFail += 1
+                    return
+                }
+                frame = enc
+            }
+            let units = H264AnnexB.split(frame)
+            for (i, nal) in units.enumerated() {
+                self.sendNAL(nal, timestamp: timestamp, markLast: i == units.count - 1)
             }
         }
     }
@@ -458,7 +468,7 @@ final class VoiceMedia {
             let chunkEnd = payload.index(offset, offsetBy: VoiceMedia.rtpMaxPayload - 2, limitedBy: payload.endIndex) ?? payload.endIndex
             let isLastChunk = chunkEnd == payload.endIndex
             var packet = Data()
-            packet.append(0x60 | nri) // индикатор: FU-A
+            packet.append(nri | 28) // индикатор: FU-A (тип 28) с NRI исходного NAL
             var fuHeader: UInt8 = type
             if first { fuHeader |= 0x80 }
             if isLastChunk { fuHeader |= 0x40 }
@@ -471,14 +481,7 @@ final class VoiceMedia {
     }
 
     private func sendVideoPacket(_ payloadIn: Data, timestamp: UInt32, marker: Bool) {
-        var payload = payloadIn
-        if let dave {
-            guard let enc = dave.encryptVideo(frame: payloadIn, ssrc: videoSsrc) else {
-                stats.encryptFail += 1
-                return
-            }
-            payload = enc
-        }
+        let payload = payloadIn
 
         var header = [UInt8](repeating: 0, count: 12)
         header[0] = 0x80
