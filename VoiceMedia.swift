@@ -100,6 +100,14 @@ final class VoiceMedia {
     private var rtpSeq = UInt16.random(in: 0...UInt16.max)
     private var rtpTimestamp = UInt32.random(in: 0...UInt32.max)
     private var nonceCounter: UInt32 = 0
+
+    // Видео (камера): своя нумерация пакетов, свой ssrc, свой payload type.
+    private var videoSsrc: UInt32 = 0
+    var videoPayloadType: UInt8 = 101
+    private var videoRtpSeq = UInt16.random(in: 0...UInt16.max)
+    private var videoNonceCounter: UInt32 = 0
+    private static let rtpMaxPayload = 1100 // с запасом под заголовок/шифр-тег/nonce, не бьёт MTU
+
     private var muted = false
     private var speakingNow = false
     private var hangover = 0
@@ -399,6 +407,99 @@ final class VoiceMedia {
         }
         sendSpeaking?(false)
         onLocalSpeaking?(false)
+    }
+
+    // MARK: - Отправка видео (камера)
+
+    func setVideoSsrc(_ s: UInt32) {
+        queue.async { self.videoSsrc = s }
+    }
+
+    /// Отправить один кадр H264: каждый NAL-юнит отдельно, крупные — разбиваются на FU-A.
+    /// RTP-заголовок шифруется тем же способом, что и звук (через DAVE, если он есть).
+    func sendVideoFrame(nalUnits: [Data], timestamp: UInt32) {
+        queue.async { [weak self] in
+            guard let self, self.videoSsrc != 0 else { return }
+            for (i, nal) in nalUnits.enumerated() {
+                let isLastNal = i == nalUnits.count - 1
+                self.sendNAL(nal, timestamp: timestamp, markLast: isLastNal)
+            }
+        }
+    }
+
+    private func sendNAL(_ nal: Data, timestamp: UInt32, markLast: Bool) {
+        guard !nal.isEmpty else { return }
+        if nal.count <= VoiceMedia.rtpMaxPayload {
+            sendVideoPacket(nal, timestamp: timestamp, marker: markLast)
+            return
+        }
+        // FU-A: делим NAL на куски, первый байт исходного NAL несёт тип+NRI, дальше идут
+        // индикатор-байт (тип 28 = FU-A) и заголовок фрагмента (start/end/тип).
+        let header = nal[nal.startIndex]
+        let nri = header & 0x60
+        let type = header & 0x1F
+        let payload = nal.dropFirst()
+        var offset = payload.startIndex
+        var first = true
+        while offset < payload.endIndex {
+            let chunkEnd = payload.index(offset, offsetBy: VoiceMedia.rtpMaxPayload - 2, limitedBy: payload.endIndex) ?? payload.endIndex
+            let isLastChunk = chunkEnd == payload.endIndex
+            var packet = Data()
+            packet.append(0x60 | nri) // индикатор: FU-A
+            var fuHeader: UInt8 = type
+            if first { fuHeader |= 0x80 }
+            if isLastChunk { fuHeader |= 0x40 }
+            packet.append(fuHeader)
+            packet.append(payload[offset..<chunkEnd])
+            sendVideoPacket(packet, timestamp: timestamp, marker: isLastChunk && markLast)
+            offset = chunkEnd
+            first = false
+        }
+    }
+
+    private func sendVideoPacket(_ payloadIn: Data, timestamp: UInt32, marker: Bool) {
+        var payload = payloadIn
+        if let dave {
+            guard let enc = dave.encrypt(frame: payloadIn, ssrc: videoSsrc) else {
+                stats.encryptFail += 1
+                return
+            }
+            payload = enc
+        }
+
+        var header = [UInt8](repeating: 0, count: 12)
+        header[0] = 0x80
+        header[1] = (marker ? 0x80 : 0x00) | (videoPayloadType & 0x7F)
+        header[2] = UInt8(videoRtpSeq >> 8)
+        header[3] = UInt8(videoRtpSeq & 0xFF)
+        header[4] = UInt8((timestamp >> 24) & 0xFF)
+        header[5] = UInt8((timestamp >> 16) & 0xFF)
+        header[6] = UInt8((timestamp >> 8) & 0xFF)
+        header[7] = UInt8(timestamp & 0xFF)
+        header[8] = UInt8((videoSsrc >> 24) & 0xFF)
+        header[9] = UInt8((videoSsrc >> 16) & 0xFF)
+        header[10] = UInt8((videoSsrc >> 8) & 0xFF)
+        header[11] = UInt8(videoSsrc & 0xFF)
+        videoRtpSeq = videoRtpSeq &+ 1
+
+        let counter = videoNonceCounter
+        videoNonceCounter = videoNonceCounter &+ 1
+        let nonce4: [UInt8] = [
+            UInt8((counter >> 24) & 0xFF), UInt8((counter >> 16) & 0xFF),
+            UInt8((counter >> 8) & 0xFF), UInt8(counter & 0xFF)
+        ]
+        var nonceData = Data(nonce4)
+        nonceData.append(Data(count: 8))
+
+        guard let nonce = try? AES.GCM.Nonce(data: nonceData),
+              let sealed = try? AES.GCM.seal(payload, using: key, nonce: nonce, authenticating: Data(header)) else { return }
+
+        var packet = Data(header)
+        packet.append(sealed.ciphertext)
+        packet.append(sealed.tag)
+        packet.append(contentsOf: nonce4)
+        connection.send(content: packet, completion: .contentProcessed { _ in })
+        stats.sent += 1
     }
 
     private func sendFrame(_ pcm: [Float], timestamp: UInt32) {

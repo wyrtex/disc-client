@@ -44,3 +44,4 @@ targets:
         INFOPLIST_KEY_NSSpeechRecognitionUsageDescription: "Распознавание речи нужно для субтитров голосового канала"
         INFOPLIST_KEY_NSPhotoLibraryAddUsageDescription: "Сохранение фото, гифок и видео из чатов в галерею"
         INFOPLIST_KEY_NSMicrophoneUsageDescription: "Микрофон нужен для голосовых сообщений и голосовых каналов"
+        INFOPLIST_KEY_NSCameraUsageDescription: "Камера нужна, чтобы показывать себя в голосовых каналах"

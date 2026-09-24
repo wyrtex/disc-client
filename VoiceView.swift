@@ -12,6 +12,7 @@ struct VoiceView: View {
     @State private var showLog = false
     @State private var showChat = false
     @State private var volumeUser: User?
+    @State private var fullscreenSelf = false
 
     var body: some View {
         ZStack {
@@ -25,10 +26,17 @@ struct VoiceView: View {
                     Spacer()
                 } else if voice.isStage {
                     StageContent(voice: voice)
+                } else if voice.videoOn {
+                    VStack(spacing: 12) {
+                        selfVideoTile
+                        if !fullscreenSelf {
+                            participants
+                        }
+                    }
                 } else {
                     participants
                 }
-                if voice.captionsEnabled {
+                if voice.captionsEnabled && !fullscreenSelf {
                     CaptionsPanel(voice: voice)
                 }
                 if voice.isStage { stageControls } else { controls }
@@ -50,6 +58,56 @@ struct VoiceView: View {
         .sheet(item: $volumeUser) { u in
             UserProfileSheet(user: u, guildId: voice.activeGuildId, voice: voice)
         }
+        .alert("Камера", isPresented: Binding(
+            get: { voice.cameraError != nil },
+            set: { if !$0 { voice.cameraError = nil } }
+        )) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(voice.cameraError ?? "")
+        }
+    }
+
+    // MARK: Своё видео с камеры
+
+    /// Плитка как в официальном Discord: превью, имя снизу-слева, разворот на весь экран
+    /// сверху-справа. Разворот — переключатель, а не жест: включил — так и остаётся, пока не нажмёшь ещё раз.
+    private var selfVideoTile: some View {
+        ZStack(alignment: .bottomLeading) {
+            CameraPreviewView(source: voice.camera)
+                .background(Color.black)
+                .clipShape(RoundedRectangle(cornerRadius: fullscreenSelf ? 0 : 14))
+
+            Text(store.me?.displayName ?? "Ты")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(.white)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 5)
+                .background(Color.black.opacity(0.55), in: Capsule())
+                .padding(10)
+
+            HStack {
+                Spacer()
+                VStack {
+                    Button {
+                        fullscreenSelf.toggle()
+                    } label: {
+                        Image(systemName: fullscreenSelf ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right")
+                            .font(.system(size: 13, weight: .bold))
+                            .foregroundStyle(.white)
+                            .frame(width: 32, height: 32)
+                            .background(Color.black.opacity(0.55), in: Circle())
+                    }
+                    .padding(10)
+                    Spacer()
+                }
+            }
+        }
+        .frame(maxWidth: .infinity)
+        .frame(maxHeight: fullscreenSelf ? .infinity : 220)
+        .frame(height: fullscreenSelf ? nil : 220)
+        .padding(.horizontal, fullscreenSelf ? 0 : 16)
+        .padding(.top, fullscreenSelf ? 0 : 4)
     }
 
     // MARK: Шапка
@@ -183,7 +241,7 @@ struct VoiceView: View {
     // MARK: Кнопки управления
 
     private var controls: some View {
-        HStack(spacing: 12) {
+        HStack(spacing: 8) {
             controlButton(
                 icon: (voice.muted || voice.deafened) ? "mic.slash.fill" : "mic.fill",
                 active: voice.muted || voice.deafened
@@ -202,6 +260,16 @@ struct VoiceView: View {
                 showAudio = true
             }
 
+            controlButton(icon: voice.videoOn ? "video.fill" : "video.slash.fill", active: voice.videoOn) {
+                voice.toggleCamera()
+            }
+
+            if voice.videoOn {
+                controlButton(icon: "arrow.triangle.2.circlepath.camera.fill", active: false) {
+                    voice.flipCamera()
+                }
+            }
+
             Button {
                 voice.leave()
                 onMinimize()
@@ -213,7 +281,7 @@ struct VoiceView: View {
                     .background(Color.red, in: Circle())
             }
         }
-        .padding(.horizontal, 20)
+        .padding(.horizontal, 12)
         .padding(.top, 10)
         .padding(.bottom, 24)
         .frame(maxWidth: .infinity)

@@ -39,6 +39,9 @@ final class VoiceGateway {
     private let audio: VoiceAudio
     private let micAllowed: Bool
     private var ownSsrc: UInt32 = 0
+    private var readyVideoSsrc: UInt32?
+    private var readyVideoRtxSsrc: UInt32?
+    private var videoSsrc: UInt32 = 0
     private var muted = false
     private var deafened = false
 
@@ -224,15 +227,15 @@ final class VoiceGateway {
     }
 
     private func identify() {
-        var d: [String: Any] = [
+        let d: [String: Any] = [
             "server_id": serverId,
             "user_id": userId,
             "session_id": sessionId,
             "token": token,
-            "max_dave_protocol_version": daveVersion
+            "max_dave_protocol_version": daveVersion,
+            "video": true
         ]
-        if videoProbe { d["video"] = true }
-        log("Отправляю Identify (op 0), DAVE v\(daveVersion)\(videoProbe ? ", video: true (диагностика)" : "")")
+        log("Отправляю Identify (op 0), DAVE v\(daveVersion), video: true")
         send(["op": 0, "d": d])
     }
 
@@ -261,6 +264,12 @@ final class VoiceGateway {
         dave?.setSelfSsrc(ownSsrc)
         log("op 2 Ready: ssrc \(ssrc), UDP \(ip):\(port)")
         log("Режимы шифрования: \(modes.joined(separator: ", "))")
+        // Discord может сразу выдать нам ssrc под видео (streams[0]); если нет — придумаем свой при старте камеры.
+        if let streams = d["streams"] as? [[String: Any]], let first = streams.first {
+            if let vs = first["ssrc"] as? Int { readyVideoSsrc = UInt32(truncatingIfNeeded: vs) }
+            if let rtx = first["rtx_ssrc"] as? Int { readyVideoRtxSsrc = UInt32(truncatingIfNeeded: rtx) }
+            log("Ready: Discord выдал ssrc для видео заранее: \(readyVideoSsrc.map(String.init) ?? "нет")")
+        }
         discover(ip: ip, port: port, ssrc: UInt32(truncatingIfNeeded: ssrc), modes: modes)
     }
 
@@ -328,21 +337,16 @@ final class VoiceGateway {
         log("Выбираю режим шифрования: \(mode)")
         let data: [String: Any] = ["address": address, "port": port, "mode": mode]
         var d: [String: Any] = ["protocol": "udp", "data": data]
-        if videoProbe {
-            // Диагностика видео: сообщаем серверу, что умеем принимать H264/VP8.
-            d["address"] = address
-            d["port"] = port
-            d["mode"] = mode
-            d["codecs"] = [
-                ["name": "opus", "type": "audio", "priority": 1000, "payload_type": 120],
-                ["name": "H264", "type": "video", "priority": 1000, "payload_type": 101,
-                 "rtx_payload_type": 102, "encode": false, "decode": true],
-                ["name": "VP8", "type": "video", "priority": 2000, "payload_type": 103,
-                 "rtx_payload_type": 104, "encode": false, "decode": true]
-            ]
-            d["experiments"] = [String]()
-            log("Диагностика видео: в Select Protocol добавлены кодеки H264 и VP8")
-        }
+        // H264 на отправку (наша камера) всегда, плюс приём — если включена видео-диагностика.
+        d["address"] = address
+        d["port"] = port
+        d["mode"] = mode
+        d["codecs"] = [
+            ["name": "opus", "type": "audio", "priority": 1000, "payload_type": 120],
+            ["name": "H264", "type": "video", "priority": 1000, "payload_type": 101,
+             "rtx_payload_type": 102, "encode": true, "decode": videoProbe]
+        ]
+        d["experiments"] = [String]()
         send(["op": 1, "d": d])
     }
 
@@ -388,6 +392,11 @@ final class VoiceGateway {
                 m.setSsrc(ssrc, user: uid)
                 audio.setVolume(volumeForUser?(uid) ?? 1, forUser: uid)
             }
+            if let vs = readyVideoSsrc {
+                videoSsrc = vs
+                m.setVideoSsrc(vs)
+            }
+            m.videoPayloadType = 101
             m.setMuted(muted || deafened)
             audio.setDeafened(deafened)
             media = m
@@ -432,6 +441,52 @@ final class VoiceGateway {
         default:
             log("Бинарное сообщение op \(op), \(payload.count) байт")
         }
+    }
+
+    // MARK: Видео (камера)
+
+    /// Включить свою камеру: придумываем ssrc (если Discord не выдал его заранее в Ready),
+    /// регистрируем поток через op 12 и с этого момента пересылаем кадры в VoiceMedia.
+    func startVideo() {
+        if videoSsrc == 0 {
+            videoSsrc = readyVideoSsrc ?? (ownSsrc &+ 1)
+        }
+        let rtxSsrc = readyVideoRtxSsrc ?? (videoSsrc &+ 1)
+        media?.setVideoSsrc(videoSsrc)
+        let stream: [String: Any] = [
+            "type": "video",
+            "rid": "100",
+            "quality": 100,
+            "active": true,
+            "ssrc": Int(videoSsrc),
+            "rtx_ssrc": Int(rtxSsrc)
+        ]
+        let d: [String: Any] = [
+            "audio_ssrc": Int(ownSsrc),
+            "video_ssrc": Int(videoSsrc),
+            "rtx_ssrc": Int(rtxSsrc),
+            "streams": [stream]
+        ]
+        send(["op": 12, "d": d])
+        log("Камера: включена, ssrc \(videoSsrc), отправил op 12")
+    }
+
+    func stopVideo() {
+        guard videoSsrc != 0 else { return }
+        let stream: [String: Any] = [
+            "type": "video", "rid": "100", "quality": 100,
+            "active": false, "ssrc": Int(videoSsrc), "rtx_ssrc": Int(readyVideoRtxSsrc ?? (videoSsrc &+ 1))
+        ]
+        let d: [String: Any] = [
+            "audio_ssrc": Int(ownSsrc), "video_ssrc": Int(videoSsrc),
+            "rtx_ssrc": Int(readyVideoRtxSsrc ?? (videoSsrc &+ 1)), "streams": [stream]
+        ]
+        send(["op": 12, "d": d])
+        log("Камера: выключена")
+    }
+
+    func sendVideoFrame(nalUnits: [Data], timestamp: UInt32) {
+        media?.sendVideoFrame(nalUnits: nalUnits, timestamp: timestamp)
     }
 
     private func send(_ obj: [String: Any]) {
@@ -508,6 +563,9 @@ final class VoiceSpike: ObservableObject {
     @Published var muted = false
     @Published var deafened = false
     @Published var speakerOn = true
+    @Published var videoOn = false
+    @Published var cameraError: String?
+    let camera = CameraSource()
     @Published var vadThreshold: Double = -45 {
         didSet { shared.vad = vadThreshold }
     }
@@ -560,6 +618,7 @@ final class VoiceSpike: ObservableObject {
         transcriber.onStatus = { [weak self] s in
             Task { @MainActor in self?.captionStatus = s }
         }
+        setupCamera()
     }
 
     /// Когда последний раз слышали пользователя (читается из TimelineView, поэтому не @Published).
@@ -649,7 +708,7 @@ final class VoiceSpike: ObservableObject {
         var d: [String: Any] = [
             "self_mute": muted || deafened,
             "self_deaf": deafened,
-            "self_video": false
+            "self_video": videoOn
         ]
         d["guild_id"] = guildId ?? NSNull()
         d["channel_id"] = channelId ?? NSNull()
@@ -698,7 +757,20 @@ final class VoiceSpike: ObservableObject {
         }
     }
 
-    func leave(silent: Bool = false) {
+    private func setupCamera() {
+        camera.onFrame = { [weak self] frame in
+            self?.gateway?.sendVideoFrame(nalUnits: frame.nalUnits, timestamp: frame.timestamp)
+        }
+        camera.onError = { [weak self] msg in
+            Task { @MainActor in self?.cameraError = msg }
+        }
+    }
+
+        func leave(silent: Bool = false) {
+        if videoOn {
+            videoOn = false
+            camera.stop()
+        }
         gateway?.stop()
         gateway = nil
         if activeChannelId != nil {
@@ -832,6 +904,34 @@ final class VoiceSpike: ObservableObject {
     }
 
     // MARK: Микрофон, наушники, маршрут звука
+
+    /// Включить/выключить свою камеру. Сама съёмка и превью работают независимо от того,
+    /// принял ли Discord поток — интерфейс не ждёт подтверждения.
+    func toggleCamera() {
+        guard isConnected else { return }
+        if videoOn {
+            videoOn = false
+            camera.stop()
+            gateway?.stopVideo()
+            _ = sendGateway?(voiceStatePacket(guildId: guildId, channelId: activeChannelId))
+            return
+        }
+        camera.requestAccess { [weak self] granted in
+            guard let self else { return }
+            guard granted else {
+                self.cameraError = "Нет доступа к камере. Разреши в Настройки → DiscClient."
+                return
+            }
+            self.videoOn = true
+            self.camera.start()
+            self.gateway?.startVideo()
+            _ = self.sendGateway?(self.voiceStatePacket(guildId: self.guildId, channelId: self.activeChannelId))
+        }
+    }
+
+    func flipCamera() {
+        camera.flip()
+    }
 
     func toggleMute() {
         if deafened {
