@@ -460,7 +460,7 @@ final class VoiceMedia {
     private func sendVideoPacket(_ payloadIn: Data, timestamp: UInt32, marker: Bool) {
         var payload = payloadIn
         if let dave {
-            guard let enc = dave.encrypt(frame: payloadIn, ssrc: videoSsrc) else {
+            guard let enc = dave.encryptVideo(frame: payloadIn, ssrc: videoSsrc) else {
                 stats.encryptFail += 1
                 return
             }

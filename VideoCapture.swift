@@ -25,7 +25,7 @@ final class CameraSource: NSObject {
     private var output: AVCaptureVideoDataOutput?
     private var compressionSession: VTCompressionSession?
     private var currentInput: AVCaptureDeviceInput?
-    private(set) var position: AVCaptureDevice.Position = .front
+    private(set) var position: AVCaptureDevice.Position = .back
     private var startTime: CMTime?
     private var forceKeyFrame = false
     private var sps: Data?
@@ -53,7 +53,7 @@ final class CameraSource: NSObject {
         }
     }
 
-    func start(position: AVCaptureDevice.Position = .front) {
+    func start(position: AVCaptureDevice.Position = .back) {
         queue.async { [weak self] in
             self?.startInternal(position: position)
         }

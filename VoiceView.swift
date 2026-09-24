@@ -140,6 +140,26 @@ struct VoiceView: View {
                 .foregroundStyle(voice.encrypted ? Theme.green : Theme.muted)
             }
             Spacer()
+            if voice.videoOn {
+                Button {
+                    voice.flipCamera()
+                } label: {
+                    Image(systemName: "arrow.triangle.2.circlepath.camera.fill")
+                        .font(.system(size: 16))
+                        .foregroundStyle(Theme.muted)
+                        .frame(width: 40, height: 40)
+                        .background(Theme.input, in: Circle())
+                }
+            }
+            Button {
+                showAudio = true
+            } label: {
+                Image(systemName: voice.speakerOn ? "speaker.wave.3.fill" : "ear.fill")
+                    .font(.system(size: 16))
+                    .foregroundStyle(Theme.muted)
+                    .frame(width: 40, height: 40)
+                    .background(Theme.input, in: Circle())
+            }
             Button {
                 showChat = true
             } label: {
@@ -256,18 +276,8 @@ struct VoiceView: View {
                 voice.setCaptions(!voice.captionsEnabled)
             }
 
-            controlButton(icon: voice.speakerOn ? "speaker.wave.3.fill" : "ear.fill", active: false) {
-                showAudio = true
-            }
-
             controlButton(icon: voice.videoOn ? "video.fill" : "video.slash.fill", active: voice.videoOn) {
                 voice.toggleCamera()
-            }
-
-            if voice.videoOn {
-                controlButton(icon: "arrow.triangle.2.circlepath.camera.fill", active: false) {
-                    voice.flipCamera()
-                }
             }
 
             Button {

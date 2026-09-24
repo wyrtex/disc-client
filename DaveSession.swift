@@ -51,11 +51,19 @@ final class DaveSession {
         if let h = handle { daveSessionDestroy(h) }
     }
 
-    /// Наш SSRC (из op 2 Ready): нужен шифратору.
+    /// Наш SSRC для звука (из op 2 Ready): нужен шифратору, привязываем к кодеку Opus.
     func setSelfSsrc(_ ssrc: UInt32) {
         lock.lock(); defer { lock.unlock() }
         selfSsrc = ssrc
         if let e = encryptor { daveEncryptorAssignSsrcToCodec(e, ssrc, DAVE_CODEC_OPUS) }
+    }
+
+    /// SSRC своей камеры: без этой привязки шифратор не знает, что это за поток,
+    /// и encrypt(...) для этого ssrc всегда возвращает ошибку (это и было причиной,
+    /// что видео "не уходило" — шифрование валилось на каждом кадре).
+    func setSelfVideoSsrc(_ ssrc: UInt32) {
+        lock.lock(); defer { lock.unlock() }
+        if let e = encryptor { daveEncryptorAssignSsrcToCodec(e, ssrc, DAVE_CODEC_H264) }
     }
 
     /// Шифрование кадра Opus перед отправкой. nil, если ключ ещё не готов.
@@ -72,6 +80,36 @@ final class DaveSession {
                 daveEncryptorEncrypt(
                     enc,
                     DAVE_MEDIA_TYPE_AUDIO,
+                    ssrc,
+                    raw.bindMemory(to: UInt8.self).baseAddress,
+                    frame.count,
+                    buf.baseAddress,
+                    capacity,
+                    &written
+                )
+            }
+        }
+        guard result == DAVE_ENCRYPTOR_RESULT_CODE_SUCCESS, written > 0 else { return nil }
+        return Data(out.prefix(written))
+    }
+
+    /// То же самое, но для H264 NAL-юнита с камеры — отдельный медиатип, у видео своя схема
+    /// (какая часть кадра остаётся открытой для NAL-заголовков). Раньше эта функция просто
+    /// отсутствовала, и видео пробовало шифроваться как звук — с ssrc, который шифратор вообще
+    /// не знал (не был привязан к кодеку), поэтому падало на каждом кадре.
+    func encryptVideo(frame: Data, ssrc: UInt32) -> Data? {
+        lock.lock(); defer { lock.unlock() }
+        guard let enc = encryptor else { return nil }
+        if daveEncryptorIsPassthroughMode(enc) { return frame }
+        guard daveEncryptorHasKeyRatchet(enc) else { return nil }
+        let capacity = daveEncryptorGetMaxCiphertextByteSize(enc, DAVE_MEDIA_TYPE_VIDEO, frame.count)
+        var out = [UInt8](repeating: 0, count: max(capacity, 1))
+        var written: Int = 0
+        let result: DAVEEncryptorResultCode = frame.withUnsafeBytes { (raw: UnsafeRawBufferPointer) -> DAVEEncryptorResultCode in
+            out.withUnsafeMutableBufferPointer { buf -> DAVEEncryptorResultCode in
+                daveEncryptorEncrypt(
+                    enc,
+                    DAVE_MEDIA_TYPE_VIDEO,
                     ssrc,
                     raw.bindMemory(to: UInt8.self).baseAddress,
                     frame.count,
@@ -400,7 +438,9 @@ final class DaveSession {
     func userDisconnected(_ id: String) {}
     func decrypt(userId: String, frame: Data) -> Data? { return nil }
     func encrypt(frame: Data, ssrc: UInt32) -> Data? { return nil }
+    func encryptVideo(frame: Data, ssrc: UInt32) -> Data? { return nil }
     func setSelfSsrc(_ ssrc: UInt32) {}
+    func setSelfVideoSsrc(_ ssrc: UInt32) {}
     func onSessionDescription(version: Int) {}
     func onPrepareTransition(id: Int, version: Int) {}
     func onExecuteTransition(id: Int) {}

@@ -453,6 +453,9 @@ final class VoiceGateway {
         }
         let rtxSsrc = readyVideoRtxSsrc ?? (videoSsrc &+ 1)
         media?.setVideoSsrc(videoSsrc)
+        // Без этой привязки шифратор не знает про наш видео-ssrc и шифрование кадров с камеры
+        // всегда проваливается — на телефоне видно было бы то же превью, но пусто у Discord.
+        dave?.setSelfVideoSsrc(videoSsrc)
         let stream: [String: Any] = [
             "type": "video",
             "rid": "100",
