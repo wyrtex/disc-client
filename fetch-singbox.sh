@@ -62,18 +62,28 @@ rm -rf "$WORKDIR"
 ls Vendor/Libbox.xcframework
 echo "Libbox.xcframework собран (теги: ${TAGS})" >> "$GITHUB_STEP_SUMMARY"
 
-# Диагностика: печатаем настоящие объявления из сгенерированного заголовка, чтобы не гадать
-# вслепую про имена и сигнатуры методов. set -e тут временно выключен: grep без совпадений
-# сам по себе не должен обрывать сборку, которая к этому моменту уже успешно завершилась.
+# Диагностика: печатаем настоящие объявления из сгенерированных заголовков, чтобы не гадать
+# вслепую про имена и сигнатуры методов. Libbox.h — просто обёртка с двумя #include, реальные
+# декларации лежат в Libbox.objc.h (и часть общих типов в Universe.objc.h) в той же папке Headers.
+# set -e тут временно выключен: grep без совпадений сам по себе не должен обрывать сборку,
+# которая к этому моменту уже успешно завершилась.
 set +e
-HEADER=$(find Vendor/Libbox.xcframework -name "Libbox.h" -path "*ios-arm64/*" 2>/dev/null | head -1)
-if [ -z "$HEADER" ]; then
-  HEADER=$(find Vendor/Libbox.xcframework -name "Libbox.h" 2>/dev/null | head -1)
+HDIR=$(find Vendor/Libbox.xcframework -type d -name Headers -path "*ios-arm64/*" 2>/dev/null | head -1)
+if [ -z "$HDIR" ]; then
+  HDIR=$(find Vendor/Libbox.xcframework -type d -name Headers 2>/dev/null | head -1)
 fi
+MAIN_H="${HDIR}/Libbox.objc.h"
 {
-  echo "### Настоящие объявления из Libbox.h (для интеграции)"
-  if [ -n "$HEADER" ]; then
-    echo "Файл: ${HEADER}, всего строк: $(wc -l < "$HEADER" | tr -d ' ')"
+  echo "### Настоящие объявления из Libbox.objc.h (для интеграции)"
+  if [ -n "$HDIR" ]; then
+    echo "Папка Headers: ${HDIR}"
+    echo "Файлы внутри:"
+    echo '```'
+    ls -la "$HDIR" 2>/dev/null
+    echo '```'
+  fi
+  if [ -f "$MAIN_H" ]; then
+    echo "Файл: ${MAIN_H}, всего строк: $(wc -l < "$MAIN_H" | tr -d ' ')"
     echo '```objc'
     grep -n -A2 -B2 -i \
       -e "PlatformInterface" \
@@ -87,17 +97,19 @@ fi
       -e "TunOptions" \
       -e "Notification" \
       -e "WIFIState" \
-      "$HEADER" 2>/dev/null | head -500
-    if [ -z "$(grep -i -e PlatformInterface -e BoxService "$HEADER" 2>/dev/null)" ]; then
-      echo "(целевые шаблоны не нашлись — вот первые 200 строк файла целиком)"
-      head -200 "$HEADER"
+      "$MAIN_H" 2>/dev/null | head -600
+    if [ -z "$(grep -i -e PlatformInterface -e BoxService "$MAIN_H" 2>/dev/null)" ]; then
+      echo "(целевые шаблоны не нашлись — вот первые 300 строк файла целиком)"
+      head -300 "$MAIN_H"
     fi
     echo '```'
   else
-    echo "Libbox.h не нашёлся внутри framework. Список того, что реально лежит внутри:"
+    echo "Libbox.objc.h не нашёлся по ожидаемому пути (${MAIN_H})."
+    echo "Всё содержимое framework:"
     echo '```'
-    find Vendor/Libbox.xcframework -maxdepth 6 2>/dev/null
+    find Vendor/Libbox.xcframework -maxdepth 8 2>/dev/null
     echo '```'
   fi
 } >> "$GITHUB_STEP_SUMMARY"
+set -e
 set -e
