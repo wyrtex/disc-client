@@ -122,6 +122,9 @@ final class VoiceMedia {
         var played = 0
         var sent = 0
         var encryptFail = 0
+        var udpOut = 0
+        var udpFail = 0
+        var udpBytes = 0
     }
     private var stats = Stats()
     private var lastReported = Stats()
@@ -191,7 +194,24 @@ final class VoiceMedia {
         var counter = keepaliveCounter.bigEndian
         keepaliveCounter &+= 1
         let data = Data(bytes: &counter, count: 8)
-        connection.send(content: data, completion: .contentProcessed { _ in })
+        udpSend(data)
+    }
+
+    /// Единая точка отправки в сеть — считает, сколько реально ушло и не вернула ли сеть ошибку.
+    /// Так видно, доходит ли трафик до сервера, даже когда в канале никого нет.
+    private func udpSend(_ data: Data) {
+        let n = data.count
+        connection.send(content: data, completion: .contentProcessed { [weak self] error in
+            self?.queue.async {
+                guard let self else { return }
+                if error == nil {
+                    self.stats.udpOut += 1
+                    self.stats.udpBytes += n
+                } else {
+                    self.stats.udpFail += 1
+                }
+            }
+        })
     }
 
     func stop() {
@@ -253,6 +273,7 @@ final class VoiceMedia {
         guard stats != lastReported else { return }
         lastReported = stats
         log?("Звук: принято \(stats.received), проиграно \(stats.played), отправлено \(stats.sent). Ошибки: транспорт \(stats.transportFail), SSRC \(stats.unknownSsrc), DAVE \(stats.daveFail), Opus \(stats.opusFail), шифрование \(stats.encryptFail)")
+        log?("Сеть UDP: ушло в сеть \(stats.udpOut) пакетов (\(stats.udpBytes) байт), ошибок отправки \(stats.udpFail). Если больше 0 — трафик до сервера идёт")
     }
 
     private func handlePacket(_ packet: Data) {
@@ -514,7 +535,7 @@ final class VoiceMedia {
         packet.append(sealed.ciphertext)
         packet.append(sealed.tag)
         packet.append(contentsOf: nonce4)
-        connection.send(content: packet, completion: .contentProcessed { _ in })
+        udpSend(packet)
         stats.sent += 1
     }
 
@@ -568,7 +589,7 @@ final class VoiceMedia {
         packet.append(sealed.ciphertext)
         packet.append(sealed.tag)
         packet.append(contentsOf: nonce4)
-        connection.send(content: packet, completion: .contentProcessed { _ in })
+        udpSend(packet)
         stats.sent += 1
     }
 }
