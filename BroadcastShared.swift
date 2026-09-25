@@ -25,6 +25,40 @@ enum BroadcastShared {
 
     static var defaults: UserDefaults? { UserDefaults(suiteName: appGroup) }
 
+    /// Общий файл-журнал расширения: расширение не может писать в наш экранный лог напрямую
+    /// (это другой процесс), поэтому пишем строки в файл App Group, а приложение их читает.
+    static func logURL() -> URL? {
+        FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: appGroup)?
+            .appendingPathComponent("ext.log")
+    }
+
+    /// Дозаписать строку в журнал расширения. Работает даже если App Group недоступна —
+    /// тогда просто ничего не пишет (и это само по себе будет сигналом).
+    static func extLog(_ line: String) {
+        guard let url = logURL() else { return }
+        let stamp = ISO8601DateFormatter().string(from: Date())
+        let entry = "\(stamp)  \(line)\n"
+        if let data = entry.data(using: .utf8) {
+            if let h = try? FileHandle(forWritingTo: url) {
+                h.seekToEndOfFile()
+                h.write(data)
+                try? h.close()
+            } else {
+                try? entry.write(to: url, atomically: true, encoding: .utf8)
+            }
+        }
+    }
+
+    static func clearExtLog() {
+        guard let url = logURL() else { return }
+        try? "".write(to: url, atomically: true, encoding: .utf8)
+    }
+
+    static func readExtLog() -> String {
+        guard let url = logURL(), let s = try? String(contentsOf: url, encoding: .utf8) else { return "" }
+        return s
+    }
+
     static func socketURL() -> URL? {
         FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: appGroup)?
             .appendingPathComponent(socketName)

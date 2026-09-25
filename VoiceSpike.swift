@@ -1285,7 +1285,9 @@ final class VoiceSpike: ObservableObject {
         BroadcastShared.defaults?.set(blur, forKey: BroadcastShared.keyBlur)
         BroadcastShared.defaults?.set(record, forKey: BroadcastShared.keyRecord)
         blurOn = blur
+        BroadcastShared.clearExtLog()
         setupBroadcastListeners()
+        startExtLogPolling()
         add("[видео/демо] Демонстрация подготовлена: качество \(quality.rawValue), звук \(streamAudio), блюр \(blur), запись \(record)")
     }
 
@@ -1362,7 +1364,37 @@ final class VoiceSpike: ObservableObject {
         broadcastRtc = nil
         broadcastEndpoint = nil
         broadcastToken = nil
+        flushExtLog()
+        // Ещё раз через секунду — вдруг расширение допишет строку про причину остановки.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in self?.flushExtLog() }
+        extLogTimer?.invalidate()
+        extLogTimer = nil
         add("[видео/демо] Демонстрация остановлена")
+    }
+
+    private var extLogTimer: Timer?
+    private var extLogSeen = 0
+
+    /// Периодически подтягиваем строки журнала расширения в наш экранный лог, чтобы видеть,
+    /// на каком шаге расширение падает (оно пишет их в общий файл App Group).
+    private func startExtLogPolling() {
+        extLogSeen = 0
+        extLogTimer?.invalidate()
+        extLogTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.flushExtLog() }
+        }
+    }
+
+    private func flushExtLog() {
+        let full = BroadcastShared.readExtLog()
+        guard !full.isEmpty else { return }
+        let lines = full.split(separator: "\n")
+        if lines.count > extLogSeen {
+            for line in lines[extLogSeen...] {
+                add("[расширение] \(line)")
+            }
+            extLogSeen = lines.count
+        }
     }
 
     func setBlur(_ on: Bool) {

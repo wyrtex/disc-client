@@ -19,6 +19,7 @@ class SampleHandler: RPBroadcastSampleHandler {
     private var blurOn: NSObjectProtocol?
     private var blurOff: NSObjectProtocol?
     private var blurToggle: NSObjectProtocol?
+    private var firstFrameSent = false
 
     private var width = 0
     private var height = 0
@@ -37,10 +38,18 @@ class SampleHandler: RPBroadcastSampleHandler {
     private var minFrameInterval: Double = 1.0 / 30.0
 
     override func broadcastStarted(withSetupInfo setupInfo: [String: NSObject]?) {
+        BroadcastShared.clearExtLog()
+        // Проверяем сразу, доступна ли общая папка — если нет, значит App Group не подписался.
+        if BroadcastShared.logURL() == nil {
+            BroadcastShared.extLog("СТАРТ, но общая папка App Group НЕдоступна — расширение подписано без группы")
+        } else {
+            BroadcastShared.extLog("broadcastStarted: расширение запущено, App Group доступна")
+        }
         blur = BroadcastShared.blur
         minFrameInterval = 1.0 / Double(max(15, BroadcastShared.quality.fps))
         socket = LocalSocketClient()
         socket?.connect()
+        BroadcastShared.extLog("сокет к приложению: попытка подключения")
         blurOn = BroadcastShared.observe(BroadcastShared.notifyBlurOn) { [weak self] in self?.setBlur(true) }
         blurOff = BroadcastShared.observe(BroadcastShared.notifyBlurOff) { [weak self] in self?.setBlur(false) }
         blurToggle = BroadcastShared.observe(BroadcastShared.notifyBlurToggle) { [weak self] in
@@ -48,9 +57,11 @@ class SampleHandler: RPBroadcastSampleHandler {
             self.setBlur(!self.blur)
         }
         BroadcastShared.post(BroadcastShared.notifyStarted)
+        BroadcastShared.extLog("послал сигнал 'начал' приложению")
     }
 
     override func broadcastFinished() {
+        BroadcastShared.extLog("broadcastFinished: система остановила расширение (это может быть из-за памяти)")
         BroadcastShared.post(BroadcastShared.notifyStopped)
         if let e = encoder { VTCompressionSessionInvalidate(e) }
         encoder = nil
@@ -65,10 +76,13 @@ class SampleHandler: RPBroadcastSampleHandler {
     }
 
     override func processSampleBuffer(_ sampleBuffer: CMSampleBuffer, with sampleBufferType: RPSampleBufferType) {
-        guard sampleBufferType == .video else { return } // звук вернём после стабилизации памяти
+        guard sampleBufferType == .video else { return }
         guard let source = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
         let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
-        if startTime == nil { startTime = pts }
+        if startTime == nil {
+            startTime = pts
+            BroadcastShared.extLog("первый видеокадр получен: \(CVPixelBufferGetWidth(source))x\(CVPixelBufferGetHeight(source))")
+        }
 
         // Пропускаем лишние кадры, чтобы не переполнять память очередью.
         if lastEncodedPTS != .zero {
@@ -194,6 +208,10 @@ class SampleHandler: RPBroadcastSampleHandler {
             offset += nalLen
         }
         socket?.send(BroadcastWire.frame(type: BroadcastWire.typeVideo, annexb))
+        if !firstFrameSent {
+            firstFrameSent = true
+            BroadcastShared.extLog("первый кадр закодирован и отправлен в приложение (\(annexb.count) байт)")
+        }
     }
 
     private func extractParams(_ fmt: CMFormatDescription) {
