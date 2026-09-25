@@ -23,6 +23,17 @@ struct DiscApp: App {
                         await translator.translateCaption(text, from: from, to: to)
                     }
                 }
+                .onOpenURL { url in
+                    // Управление блюром из приложения «Команды»:
+                    // discclient://blur/on | off | toggle
+                    guard url.scheme == "discclient", url.host == "blur" else { return }
+                    let action = url.pathComponents.last ?? "toggle"
+                    switch action {
+                    case "on": store.voice.setBlur(true)
+                    case "off": store.voice.setBlur(false)
+                    default: store.voice.toggleBlur()
+                    }
+                }
                 .onChange(of: scenePhase) { _, phase in
                     switch phase {
                     case .active:

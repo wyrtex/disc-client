@@ -2,7 +2,7 @@ name: DiscClient
 options:
   bundleIdPrefix: com.example
   deploymentTarget:
-    iOS: "18.0"
+    iOS: '18.0'
 packages:
   SwiftOGG:
     url: https://github.com/element-hq/swift-ogg
@@ -14,34 +14,74 @@ targets:
   DiscClient:
     type: application
     platform: iOS
-    sources: [Sources]
+    sources:
+    - path: Sources
+      excludes:
+      - SampleHandler.swift
     dependencies:
-      - package: SwiftOGG
-        product: SwiftOGG
-      - package: YbridOpus
-        product: YbridOpus
-      - sdk: libbz2.tbd
-      - framework: Vendor/SherpaOnnxC.xcframework
-        embed: true
-        codeSign: true
+    - package: SwiftOGG
+      product: SwiftOGG
+    - package: YbridOpus
+      product: YbridOpus
+    - sdk: libbz2.tbd
+    - framework: Vendor/SherpaOnnxC.xcframework
+      embed: true
+      codeSign: true
+    - target: BroadcastExtension
     configFiles:
       Debug: Vendor/dave-link.xcconfig
       Release: Vendor/dave-link.xcconfig
     settings:
       base:
-        SWIFT_VERSION: "5.0"
+        SWIFT_VERSION: '5.0'
         SWIFT_OBJC_BRIDGING_HEADER: DiscClient-Bridging-Header.h
         PRODUCT_BUNDLE_IDENTIFIER: com.example.discclient
-        MARKETING_VERSION: "0.1"
-        CURRENT_PROJECT_VERSION: "1"
-        TARGETED_DEVICE_FAMILY: "1"
-        GENERATE_INFOPLIST_FILE: YES
+        MARKETING_VERSION: '0.1'
+        CURRENT_PROJECT_VERSION: '1'
+        TARGETED_DEVICE_FAMILY: '1'
+        GENERATE_INFOPLIST_FILE: true
         INFOPLIST_KEY_CFBundleDisplayName: DiscClient
-        INFOPLIST_KEY_UILaunchScreen_Generation: YES
-        INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES
-        INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone: "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight"
+        INFOPLIST_KEY_UILaunchScreen_Generation: true
+        INFOPLIST_KEY_UIApplicationSceneManifest_Generation: true
+        INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone: UIInterfaceOrientationPortrait
+          UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight
         INFOPLIST_KEY_UIBackgroundModes: audio
-        INFOPLIST_KEY_NSSpeechRecognitionUsageDescription: "Распознавание речи нужно для субтитров голосового канала"
-        INFOPLIST_KEY_NSPhotoLibraryAddUsageDescription: "Сохранение фото, гифок и видео из чатов в галерею"
-        INFOPLIST_KEY_NSMicrophoneUsageDescription: "Микрофон нужен для голосовых сообщений и голосовых каналов"
-        INFOPLIST_KEY_NSCameraUsageDescription: "Камера нужна, чтобы показывать себя в голосовых каналах"
+        INFOPLIST_KEY_NSSpeechRecognitionUsageDescription: Распознавание речи нужно
+          для субтитров голосового канала
+        INFOPLIST_KEY_NSPhotoLibraryAddUsageDescription: Сохранение фото, гифок и
+          видео из чатов в галерею
+        INFOPLIST_KEY_NSMicrophoneUsageDescription: Микрофон нужен для голосовых сообщений
+          и голосовых каналов
+        INFOPLIST_KEY_NSCameraUsageDescription: Камера нужна, чтобы показывать себя
+          в голосовых каналах
+        CODE_SIGN_ENTITLEMENTS: DiscClient.entitlements
+    info:
+      path: DiscClient-Info.plist
+      properties:
+        CFBundleURLTypes:
+        - CFBundleURLSchemes:
+          - discclient
+  BroadcastExtension:
+    type: app-extension
+    platform: iOS
+    sources:
+    - path: Sources/SampleHandler.swift
+    - path: Sources/LocalSocket.swift
+    - path: Sources/BroadcastShared.swift
+    settings:
+      base:
+        SWIFT_VERSION: '5.0'
+        PRODUCT_BUNDLE_IDENTIFIER: com.example.discclient.broadcast
+        MARKETING_VERSION: '0.1'
+        CURRENT_PROJECT_VERSION: '1'
+        TARGETED_DEVICE_FAMILY: '1'
+        GENERATE_INFOPLIST_FILE: 'YES'
+        CODE_SIGN_ENTITLEMENTS: BroadcastExtension.entitlements
+        INFOPLIST_KEY_CFBundleDisplayName: DiscClient Stream
+    info:
+      path: BroadcastExtension-Info.plist
+      properties:
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.broadcast-services-upload
+          NSExtensionPrincipalClass: SampleHandler
+          RPBroadcastProcessMode: RPBroadcastProcessModeSampleBuffer

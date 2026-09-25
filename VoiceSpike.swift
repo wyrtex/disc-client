@@ -40,6 +40,9 @@ final class VoiceGateway {
     private let viewer: Bool
     var streamDisplay: StreamDisplay?
     var onFirstVideoFrame: (() -> Void)?
+    /// true = это соединение отправляет НАШУ демонстрацию экрана.
+    var broadcastSender = false
+    private var screenStarted = false
     private var streamRx: StreamVideoReceiver?
     private var knownVideo: [UInt32: (user: String, rtx: UInt32?)] = [:]
     private let audio: VoiceAudio
@@ -407,6 +410,16 @@ final class VoiceGateway {
             dave?.onSessionDescription(version: daveVer ?? 0)
         }
 
+        if broadcastSender {
+            // Мы отправляем экран: включаем видеопоток и начинаем слать кадры (их даёт VoiceSpike).
+            startVideo()
+            // Флаг «speaking» с битом 2 = идёт видео/демонстрация.
+            send(["op": 5, "d": ["speaking": 2, "delay": 0, "ssrc": Int(ownSsrc)]])
+            screenStarted = true
+            onState?("В эфире")
+            log("Отправка демонстрации запущена, ssrc \(videoSsrc)")
+            return
+        }
         if viewer {
             log("Демонстрация: кодек видео от сервера — \(d["video_codec"] ?? "не указан")")
             guard mode == "aead_aes256_gcm_rtpsize", keyBytes.count == 32, let conn = udp, let display = streamDisplay else {
@@ -556,6 +569,12 @@ final class VoiceGateway {
         media?.sendVideoFrame(nalUnits: nalUnits, timestamp: timestamp)
     }
 
+    /// Кадр экрана из расширения (уже H264). Пока не готов ключ шифрования — просто пропускаем.
+    func sendScreenFrame(nalUnits: [Data], timestamp: UInt32) {
+        guard screenStarted else { return }
+        media?.sendVideoFrame(nalUnits: nalUnits, timestamp: timestamp)
+    }
+
     private func send(_ obj: [String: Any]) {
         guard let data = try? JSONSerialization.data(withJSONObject: obj),
               let s = String(data: data, encoding: .utf8) else { return }
@@ -633,6 +652,20 @@ final class VoiceSpike: ObservableObject {
     @Published var videoOn = false
     @Published var cameraError: String?
     let camera = CameraSource()
+
+    // Своя демонстрация экрана (Go Live через расширение трансляции).
+    @Published var broadcasting = false
+    @Published var broadcastStatus = ""
+    @Published var blurOn = BroadcastShared.blur
+    private let socketServer = LocalSocketServer()
+    private var broadcastGateway: VoiceGateway?
+    private var broadcastKey: String?
+    private var broadcastRtc: String?
+    private var broadcastEndpoint: String?
+    private var broadcastToken: String?
+    private var broadcastStartedObserver: NSObjectProtocol?
+    private var broadcastStoppedObserver: NSObjectProtocol?
+    private var frameClock: UInt32 = 0
 
     // Просмотр чужой демонстрации экрана (Go Live): отдельное соединение со своим сервером.
     @Published var watchingStream: String?
@@ -844,6 +877,7 @@ final class VoiceSpike: ObservableObject {
     }
 
         func leave(silent: Bool = false) {
+        if broadcasting { stopBroadcast(notify: true) }
         if watchingStream != nil { stopWatching() }
         if videoOn {
             videoOn = false
@@ -1189,6 +1223,11 @@ final class VoiceSpike: ObservableObject {
             }
         case "STREAM_CREATE", "STREAM_UPDATE":
             add("[видео/демо] \(t): \(d)")
+            if let key = d["stream_key"] as? String, key == broadcastKey {
+                if let rtc = d["rtc_server_id"] as? String { broadcastRtc = rtc }
+                else if let rtc = d["rtc_server_id"] as? Int { broadcastRtc = String(rtc) }
+                tryConnectBroadcast()
+            }
             if let key = d["stream_key"] as? String, key == streamKey {
                 if let rtc = d["rtc_server_id"] as? String {
                     streamRtcServerId = rtc
@@ -1199,6 +1238,12 @@ final class VoiceSpike: ObservableObject {
             }
         case "STREAM_SERVER_UPDATE":
             add("[видео/демо] STREAM_SERVER_UPDATE: \(d["endpoint"] ?? "?")")
+            if let key = d["stream_key"] as? String, key == broadcastKey,
+               let token = d["token"] as? String, let ep = d["endpoint"] as? String {
+                broadcastEndpoint = ep
+                broadcastToken = token
+                tryConnectBroadcast()
+            }
             if let key = d["stream_key"] as? String, key == streamKey,
                let token = d["token"] as? String, let ep = d["endpoint"] as? String {
                 streamEndpoint = ep
@@ -1229,6 +1274,118 @@ final class VoiceSpike: ObservableObject {
 
     /// Начать смотреть демонстрацию участника: просим у основного шлюза (op 20 Watch Stream)
     /// отдельный сервер стрима, дальше ждём STREAM_CREATE и STREAM_SERVER_UPDATE.
+    // MARK: Своя демонстрация экрана
+
+    /// Готовит настройки и слушает сокет от расширения. Само окно выбора "Общий экран" показывает
+    /// системная кнопка трансляции — здесь мы только настраиваем качество/звук/блюр заранее.
+    func prepareBroadcast(quality: BroadcastShared.Quality, streamAudio: Bool, blur: Bool) {
+        BroadcastShared.defaults?.set(quality.rawValue, forKey: BroadcastShared.keyQuality)
+        BroadcastShared.defaults?.set(streamAudio, forKey: BroadcastShared.keyStreamAudio)
+        BroadcastShared.defaults?.set(blur, forKey: BroadcastShared.keyBlur)
+        blurOn = blur
+        setupBroadcastListeners()
+        add("[видео/демо] Демонстрация подготовлена: качество \(quality.rawValue), звук \(streamAudio), блюр \(blur)")
+    }
+
+    private func setupBroadcastListeners() {
+        socketServer.onConnect = { [weak self] in
+            Task { @MainActor in
+                self?.add("[видео/демо] Расширение трансляции подключилось к приложению")
+            }
+        }
+        socketServer.onFrame = { [weak self] type, payload in
+            guard type == BroadcastWire.typeVideo else { return }
+            Task { @MainActor in self?.forwardScreenFrame(payload) }
+        }
+        socketServer.start()
+
+        if broadcastStartedObserver == nil {
+            broadcastStartedObserver = BroadcastShared.observe(BroadcastShared.notifyStarted) { [weak self] in
+                Task { @MainActor in self?.onBroadcastStarted() }
+            }
+        }
+        if broadcastStoppedObserver == nil {
+            broadcastStoppedObserver = BroadcastShared.observe(BroadcastShared.notifyStopped) { [weak self] in
+                Task { @MainActor in self?.stopBroadcast(notify: true) }
+            }
+        }
+    }
+
+    /// Пришёл сигнал, что системная трансляция реально стартовала — регистрируем стрим у Discord.
+    private func onBroadcastStarted() {
+        guard isConnected, !broadcasting, let cid = activeChannelId, let gid = guildId else { return }
+        broadcasting = true
+        broadcastStatus = "Запускаю демонстрацию…"
+        broadcastKey = "guild:\(gid):\(cid):\(userId)"
+        add("[видео/демо] Система начала запись экрана, отправляю op 18 (Stream Create)")
+        _ = sendGateway?([
+            "op": 18,
+            "d": ["type": "guild", "guild_id": gid, "channel_id": cid, "preferred_region": NSNull()]
+        ])
+        // Снимаем возможную паузу.
+        _ = sendGateway?(["op": 22, "d": ["stream_key": broadcastKey ?? "", "paused": false]])
+    }
+
+    func stopBroadcast(notify: Bool) {
+        guard broadcasting || broadcastGateway != nil else { return }
+        if notify, let key = broadcastKey {
+            _ = sendGateway?(["op": 18, "d": ["stream_key": key, "active": false]])
+        }
+        broadcastGateway?.stop()
+        broadcastGateway = nil
+        broadcasting = false
+        broadcastStatus = ""
+        broadcastKey = nil
+        broadcastRtc = nil
+        broadcastEndpoint = nil
+        broadcastToken = nil
+        add("[видео/демо] Демонстрация остановлена")
+    }
+
+    func setBlur(_ on: Bool) {
+        blurOn = on
+        BroadcastShared.defaults?.set(on, forKey: BroadcastShared.keyBlur)
+        BroadcastShared.post(on ? BroadcastShared.notifyBlurOn : BroadcastShared.notifyBlurOff)
+        add("[видео/демо] Блюр экрана: \(on ? "включён" : "выключен")")
+    }
+
+    func toggleBlur() { setBlur(!blurOn) }
+
+    /// Кадр экрана из расширения → в отправляющий шлюз демонстрации.
+    private func forwardScreenFrame(_ annexb: Data) {
+        guard let gw = broadcastGateway else { return }
+        let nals = H264AnnexB.split(annexb)
+        guard !nals.isEmpty else { return }
+        // Таймштамп видео (90 кГц). Точная привязка не критична для приёмника.
+        frameClock &+= 3000
+        gw.sendScreenFrame(nalUnits: nals, timestamp: frameClock)
+    }
+
+    /// Подключение к серверу нашей демонстрации (получив STREAM_CREATE + STREAM_SERVER_UPDATE).
+    private func tryConnectBroadcast() {
+        guard broadcastGateway == nil, broadcasting,
+              let rtc = broadcastRtc, let ep = broadcastEndpoint,
+              let token = broadcastToken, let sid = sessionId,
+              let rtcNum = UInt64(rtc), rtcNum > 0 else { return }
+        add("[видео/демо] Подключаюсь к серверу СВОЕЙ демонстрации \(ep)")
+        let vg = VoiceGateway(
+            endpoint: ep, serverId: rtc, channelId: String(rtcNum - 1),
+            userId: userId, sessionId: sid, token: token, session: session,
+            daveVersion: daveVersion, audio: audio, micAllowed: false,
+            muted: true, deafened: false, videoProbe: false, viewer: false
+        )
+        vg.broadcastSender = true
+        vg.onLog = { [weak self] s in Task { @MainActor in self?.add("[стрим→] " + s) } }
+        vg.onState = { [weak self] s in
+            Task { @MainActor in
+                guard let self, self.broadcasting else { return }
+                self.broadcastStatus = s.contains("E2EE") ? "В эфире" : s
+            }
+        }
+        broadcastGateway = vg
+        vg.start()
+    }
+
     func watchStream(_ uid: String) {
         guard isConnected, let cid = activeChannelId else { return }
         if watchingStream == uid { return }

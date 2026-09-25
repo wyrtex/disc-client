@@ -11,6 +11,7 @@ struct VoiceView: View {
     @State private var showAudio = false
     @State private var showLog = false
     @State private var showChat = false
+    @State private var showStreamSettings = false
     @State private var volumeUser: User?
     @State private var fullscreenSelf = false
     @State private var fullscreenStream = false
@@ -53,6 +54,9 @@ struct VoiceView: View {
         }
         .sheet(isPresented: $showLog) {
             VoiceLogView(voice: voice)
+        }
+        .sheet(isPresented: $showStreamSettings) {
+            StreamSettingsSheet(voice: voice)
         }
         .sheet(isPresented: $showChat) {
             if let ch = voice.activeChannel {
@@ -374,6 +378,16 @@ struct VoiceView: View {
 
             controlButton(icon: voice.videoOn ? "video.fill" : "video.slash.fill", active: voice.videoOn) {
                 voice.toggleCamera()
+            }
+
+            if voice.broadcasting {
+                controlButton(icon: voice.blurOn ? "eye.slash.fill" : "eye.fill", active: voice.blurOn) {
+                    voice.toggleBlur()
+                }
+            } else {
+                controlButton(icon: "rectangle.on.rectangle", active: false) {
+                    showStreamSettings = true
+                }
             }
 
             Button {
@@ -1183,5 +1197,99 @@ struct AudienceCell: View {
                 .foregroundStyle(Theme.muted)
                 .lineLimit(1)
         }
+    }
+}
+
+
+// MARK: - Настройки своей демонстрации экрана
+
+struct StreamSettingsSheet: View {
+    @ObservedObject var voice: VoiceSpike
+    @Environment(\.dismiss) private var dismiss
+    @State private var quality: BroadcastShared.Quality = BroadcastShared.quality
+    @State private var streamAudio = BroadcastShared.streamAudio
+    @State private var blur = BroadcastShared.blur
+
+    var body: some View {
+        NavigationStack {
+            VStack(spacing: 20) {
+                VStack(alignment: .leading, spacing: 10) {
+                    sectionTitle("Режим стрима")
+                    modeRow(.standard, title: "По умолчанию", subtitle: "Баланс качества (720p, 30 fps)", icon: "iphone")
+                    modeRow(.high, title: "Высокое качество", subtitle: "Для видео и игр (1080p, 60 fps)", icon: "sparkles.tv")
+                    Text("Высокое качество — функция Nitro. Без неё Discord может понизить до 720p.")
+                        .font(.system(size: 12))
+                        .foregroundStyle(Theme.muted)
+                }
+
+                VStack(alignment: .leading, spacing: 10) {
+                    sectionTitle("Звук стрима")
+                    Toggle("Транслировать звук приложения", isOn: $streamAudio)
+                        .tint(Theme.blurple)
+                        .padding(12)
+                        .background(Theme.panel, in: RoundedRectangle(cornerRadius: 12))
+                }
+
+                VStack(alignment: .leading, spacing: 10) {
+                    sectionTitle("Приватность")
+                    Toggle("Начать с размытым экраном", isOn: $blur)
+                        .tint(Theme.blurple)
+                        .padding(12)
+                        .background(Theme.panel, in: RoundedRectangle(cornerRadius: 12))
+                    Text("Блюр можно включать и выключать в любой момент — кнопкой в звонке или из приложения «Команды».")
+                        .font(.system(size: 12))
+                        .foregroundStyle(Theme.muted)
+                }
+
+                Spacer()
+
+                Text("Нажми «Начать», затем в системном окне выбери наше приложение и «Начать вещание».")
+                    .font(.system(size: 13))
+                    .foregroundStyle(Theme.muted)
+                    .multilineTextAlignment(.center)
+
+                BroadcastStartButton(voice: voice, quality: quality, streamAudio: streamAudio, blur: blur) {
+                    dismiss()
+                }
+            }
+            .padding(16)
+            .background(Theme.chat)
+            .navigationTitle("Настройки стрима")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Отмена") { dismiss() }
+                }
+            }
+        }
+        .presentationDetents([.large])
+        .presentationBackground(Theme.chat)
+    }
+
+    private func sectionTitle(_ s: String) -> some View {
+        Text(s).font(.system(size: 14, weight: .semibold)).foregroundStyle(Theme.muted)
+    }
+
+    private func modeRow(_ q: BroadcastShared.Quality, title: String, subtitle: String, icon: String) -> some View {
+        Button {
+            quality = q
+        } label: {
+            HStack(spacing: 12) {
+                Image(systemName: icon)
+                    .font(.system(size: 20))
+                    .foregroundStyle(Theme.text)
+                    .frame(width: 30)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(title).font(.system(size: 16, weight: .semibold)).foregroundStyle(Theme.text)
+                    Text(subtitle).font(.system(size: 12)).foregroundStyle(Theme.muted)
+                }
+                Spacer()
+                Image(systemName: quality == q ? "largecircle.fill.circle" : "circle")
+                    .foregroundStyle(quality == q ? Theme.blurple : Theme.muted)
+            }
+            .padding(12)
+            .background(Theme.panel, in: RoundedRectangle(cornerRadius: 12))
+        }
+        .buttonStyle(.plain)
     }
 }
