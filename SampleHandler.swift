@@ -3,29 +3,42 @@ import VideoToolbox
 import CoreImage
 import CoreMedia
 
-/// Расширение трансляции экрана. Захватывает кадры всего экрана, при включённом блюре размывает
-/// их на видеочипе, кодирует в H264 и отправляет в основное приложение через локальный сокет.
-/// Блюр можно включать и выключать в любой момент — по межпроцессному сигналу.
+/// Расширение трансляции экрана. Живёт под жёстким лимитом памяти (~50 МБ), поэтому всё сделано
+/// «на диете»: блюр считается на уменьшенной копии кадра, буферы переиспользуются через пулы,
+/// лишние кадры отбрасываются. Логика простая: обычный кадр идёт как есть, при блюре — размытый,
+/// переключение живое (со следующего кадра).
 class SampleHandler: RPBroadcastSampleHandler {
     private var encoder: VTCompressionSession?
     private var socket: LocalSocketClient?
-    private let ciContext = CIContext(options: [.useSoftwareRenderer: false])
-    private var blur = BroadcastShared.blur
+    private let ciContext = CIContext(options: [
+        .useSoftwareRenderer: false,
+        .cacheIntermediates: false,           // не копим промежуточные буферы
+        .name: "blur"
+    ])
+    private var blur = false
     private var blurOn: NSObjectProtocol?
     private var blurOff: NSObjectProtocol?
     private var blurToggle: NSObjectProtocol?
+
     private var width = 0
     private var height = 0
     private var startTime: CMTime?
     private var forceKeyFrame = false
     private var sps: Data?
     private var pps: Data?
-    private var recorder: StreamRecorder?
-    private var recordAudio = false
-    private var recordStarted = false
+
+    // Пул уменьшенных буферов для блюра — создаётся один раз и переиспользуется.
+    private var blurPool: CVPixelBufferPool?
+    private var blurW = 0
+    private var blurH = 0
+
+    // Ограничение частоты: не обрабатываем больше, чем нужно, чтобы не копить память.
+    private var lastEncodedPTS = CMTime.zero
+    private var minFrameInterval: Double = 1.0 / 30.0
 
     override func broadcastStarted(withSetupInfo setupInfo: [String: NSObject]?) {
         blur = BroadcastShared.blur
+        minFrameInterval = 1.0 / Double(max(15, BroadcastShared.quality.fps))
         socket = LocalSocketClient()
         socket?.connect()
         blurOn = BroadcastShared.observe(BroadcastShared.notifyBlurOn) { [weak self] in self?.setBlur(true) }
@@ -34,22 +47,10 @@ class SampleHandler: RPBroadcastSampleHandler {
             guard let self else { return }
             self.setBlur(!self.blur)
         }
-        if BroadcastShared.record {
-            recorder = StreamRecorder()
-            recordAudio = BroadcastShared.streamAudio
-        }
         BroadcastShared.post(BroadcastShared.notifyStarted)
     }
 
     override func broadcastFinished() {
-        if let rec = recorder {
-            rec.finish { url in
-                if let url {
-                    BroadcastShared.defaults?.set(url.path, forKey: BroadcastShared.keyLastRecording)
-                    BroadcastShared.post(BroadcastShared.notifyRecordingReady)
-                }
-            }
-        }
         BroadcastShared.post(BroadcastShared.notifyStopped)
         if let e = encoder { VTCompressionSessionInvalidate(e) }
         encoder = nil
@@ -64,90 +65,79 @@ class SampleHandler: RPBroadcastSampleHandler {
     }
 
     override func processSampleBuffer(_ sampleBuffer: CMSampleBuffer, with sampleBufferType: RPSampleBufferType) {
-        if sampleBufferType == .audioApp {
-            if recordAudio { recorder?.appendAudio(sampleBuffer) }
-            return
-        }
-        guard sampleBufferType == .video else { return }
-        guard var pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+        guard sampleBufferType == .video else { return } // звук вернём после стабилизации памяти
+        guard let source = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
         let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
         if startTime == nil { startTime = pts }
 
-        if blur, let blurred = makeBlurred(pixelBuffer) {
-            pixelBuffer = blurred
+        // Пропускаем лишние кадры, чтобы не переполнять память очередью.
+        if lastEncodedPTS != .zero {
+            let dt = CMTimeGetSeconds(CMTimeSubtract(pts, lastEncodedPTS))
+            if dt < minFrameInterval * 0.9 { return }
         }
+        lastEncodedPTS = pts
 
-        if let rec = recorder {
-            if !recordStarted {
-                rec.start(width: CVPixelBufferGetWidth(pixelBuffer),
-                          height: CVPixelBufferGetHeight(pixelBuffer),
-                          includeAudio: recordAudio)
-                recordStarted = true
+        // autoreleasepool: временные объекты CoreImage освобождаются сразу после кадра.
+        autoreleasepool {
+            var pixelBuffer = source
+            if blur, let blurred = makeBlurred(source) {
+                pixelBuffer = blurred
             }
-            appendToRecorder(pixelBuffer, pts: pts, original: sampleBuffer)
-        }
+            ensureEncoder(width: CVPixelBufferGetWidth(pixelBuffer), height: CVPixelBufferGetHeight(pixelBuffer))
+            guard let encoder else { return }
 
-        ensureEncoder(width: CVPixelBufferGetWidth(pixelBuffer), height: CVPixelBufferGetHeight(pixelBuffer))
-        guard let encoder else { return }
-
-        var props: [String: Any]? = nil
-        if forceKeyFrame {
-            props = [kVTEncodeFrameOptionKey_ForceKeyFrame as String: true]
-            forceKeyFrame = false
-        }
-        VTCompressionSessionEncodeFrame(
-            encoder, imageBuffer: pixelBuffer, presentationTimeStamp: pts, duration: .invalid,
-            frameProperties: props as CFDictionary?, infoFlagsOut: nil,
-            outputHandler: { [weak self] status, _, sb in
-                guard status == noErr, let sb, let self else { return }
-                self.emit(sb, pts: pts)
+            var props: [String: Any]? = nil
+            if forceKeyFrame {
+                props = [kVTEncodeFrameOptionKey_ForceKeyFrame as String: true]
+                forceKeyFrame = false
             }
-        )
+            VTCompressionSessionEncodeFrame(
+                encoder, imageBuffer: pixelBuffer, presentationTimeStamp: pts, duration: .invalid,
+                frameProperties: props as CFDictionary?, infoFlagsOut: nil,
+                outputHandler: { [weak self] status, _, sb in
+                    guard status == noErr, let sb, let self else { return }
+                    self.emit(sb)
+                }
+            )
+        }
     }
 
-    /// Кладём кадр в запись. Если блюр применён, оборачиваем размытый буфер в новый sample buffer
-    /// с тем же временем; иначе пишем оригинал напрямую.
-    private func appendToRecorder(_ pixelBuffer: CVPixelBuffer, pts: CMTime, original: CMSampleBuffer) {
-        guard let rec = recorder else { return }
-        if CMSampleBufferGetImageBuffer(original) === pixelBuffer {
-            rec.appendVideo(original)
-            return
-        }
-        var timing = CMSampleTimingInfo(duration: .invalid, presentationTimeStamp: pts, decodeTimeStamp: .invalid)
-        var fmt: CMFormatDescription?
-        CMVideoFormatDescriptionCreateForImageBuffer(allocator: nil, imageBuffer: pixelBuffer, formatDescriptionOut: &fmt)
-        guard let fmt else { return }
-        var sb: CMSampleBuffer?
-        CMSampleBufferCreateReadyWithImageBuffer(allocator: nil, imageBuffer: pixelBuffer, formatDescription: fmt, sampleTiming: &timing, sampleBufferOut: &sb)
-        if let sb { rec.appendVideo(sb) }
-    }
-
-    // MARK: Блюр (на видеочипе, поэтому переключение почти мгновенное)
-
-    private var blurPool: CVPixelBufferPool?
+    // MARK: Блюр (на уменьшенной копии — визуально то же, а памяти в разы меньше)
 
     private func makeBlurred(_ input: CVPixelBuffer) -> CVPixelBuffer? {
         let w = CVPixelBufferGetWidth(input)
         let h = CVPixelBufferGetHeight(input)
-        var ci = CIImage(cvPixelBuffer: input)
-        // Сильное размытие: даже мелкий текст становится нечитаемым.
-        let clamped = ci.clampedToExtent()
-        ci = clamped.applyingFilter("CIGaussianBlur", parameters: [kCIInputRadiusKey: 28])
-            .cropped(to: CIImage(cvPixelBuffer: input).extent)
+        guard w > 0, h > 0 else { return nil }
+        // Блюр всё равно съедает детали, поэтому сначала уменьшаем кадр до ~360p — так буфер
+        // в разы меньше. При растягивании обратно размытие выглядит так же сильно.
+        let targetH = 360
+        let scale = min(1.0, Double(targetH) / Double(h))
+        let sw = max(16, Int(Double(w) * scale))
+        let sh = max(16, Int(Double(h) * scale))
 
-        if blurPool == nil {
+        if blurPool == nil || blurW != sw || blurH != sh {
+            blurW = sw; blurH = sh
             let attrs: [String: Any] = [
                 kCVPixelBufferPixelFormatTypeKey as String: CVPixelBufferGetPixelFormatType(input),
-                kCVPixelBufferWidthKey as String: w,
-                kCVPixelBufferHeightKey as String: h,
+                kCVPixelBufferWidthKey as String: sw,
+                kCVPixelBufferHeightKey as String: sh,
                 kCVPixelBufferIOSurfacePropertiesKey as String: [:]
             ]
-            CVPixelBufferPoolCreate(nil, nil, attrs as CFDictionary, &blurPool)
+            var pool: CVPixelBufferPool?
+            let poolAttrs: [String: Any] = [kCVPixelBufferPoolMinimumBufferCountKey as String: 3]
+            CVPixelBufferPoolCreate(nil, poolAttrs as CFDictionary, attrs as CFDictionary, &pool)
+            blurPool = pool
         }
         guard let pool = blurPool else { return nil }
         var out: CVPixelBuffer?
         CVPixelBufferPoolCreatePixelBuffer(nil, pool, &out)
         guard let out else { return nil }
+
+        let ci = CIImage(cvPixelBuffer: input)
+            .transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+            .clampedToExtent()
+            .applyingFilter("CIGaussianBlur", parameters: [kCIInputRadiusKey: 14])
+            .cropped(to: CGRect(x: 0, y: 0, width: sw, height: sh))
         ciContext.render(ci, to: out)
         return out
     }
@@ -177,7 +167,7 @@ class SampleHandler: RPBroadcastSampleHandler {
         forceKeyFrame = true
     }
 
-    private func emit(_ sb: CMSampleBuffer, pts: CMTime) {
+    private func emit(_ sb: CMSampleBuffer) {
         let isKey = !((CMSampleBufferGetSampleAttachmentsArray(sb, createIfNecessary: false) as? [[CFString: Any]])?
             .first?[kCMSampleAttachmentKey_NotSync] as? Bool ?? false)
         if isKey, let fmt = CMSampleBufferGetFormatDescription(sb) {

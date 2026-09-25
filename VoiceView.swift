@@ -1209,7 +1209,6 @@ struct StreamSettingsSheet: View {
     @State private var quality: BroadcastShared.Quality = BroadcastShared.quality
     @State private var streamAudio = BroadcastShared.streamAudio
     @State private var blur = BroadcastShared.blur
-    @State private var record = BroadcastShared.record
 
     var body: some View {
         NavigationStack {
@@ -1241,11 +1240,7 @@ struct StreamSettingsSheet: View {
                         .font(.system(size: 12))
                         .foregroundStyle(Theme.muted)
 
-                    Toggle("Сохранить стрим на телефон", isOn: $record)
-                        .tint(Theme.blurple)
-                        .padding(12)
-                        .background(Theme.panel, in: RoundedRectangle(cornerRadius: 12))
-                    Text("Запишет ровно то, что уходит на сервер (с блюром и звуком). Это то, что видят другие «на выходе» от тебя — но Discord может пожать поток ещё раз на своей стороне.")
+                    Text("Сохранение стрима в файл временно отключено — сначала стабилизируем сам стрим и блюр под лимит памяти расширения, потом вернём запись.")
                         .font(.system(size: 12))
                         .foregroundStyle(Theme.muted)
                 }
@@ -1257,7 +1252,7 @@ struct StreamSettingsSheet: View {
                     .foregroundStyle(Theme.muted)
                     .multilineTextAlignment(.center)
 
-                BroadcastStartButton(voice: voice, quality: quality, streamAudio: streamAudio, blur: blur, record: record) {
+                BroadcastStartButton(voice: voice, quality: quality, streamAudio: streamAudio, blur: blur, record: false) {
                     dismiss()
                 }
             }

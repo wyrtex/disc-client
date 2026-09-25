@@ -67,7 +67,6 @@ targets:
     platform: iOS
     sources:
     - path: Sources/SampleHandler.swift
-    - path: Sources/StreamRecorder.swift
     - path: Sources/LocalSocket.swift
     - path: Sources/BroadcastShared.swift
     settings:
