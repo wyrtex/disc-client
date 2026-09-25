@@ -11,6 +11,8 @@ enum BroadcastShared {
     static let keyQuality = "stream.quality"      // "default" | "high"
     static let keyStreamAudio = "stream.audio"    // Bool
     static let keyBlur = "stream.blur"            // Bool — включён ли блюр прямо сейчас
+    static let keyRecord = "stream.record"
+    static let keyLastRecording = "stream.lastRecording"
 
     // Имена межпроцессных уведомлений (Darwin notifications) для управления блюром на лету.
     static let notifyBlurOn = "com.example.discclient.blur.on"
@@ -19,6 +21,7 @@ enum BroadcastShared {
     // Расширение → приложение: трансляция началась/закончилась.
     static let notifyStarted = "com.example.discclient.broadcast.started"
     static let notifyStopped = "com.example.discclient.broadcast.stopped"
+    static let notifyRecordingReady = "com.example.discclient.broadcast.recordingReady"
 
     static var defaults: UserDefaults? { UserDefaults(suiteName: appGroup) }
 
@@ -42,6 +45,7 @@ enum BroadcastShared {
     }
     static var streamAudio: Bool { defaults?.bool(forKey: keyStreamAudio) ?? false }
     static var blur: Bool { defaults?.bool(forKey: keyBlur) ?? false }
+    static var record: Bool { defaults?.bool(forKey: keyRecord) ?? false }
 
     // MARK: Darwin notifications
 

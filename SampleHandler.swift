@@ -20,6 +20,9 @@ class SampleHandler: RPBroadcastSampleHandler {
     private var forceKeyFrame = false
     private var sps: Data?
     private var pps: Data?
+    private var recorder: StreamRecorder?
+    private var recordAudio = false
+    private var recordStarted = false
 
     override func broadcastStarted(withSetupInfo setupInfo: [String: NSObject]?) {
         blur = BroadcastShared.blur
@@ -31,10 +34,22 @@ class SampleHandler: RPBroadcastSampleHandler {
             guard let self else { return }
             self.setBlur(!self.blur)
         }
+        if BroadcastShared.record {
+            recorder = StreamRecorder()
+            recordAudio = BroadcastShared.streamAudio
+        }
         BroadcastShared.post(BroadcastShared.notifyStarted)
     }
 
     override func broadcastFinished() {
+        if let rec = recorder {
+            rec.finish { url in
+                if let url {
+                    BroadcastShared.defaults?.set(url.path, forKey: BroadcastShared.keyLastRecording)
+                    BroadcastShared.post(BroadcastShared.notifyRecordingReady)
+                }
+            }
+        }
         BroadcastShared.post(BroadcastShared.notifyStopped)
         if let e = encoder { VTCompressionSessionInvalidate(e) }
         encoder = nil
@@ -49,13 +64,27 @@ class SampleHandler: RPBroadcastSampleHandler {
     }
 
     override func processSampleBuffer(_ sampleBuffer: CMSampleBuffer, with sampleBufferType: RPSampleBufferType) {
-        guard sampleBufferType == .video else { return } // звук приложения добавим позже
+        if sampleBufferType == .audioApp {
+            if recordAudio { recorder?.appendAudio(sampleBuffer) }
+            return
+        }
+        guard sampleBufferType == .video else { return }
         guard var pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
         let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
         if startTime == nil { startTime = pts }
 
         if blur, let blurred = makeBlurred(pixelBuffer) {
             pixelBuffer = blurred
+        }
+
+        if let rec = recorder {
+            if !recordStarted {
+                rec.start(width: CVPixelBufferGetWidth(pixelBuffer),
+                          height: CVPixelBufferGetHeight(pixelBuffer),
+                          includeAudio: recordAudio)
+                recordStarted = true
+            }
+            appendToRecorder(pixelBuffer, pts: pts, original: sampleBuffer)
         }
 
         ensureEncoder(width: CVPixelBufferGetWidth(pixelBuffer), height: CVPixelBufferGetHeight(pixelBuffer))
@@ -74,6 +103,23 @@ class SampleHandler: RPBroadcastSampleHandler {
                 self.emit(sb, pts: pts)
             }
         )
+    }
+
+    /// Кладём кадр в запись. Если блюр применён, оборачиваем размытый буфер в новый sample buffer
+    /// с тем же временем; иначе пишем оригинал напрямую.
+    private func appendToRecorder(_ pixelBuffer: CVPixelBuffer, pts: CMTime, original: CMSampleBuffer) {
+        guard let rec = recorder else { return }
+        if CMSampleBufferGetImageBuffer(original) === pixelBuffer {
+            rec.appendVideo(original)
+            return
+        }
+        var timing = CMSampleTimingInfo(duration: .invalid, presentationTimeStamp: pts, decodeTimeStamp: .invalid)
+        var fmt: CMFormatDescription?
+        CMVideoFormatDescriptionCreateForImageBuffer(allocator: nil, imageBuffer: pixelBuffer, formatDescriptionOut: &fmt)
+        guard let fmt else { return }
+        var sb: CMSampleBuffer?
+        CMSampleBufferCreateReadyWithImageBuffer(allocator: nil, imageBuffer: pixelBuffer, formatDescription: fmt, sampleTiming: &timing, sampleBufferOut: &sb)
+        if let sb { rec.appendVideo(sb) }
     }
 
     // MARK: Блюр (на видеочипе, поэтому переключение почти мгновенное)

@@ -64,6 +64,19 @@ enum MediaSaver {
         }
     }
 
+    /// Сохранить уже готовый локальный файл (запись стрима) в галерею.
+    static func saveLocalVideo(_ file: URL) async throws {
+        guard FileManager.default.fileExists(atPath: file.path) else { throw Failure.download }
+        if canSaveToPhotos {
+            guard await authorize() else { throw Failure.denied }
+            try await PHPhotoLibrary.shared().performChanges {
+                _ = PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: file)
+            }
+        } else {
+            await MainActor.run { share(file) }
+        }
+    }
+
     static func saveVideo(from url: URL) async throws {
         let (tmp, resp) = try await ImageLoader.shared.session.download(from: url)
         if let http = resp as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {

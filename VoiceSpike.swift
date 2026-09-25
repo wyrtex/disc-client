@@ -665,6 +665,7 @@ final class VoiceSpike: ObservableObject {
     private var broadcastToken: String?
     private var broadcastStartedObserver: NSObjectProtocol?
     private var broadcastStoppedObserver: NSObjectProtocol?
+    private var recordingReadyObserver: NSObjectProtocol?
     private var frameClock: UInt32 = 0
 
     // Просмотр чужой демонстрации экрана (Go Live): отдельное соединение со своим сервером.
@@ -1278,13 +1279,14 @@ final class VoiceSpike: ObservableObject {
 
     /// Готовит настройки и слушает сокет от расширения. Само окно выбора "Общий экран" показывает
     /// системная кнопка трансляции — здесь мы только настраиваем качество/звук/блюр заранее.
-    func prepareBroadcast(quality: BroadcastShared.Quality, streamAudio: Bool, blur: Bool) {
+    func prepareBroadcast(quality: BroadcastShared.Quality, streamAudio: Bool, blur: Bool, record: Bool) {
         BroadcastShared.defaults?.set(quality.rawValue, forKey: BroadcastShared.keyQuality)
         BroadcastShared.defaults?.set(streamAudio, forKey: BroadcastShared.keyStreamAudio)
         BroadcastShared.defaults?.set(blur, forKey: BroadcastShared.keyBlur)
+        BroadcastShared.defaults?.set(record, forKey: BroadcastShared.keyRecord)
         blurOn = blur
         setupBroadcastListeners()
-        add("[видео/демо] Демонстрация подготовлена: качество \(quality.rawValue), звук \(streamAudio), блюр \(blur)")
+        add("[видео/демо] Демонстрация подготовлена: качество \(quality.rawValue), звук \(streamAudio), блюр \(blur), запись \(record)")
     }
 
     private func setupBroadcastListeners() {
@@ -1307,6 +1309,27 @@ final class VoiceSpike: ObservableObject {
         if broadcastStoppedObserver == nil {
             broadcastStoppedObserver = BroadcastShared.observe(BroadcastShared.notifyStopped) { [weak self] in
                 Task { @MainActor in self?.stopBroadcast(notify: true) }
+            }
+        }
+        if recordingReadyObserver == nil {
+            recordingReadyObserver = BroadcastShared.observe(BroadcastShared.notifyRecordingReady) { [weak self] in
+                Task { @MainActor in self?.saveRecording() }
+            }
+        }
+    }
+
+    /// Расширение записало стрим в файл — сохраняем его в галерею.
+    private func saveRecording() {
+        guard let path = BroadcastShared.defaults?.string(forKey: BroadcastShared.keyLastRecording) else { return }
+        let url = URL(fileURLWithPath: path)
+        add("[видео/демо] Запись стрима готова, сохраняю в галерею")
+        Task {
+            do {
+                try await MediaSaver.saveLocalVideo(url)
+                await MainActor.run { self.add("[видео/демо] Запись сохранена в галерею") }
+                try? FileManager.default.removeItem(at: url)
+            } catch {
+                await MainActor.run { self.add("[видео/демо] Не удалось сохранить запись: \(error.localizedDescription)") }
             }
         }
     }

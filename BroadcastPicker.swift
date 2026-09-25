@@ -9,6 +9,7 @@ struct BroadcastStartButton: UIViewRepresentable {
     let quality: BroadcastShared.Quality
     let streamAudio: Bool
     let blur: Bool
+    let record: Bool
     let onTapped: () -> Void
 
     func makeUIView(context: Context) -> UIView {
@@ -21,7 +22,7 @@ struct BroadcastStartButton: UIViewRepresentable {
         container.addSubview(picker)
         container.picker = picker
         container.onTap = {
-            voice.prepareBroadcast(quality: quality, streamAudio: streamAudio, blur: blur)
+            voice.prepareBroadcast(quality: quality, streamAudio: streamAudio, blur: blur, record: record)
             onTapped()
             container.triggerPicker()
         }
