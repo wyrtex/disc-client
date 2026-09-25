@@ -93,27 +93,43 @@ struct StreamPlayerView: UIViewRepresentable {
 
 // MARK: - Приём видео демонстрации по отдельному соединению стрима
 
-/// UDP -> транспортная расшифровка -> RTP -> сборка H264-кадра -> DAVE -> вывод на экран.
+/// UDP -> транспортная расшифровка -> буфер переупорядочивания (+ запросы повторов NACK/RTX) ->
+/// сборка H264-кадра -> DAVE -> вывод на экран. При потере кадра просим ключевой кадр (PLI).
 final class StreamVideoReceiver {
     private let connection: NWConnection
     private let key: SymmetricKey
     private let dave: DaveSession?
     private let display: StreamDisplay
+    private let ownSsrc: UInt32
     private let queue = DispatchQueue(label: "stream.video")
 
     var log: ((String) -> Void)?
     var onFirstFrame: (() -> Void)?
 
     static let h264PayloadType = 101
+    static let rtxPayloadType = 102
+
+    private struct Pkt {
+        let payload: [UInt8]
+        let ts: UInt32
+        let marker: Bool
+    }
 
     private var videoSsrcs: [UInt32: String] = [:]
+    private var rtxToPrimary: [UInt32: UInt32] = [:]
     private var stopped = false
+
+    // Буфер переупорядочивания (по номерам пакетов)
+    private var buffer: [UInt16: Pkt] = [:]
+    private var bufferSsrc: UInt32 = 0
+    private var expectedSeq: UInt16?
+    private var missingSince: Date?
+    private var nacked = Set<UInt16>()
 
     // Сборка текущего кадра
     private var curTs: UInt32?
     private var nals: [Data] = []
     private var fu: Data?
-    private var lastSeq: UInt16?
     private var frameBroken = false
 
     // Декодирование
@@ -122,33 +138,47 @@ final class StreamVideoReceiver {
     private var formatDesc: CMVideoFormatDescription?
     private var waitingKeyframe = true
     private var shownFirst = false
+    private var lastPli = Date.distantPast
+
+    // RTCP
+    private var rtcpNonce: UInt32 = 0
 
     private struct Stats: Equatable {
         var packets = 0
+        var rtx = 0
         var unknownSsrc = 0
         var otherPayload = 0
-        var lost = 0
+        var skipped = 0
         var frames = 0
         var shown = 0
         var daveFail = 0
         var dropped = 0
+        var nack = 0
+        var pli = 0
     }
     private var stats = Stats()
     private var lastStats = Stats()
     private var seenPayloadTypes = Set<Int>()
     private var timer: DispatchSourceTimer?
+    private var tick: DispatchSourceTimer?
     private var keepalive: DispatchSourceTimer?
     private var keepaliveCounter: UInt64 = 0
 
-    init(connection: NWConnection, secretKey: Data, dave: DaveSession?, display: StreamDisplay) {
+    init(connection: NWConnection, secretKey: Data, dave: DaveSession?, display: StreamDisplay, ownSsrc: UInt32) {
         self.connection = connection
         self.key = SymmetricKey(data: secretKey)
         self.dave = dave
         self.display = display
+        self.ownSsrc = ownSsrc
     }
 
-    func setVideo(ssrc: UInt32, user: String) {
-        queue.async { self.videoSsrcs[ssrc] = user }
+    func setVideo(ssrc: UInt32, user: String, rtx: UInt32?) {
+        queue.async {
+            self.videoSsrcs[ssrc] = user
+            if let rtx, rtx != 0 { self.rtxToPrimary[rtx] = ssrc }
+            // Сразу просим ключевой кадр, чтобы не ждать следующего по расписанию.
+            self.requestKeyframe(ssrc, force: true)
+        }
     }
 
     func start() {
@@ -158,6 +188,17 @@ final class StreamVideoReceiver {
         t.setEventHandler { [weak self] in self?.report() }
         t.resume()
         timer = t
+
+        // Проверка «застрявших» пропусков и повторные просьбы о ключевом кадре.
+        let tk = DispatchSource.makeTimerSource(queue: queue)
+        tk.schedule(deadline: .now() + 0.05, repeating: 0.05)
+        tk.setEventHandler { [weak self] in
+            guard let self else { return }
+            self.drainStale()
+            if self.waitingKeyframe, self.bufferSsrc != 0 { self.requestKeyframe(self.bufferSsrc, force: false) }
+        }
+        tk.resume()
+        tick = tk
 
         let k = DispatchSource.makeTimerSource(queue: queue)
         k.schedule(deadline: .now() + 1, repeating: 4)
@@ -176,6 +217,8 @@ final class StreamVideoReceiver {
             self.stopped = true
             self.timer?.cancel()
             self.timer = nil
+            self.tick?.cancel()
+            self.tick = nil
             self.keepalive?.cancel()
             self.keepalive = nil
         }
@@ -194,7 +237,7 @@ final class StreamVideoReceiver {
     private func report() {
         guard stats != lastStats else { return }
         lastStats = stats
-        log?("Демонстрация: пакетов \(stats.packets), кадров \(stats.frames), показано \(stats.shown). Потери \(stats.lost), выброшено кадров \(stats.dropped), DAVE ошибок \(stats.daveFail), чужих ssrc \(stats.unknownSsrc), другой кодек \(stats.otherPayload)")
+        log?("Демонстрация: пакетов \(stats.packets) (+повторов \(stats.rtx)), кадров \(stats.frames), показано \(stats.shown). Пропущено пакетов \(stats.skipped), выброшено кадров \(stats.dropped), DAVE ошибок \(stats.daveFail), NACK \(stats.nack), запросов ключевого кадра \(stats.pli)")
     }
 
     // MARK: Пакет
@@ -202,9 +245,8 @@ final class StreamVideoReceiver {
     private func handlePacket(_ data: Data) {
         let bytes = [UInt8](data)
         guard bytes.count >= 12, bytes[0] >> 6 == 2 else { return }
+        if bytes[1] >= 200 && bytes[1] <= 206 { return } // RTCP от сервера
         let pt = Int(bytes[1] & 0x7F)
-        // RTCP (200...206 с учётом бита маркера) пропускаем.
-        if bytes[1] >= 200 && bytes[1] <= 206 { return }
         let marker = (bytes[1] & 0x80) != 0
         let seq = UInt16(bytes[2]) << 8 | UInt16(bytes[3])
         var ssrc: UInt32 = 0
@@ -212,7 +254,15 @@ final class StreamVideoReceiver {
         var ts: UInt32 = 0
         for i in 4..<8 { ts = (ts << 8) | UInt32(bytes[i]) }
 
-        guard let user = videoSsrcs[ssrc] else {
+        if let primary = rtxToPrimary[ssrc] {
+            // Повтор потерянного пакета: в начале 2 байта исходного номера.
+            guard pt == StreamVideoReceiver.rtxPayloadType, let p = openTransport(bytes), p.count > 2 else { return }
+            let original = UInt16(p[0]) << 8 | UInt16(p[1])
+            stats.rtx += 1
+            insert(ssrc: primary, seq: original, pkt: Pkt(payload: Array(p[2...]), ts: ts, marker: marker))
+            return
+        }
+        guard videoSsrcs[ssrc] != nil else {
             stats.unknownSsrc += 1
             return
         }
@@ -224,14 +274,17 @@ final class StreamVideoReceiver {
             stats.otherPayload += 1
             return
         }
-        guard let payload = openTransport(bytes) else { return }
+        guard let p = openTransport(bytes) else { return }
         stats.packets += 1
-        depacketize([UInt8](payload), ts: ts, seq: seq, marker: marker, user: user)
+        insert(ssrc: ssrc, seq: seq, pkt: Pkt(payload: p, ts: ts, marker: marker))
     }
 
-    private func openTransport(_ bytes: [UInt8]) -> Data? {
+    /// Транспортная расшифровка (aead_aes256_gcm_rtpsize). Убирает расширения заголовка и
+    /// RTP-заполнение (padding), иначе в кадр попадают лишние байты и DAVE не сходится.
+    private func openTransport(_ bytes: [UInt8]) -> [UInt8]? {
         guard bytes.count >= 12 + 16 + 4 else { return nil }
         let b0 = bytes[0]
+        let hasPadding = (b0 & 0x20) != 0
         let cc = Int(b0 & 0x0F)
         let hasExtension = (b0 & 0x10) != 0
         var headerLen = 12 + cc * 4
@@ -251,76 +304,197 @@ final class StreamVideoReceiver {
         guard let nonce = try? AES.GCM.Nonce(data: nonceData),
               let box = try? AES.GCM.SealedBox(nonce: nonce, ciphertext: cipher, tag: tag),
               let plain = try? AES.GCM.open(box, using: key, authenticating: aad) else { return nil }
+        var p = [UInt8](plain)
         let n = extWords * 4
-        guard plain.count >= n else { return nil }
-        return Data(plain.dropFirst(n))
+        guard p.count >= n else { return nil }
+        p.removeFirst(n)
+        if hasPadding, let pad = p.last {
+            let padCount = Int(pad)
+            guard padCount <= p.count else { return nil }
+            p.removeLast(padCount)
+        }
+        return p
+    }
+
+    // MARK: Буфер переупорядочивания
+
+    private func dist(_ a: UInt16, _ b: UInt16) -> Int {
+        Int(Int16(bitPattern: a &- b))
+    }
+
+    private func insert(ssrc: UInt32, seq: UInt16, pkt: Pkt) {
+        if ssrc != bufferSsrc {
+            bufferSsrc = ssrc
+            buffer = [:]
+            expectedSeq = nil
+            nacked = []
+            resetFrame()
+            waitingKeyframe = true
+        }
+        if expectedSeq == nil { expectedSeq = seq }
+        guard let expected = expectedSeq, dist(seq, expected) >= 0 else { return } // уже пропущен
+        buffer[seq] = pkt
+        drain()
+        requestMissing()
+    }
+
+    /// Отдаём пакеты по порядку, пока нет дыры.
+    private func drain() {
+        guard var expected = expectedSeq else { return }
+        while let p = buffer.removeValue(forKey: expected) {
+            depacketize(p)
+            expected = expected &+ 1
+        }
+        expectedSeq = expected
+        if buffer.isEmpty {
+            missingSince = nil
+        } else if missingSince == nil {
+            missingSince = Date()
+        }
+    }
+
+    /// Если дыра не закрылась за 150 мс (или буфер разросся), пропускаем её и ждём ключевой кадр.
+    private func drainStale() {
+        guard !buffer.isEmpty, let since = missingSince, let expected = expectedSeq else { return }
+        let tooOld = Date().timeIntervalSince(since) > 0.15
+        let tooBig = buffer.count > 400
+        guard tooOld || tooBig else { return }
+        guard let next = buffer.keys.min(by: { dist($0, expected) < dist($1, expected) }) else { return }
+        stats.skipped += max(0, dist(next, expected))
+        expectedSeq = next
+        frameBroken = true
+        missingSince = nil
+        drain()
+    }
+
+    /// Просим сервер повторить пропавшие пакеты (Generic NACK), каждый номер не больше одного раза.
+    private func requestMissing() {
+        guard let expected = expectedSeq, !buffer.isEmpty,
+              let maxSeq = buffer.keys.max(by: { dist($0, expected) < dist($1, expected) }) else { return }
+        let span = min(dist(maxSeq, expected), 300)
+        var missing: [UInt16] = []
+        var s = expected
+        for _ in 0..<span {
+            if buffer[s] == nil, !nacked.contains(s) { missing.append(s) }
+            s = s &+ 1
+        }
+        guard !missing.isEmpty else { return }
+        for m in missing { nacked.insert(m) }
+        if nacked.count > 2000 { nacked = Set(missing) }
+        var fci: [UInt8] = []
+        var i = 0
+        while i < missing.count {
+            let pid = missing[i]
+            var blp: UInt16 = 0
+            var j = i + 1
+            while j < missing.count {
+                let d = dist(missing[j], pid)
+                guard d >= 1 && d <= 16 else { break }
+                blp |= 1 << UInt16(d - 1)
+                j += 1
+            }
+            fci += [UInt8(pid >> 8), UInt8(pid & 0xFF), UInt8(blp >> 8), UInt8(blp & 0xFF)]
+            i = j
+        }
+        sendFeedback(pt: 205, fmt: 1, media: bufferSsrc, fci: fci)
+        stats.nack += missing.count
+    }
+
+    // MARK: RTCP (запросы серверу)
+
+    private func requestKeyframe(_ media: UInt32, force: Bool) {
+        let now = Date()
+        guard force || now.timeIntervalSince(lastPli) > 0.5 else { return }
+        lastPli = now
+        sendFeedback(pt: 206, fmt: 1, media: media, fci: [])
+        stats.pli += 1
+    }
+
+    /// RTCP обратной связи: заголовок и ssrc отправителя остаются открытыми (AAD), остальное шифруется.
+    private func sendFeedback(pt: UInt8, fmt: UInt8, media: UInt32, fci: [UInt8]) {
+        let words = (12 + fci.count) / 4 - 1
+        var header: [UInt8] = [0x80 | fmt, pt, UInt8(words >> 8), UInt8(words & 0xFF)]
+        header += [UInt8(ownSsrc >> 24), UInt8((ownSsrc >> 16) & 0xFF), UInt8((ownSsrc >> 8) & 0xFF), UInt8(ownSsrc & 0xFF)]
+        var body: [UInt8] = [UInt8(media >> 24), UInt8((media >> 16) & 0xFF), UInt8((media >> 8) & 0xFF), UInt8(media & 0xFF)]
+        body += fci
+
+        let counter = rtcpNonce
+        rtcpNonce &+= 1
+        let nonce4: [UInt8] = [UInt8(counter >> 24), UInt8((counter >> 16) & 0xFF), UInt8((counter >> 8) & 0xFF), UInt8(counter & 0xFF)]
+        var nonceData = Data(nonce4)
+        nonceData.append(Data(count: 8))
+        guard let nonce = try? AES.GCM.Nonce(data: nonceData),
+              let sealed = try? AES.GCM.seal(Data(body), using: key, nonce: nonce, authenticating: Data(header)) else { return }
+        var packet = Data(header)
+        packet.append(sealed.ciphertext)
+        packet.append(sealed.tag)
+        packet.append(contentsOf: nonce4)
+        connection.send(content: packet, completion: .contentProcessed { _ in })
     }
 
     // MARK: Сборка H264 из RTP (RFC 6184)
 
-    private func depacketize(_ p: [UInt8], ts: UInt32, seq: UInt16, marker: Bool, user: String) {
-        if curTs != ts {
-            if curTs != nil { finishFrame(user: user) }
-            curTs = ts
+    private func resetFrame() {
+        curTs = nil
+        nals = []
+        fu = nil
+        frameBroken = false
+    }
+
+    private func depacketize(_ pkt: Pkt) {
+        if curTs != pkt.ts {
+            if curTs != nil { finishFrame() }
+            curTs = pkt.ts
             nals = []
             fu = nil
-            frameBroken = false
         }
-        if let last = lastSeq, seq != last &+ 1 {
-            frameBroken = true
-            stats.lost += 1
+        let p = pkt.payload
+        if !p.isEmpty {
+            switch p[0] & 0x1F {
+            case 1...23:
+                nals.append(Data(p))
+            case 24:
+                var i = 1
+                while i + 2 <= p.count {
+                    let size = Int(p[i]) << 8 | Int(p[i + 1])
+                    i += 2
+                    guard size > 0, i + size <= p.count else { break }
+                    nals.append(Data(p[i..<(i + size)]))
+                    i += size
+                }
+            case 28:
+                if p.count > 2 {
+                    let indicator = p[0]
+                    let header = p[1]
+                    if (header & 0x80) != 0 {
+                        var d = Data([(indicator & 0xE0) | (header & 0x1F)])
+                        d.append(contentsOf: p[2...])
+                        fu = d
+                    } else if fu != nil {
+                        fu?.append(contentsOf: p[2...])
+                    } else {
+                        frameBroken = true
+                    }
+                    if (header & 0x40) != 0, let f = fu {
+                        nals.append(f)
+                        fu = nil
+                    }
+                }
+            default:
+                break
+            }
         }
-        lastSeq = seq
-        guard !p.isEmpty else { return }
-
-        let type = p[0] & 0x1F
-        switch type {
-        case 1...23:
-            nals.append(Data(p))
-        case 24:
-            // STAP-A: несколько NAL подряд, у каждого 2 байта длины.
-            var i = 1
-            while i + 2 <= p.count {
-                let size = Int(p[i]) << 8 | Int(p[i + 1])
-                i += 2
-                guard size > 0, i + size <= p.count else { break }
-                nals.append(Data(p[i..<(i + size)]))
-                i += size
-            }
-        case 28:
-            // FU-A: кусок большого NAL.
-            guard p.count > 2 else { break }
-            let indicator = p[0]
-            let header = p[1]
-            let isStart = (header & 0x80) != 0
-            let isEnd = (header & 0x40) != 0
-            if isStart {
-                var d = Data([(indicator & 0xE0) | (header & 0x1F)])
-                d.append(contentsOf: p[2...])
-                fu = d
-            } else if fu != nil {
-                fu?.append(contentsOf: p[2...])
-            } else {
-                frameBroken = true
-            }
-            if isEnd, let f = fu {
-                nals.append(f)
-                fu = nil
-            }
-        default:
-            break
-        }
-
-        if marker {
-            finishFrame(user: user)
+        if pkt.marker {
+            finishFrame()
             curTs = nil
         }
     }
 
-    private func finishFrame(user: String) {
+    private func finishFrame() {
         defer {
             nals = []
             fu = nil
+            frameBroken = false
         }
         guard !nals.isEmpty else { return }
         stats.frames += 1
@@ -329,8 +503,8 @@ final class StreamVideoReceiver {
             stats.dropped += 1
             return
         }
+        guard let user = videoSsrcs[bufferSsrc] else { return }
         var frame = H264AnnexB.join(nals)
-        // Кадр с E2EE заканчивается маркером 0xFAFA.
         let n = frame.count
         if n >= 2, frame[frame.startIndex + n - 1] == 0xFA, frame[frame.startIndex + n - 2] == 0xFA {
             guard let dave, let dec = dave.decryptVideo(userId: user, frame: frame) else {
@@ -386,7 +560,6 @@ final class StreamVideoReceiver {
             onFirstFrame?()
         }
     }
-
     private func makeFormat(sps: Data, pps: Data) -> CMVideoFormatDescription? {
         var fd: CMFormatDescription?
         let spsBytes = [UInt8](sps)

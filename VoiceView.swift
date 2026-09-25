@@ -285,8 +285,8 @@ struct VoiceView: View {
             ) {
                 // Как в официальном клиенте: у того, кто транслирует экран, есть отдельная
                 // плитка с кнопкой "Смотреть стрим", вдобавок к обычной плитке с аватаркой.
-                ForEach(streamingIds, id: \.self) { id in
-                    StreamTile(voice: voice, id: id)
+                ForEach(streamingIds.map { "stream-" + $0 }, id: \.self) { key in
+                    StreamTile(voice: voice, id: String(key.dropFirst(7)))
                 }
                 ForEach(voice.participantIds, id: \.self) { id in
                     ParticipantTile(voice: voice, id: id)
@@ -430,9 +430,9 @@ struct StreamTile: View {
                         )
                     )
 
-                Text("Смотреть стрим")
+                Text(voice.watchingStream == id ? "Смотришь" : "Смотреть стрим")
                     .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(Theme.text)
+                    .foregroundStyle(Color.black)
                     .padding(.horizontal, 14)
                     .padding(.vertical, 9)
                     .background(.white, in: Capsule())

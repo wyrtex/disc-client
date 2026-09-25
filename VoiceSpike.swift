@@ -41,7 +41,7 @@ final class VoiceGateway {
     var streamDisplay: StreamDisplay?
     var onFirstVideoFrame: (() -> Void)?
     private var streamRx: StreamVideoReceiver?
-    private var knownVideo: [UInt32: String] = [:]
+    private var knownVideo: [UInt32: (user: String, rtx: UInt32?)] = [:]
     private let audio: VoiceAudio
     private let micAllowed: Bool
     private var ownSsrc: UInt32 = 0
@@ -216,14 +216,20 @@ final class VoiceGateway {
             log("[видео/демо] Пришёл op 12 от сервера: \(d)")
             if let uid = d["user_id"] as? String {
                 var ssrcs = Set<UInt32>()
+                var rtxFor: [UInt32: UInt32] = [:]
                 if let v = d["video_ssrc"] as? Int, v != 0 { ssrcs.insert(UInt32(truncatingIfNeeded: v)) }
                 for s in (d["streams"] as? [[String: Any]]) ?? [] {
                     let active = (s["active"] as? Bool) ?? true
-                    if active, let x = s["ssrc"] as? Int, x != 0 { ssrcs.insert(UInt32(truncatingIfNeeded: x)) }
+                    if active, let x = s["ssrc"] as? Int, x != 0 {
+                        let primary = UInt32(truncatingIfNeeded: x)
+                        ssrcs.insert(primary)
+                        if let r = s["rtx_ssrc"] as? Int, r != 0 { rtxFor[primary] = UInt32(truncatingIfNeeded: r) }
+                    }
                 }
                 for s in ssrcs {
-                    knownVideo[s] = uid
-                    streamRx?.setVideo(ssrc: s, user: uid)
+                    let rtx = rtxFor[s] ?? (s &+ 1)
+                    knownVideo[s] = (uid, rtx)
+                    streamRx?.setVideo(ssrc: s, user: uid, rtx: rtx)
                 }
                 if viewer, !ssrcs.isEmpty {
                     var wants: [String: Any] = ["any": 100]
@@ -411,11 +417,12 @@ final class VoiceGateway {
                 connection: conn,
                 secretKey: Data(keyBytes),
                 dave: daveVersion > 0 ? dave : nil,
-                display: display
+                display: display,
+                ownSsrc: ownSsrc
             )
             rx.log = { [weak self] s in self?.log(s) }
             rx.onFirstFrame = { [weak self] in self?.onFirstVideoFrame?() }
-            for (ssrc, uid) in knownVideo { rx.setVideo(ssrc: ssrc, user: uid) }
+            for (ssrc, v) in knownVideo { rx.setVideo(ssrc: ssrc, user: v.user, rtx: v.rtx) }
             streamRx = rx
             rx.start()
             send(["op": 15, "d": ["any": 100]])
@@ -1290,8 +1297,8 @@ final class VoiceSpike: ObservableObject {
         }
         vg.onState = { [weak self] s in
             Task { @MainActor in
-                guard let self, self.watchingStream != nil else { return }
-                if self.streamStatus != "" { self.streamStatus = s }
+                guard let self, self.watchingStream != nil, self.streamStatus != "" else { return }
+                self.streamStatus = s.contains("E2EE") ? "Жду картинку…" : s
             }
         }
         vg.onFirstVideoFrame = { [weak self] in
