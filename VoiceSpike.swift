@@ -1309,6 +1309,13 @@ final class VoiceSpike: ObservableObject {
         registerStreamWithDiscord(reason: "нажата кнопка старта")
     }
 
+    /// Поднять слушатели заранее (сокет-сервер + наблюдатели/маячки), чтобы приложение было
+    /// готово к моменту запуска расширения — даже если жест «подготовки» по кнопке не сработал.
+    func armBroadcast() {
+        setupBroadcastListeners()
+        startExtLogPolling()
+    }
+
     private func setupBroadcastListeners() {
         socketServer.onConnect = { [weak self] in
             Task { @MainActor in
