@@ -666,6 +666,7 @@ final class VoiceSpike: ObservableObject {
     private var broadcastStartedObserver: NSObjectProtocol?
     private var broadcastStoppedObserver: NSObjectProtocol?
     private var recordingReadyObserver: NSObjectProtocol?
+    private var beaconObservers: [NSObjectProtocol] = []
     private var frameClock: UInt32 = 0
     private var broadcastWatchdog: Timer?
     private var broadcastFramesSeen = false
@@ -1327,6 +1328,21 @@ final class VoiceSpike: ObservableObject {
         if broadcastStartedObserver == nil {
             broadcastStartedObserver = BroadcastShared.observe(BroadcastShared.notifyStarted) { [weak self] in
                 Task { @MainActor in self?.onBroadcastStarted() }
+            }
+        }
+        if beaconObservers.isEmpty {
+            // Диагностика: расширение шлёт «маячки» через Darwin (работает без App Group).
+            // По ним в следующем логе будет видно, на каком шаге всё встаёт.
+            let map: [(String, String)] = [
+                (BroadcastShared.beaconStarted, "расширение ЗАПУСТИЛОСЬ (захват экрана начался)"),
+                (BroadcastShared.beaconFirstVideo, "расширение получило первый кадр экрана"),
+                (BroadcastShared.beaconSocketOK, "расширение ПОДКЛЮЧИЛОСЬ к приложению по сокету"),
+                (BroadcastShared.beaconFirstSend, "расширение ОТПРАВИЛО первый кадр в приложение")
+            ]
+            for (name, text) in map {
+                beaconObservers.append(BroadcastShared.observe(name) { [weak self] in
+                    Task { @MainActor in self?.add("[маячок] \(text)") }
+                })
             }
         }
         if broadcastStoppedObserver == nil {

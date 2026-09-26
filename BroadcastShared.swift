@@ -27,6 +27,12 @@ enum BroadcastShared {
     // Команда приложения расширению: заверши трансляцию (пользователь нажал «остановить» в приложении).
     static let notifyStopCommand = "com.example.discclient.broadcast.stopCommand"
     static let notifyRecordingReady = "com.example.discclient.broadcast.recordingReady"
+    // Диагностические «маячки» расширения (Darwin работает без App Group): показывают, до какого
+    // шага дошло расширение. Приложение их слушает и пишет в свой лог.
+    static let beaconStarted = "com.example.discclient.broadcast.beacon.started"
+    static let beaconFirstVideo = "com.example.discclient.broadcast.beacon.firstvideo"
+    static let beaconSocketOK = "com.example.discclient.broadcast.beacon.socketok"
+    static let beaconFirstSend = "com.example.discclient.broadcast.beacon.firstsend"
 
     static var defaults: UserDefaults? { UserDefaults(suiteName: appGroup) }
 

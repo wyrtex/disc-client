@@ -46,9 +46,11 @@ class SampleHandler: RPBroadcastSampleHandler {
         } else {
             BroadcastShared.extLog("broadcastStarted: расширение запущено, App Group доступна")
         }
+        BroadcastShared.post(BroadcastShared.beaconStarted)
         blur = BroadcastShared.blur
         minFrameInterval = 1.0 / Double(max(15, BroadcastShared.quality.fps))
         socket = LocalSocketClient()
+        socket?.onConnected = { BroadcastShared.post(BroadcastShared.beaconSocketOK) }
         socket?.connect()
         BroadcastShared.extLog("сокет к приложению: попытка подключения")
         blurOn = BroadcastShared.observe(BroadcastShared.notifyBlurOn) { [weak self] in self?.setBlur(true) }
@@ -91,6 +93,7 @@ class SampleHandler: RPBroadcastSampleHandler {
         let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
         if startTime == nil {
             startTime = pts
+            BroadcastShared.post(BroadcastShared.beaconFirstVideo)
             BroadcastShared.extLog("первый видеокадр получен: \(CVPixelBufferGetWidth(source))x\(CVPixelBufferGetHeight(source))")
         }
 
@@ -220,6 +223,7 @@ class SampleHandler: RPBroadcastSampleHandler {
         socket?.send(BroadcastWire.frame(type: BroadcastWire.typeVideo, annexb))
         if !firstFrameSent {
             firstFrameSent = true
+            BroadcastShared.post(BroadcastShared.beaconFirstSend)
             BroadcastShared.extLog("первый кадр закодирован и отправлен в приложение (\(annexb.count) байт)")
         }
     }

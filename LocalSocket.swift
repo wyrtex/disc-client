@@ -11,6 +11,7 @@ import Foundation
 final class LocalSocketClient {
     private var fd: Int32 = -1
     private let queue = DispatchQueue(label: "broadcast.socket.client")
+    var onConnected: (() -> Void)?
 
     func connect() {
         queue.async { self.tryConnect() }
@@ -21,6 +22,7 @@ final class LocalSocketClient {
         for attempt in 0..<40 {
             if connectOnce() {
                 BroadcastShared.extLog("сокет: подключился к приложению (попытка \(attempt + 1))")
+                onConnected?()
                 return
             }
             usleep(100_000) // 0.1 c
