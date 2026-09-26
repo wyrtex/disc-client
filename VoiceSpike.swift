@@ -967,6 +967,15 @@ final class VoiceSpike: ObservableObject {
 
     private var reconfigureWork: DispatchWorkItem?
 
+    /// Ручной перезапуск распознавания субтитров (кнопка «обновить») — когда движок подвис.
+    func restartCaptions() {
+        guard captionsEnabled else { return }
+        reconfigureWork?.cancel()
+        add("[субтитры] перезапуск распознавания")
+        transcriber.reset()
+        transcriber.configure(enabled: true, locales: captionLangs)
+    }
+
     /// Включить или выключить язык распознавания (при включении модель скачивается).
     func toggleCaptionLanguage(_ code: String) {
         if captionLangs.contains(code) {
@@ -1304,9 +1313,9 @@ final class VoiceSpike: ObservableObject {
         setupBroadcastListeners()
         startExtLogPolling()
         add("[видео/демо] Демонстрация подготовлена: качество \(quality.rawValue), звук \(streamAudio), блюр \(blur), запись \(record)")
-        // Регистрируем стрим у Discord сразу — чтобы иконка Live появилась и кнопка переключилась,
-        // не дожидаясь сигнала от расширения (оно под ESign не всегда достукивается до приложения).
-        registerStreamWithDiscord(reason: "нажата кнопка старта")
+        // Стрим у Discord регистрируем НЕ здесь: сначала пользователь подтверждает системное окно,
+        // расширение реально стартует и присылает сигнал — тогда и шлём op 18. Иначе Discord
+        // получал стрим без картинки ещё до старта захвата (та самая гонка).
     }
 
     /// Поднять слушатели заранее (сокет-сервер + наблюдатели/маячки), чтобы приложение было
@@ -1348,7 +1357,12 @@ final class VoiceSpike: ObservableObject {
             ]
             for (name, text) in map {
                 beaconObservers.append(BroadcastShared.observe(name) { [weak self] in
-                    Task { @MainActor in self?.add("[маячок] \(text)") }
+                    Task { @MainActor in
+                        guard let self else { return }
+                        self.add("[маячок] \(text)")
+                        // Как только расширение реально стартовало — регистрируем стрим у Discord.
+                        if name == BroadcastShared.beaconStarted { self.onBroadcastStarted() }
+                    }
                 })
             }
         }

@@ -743,6 +743,16 @@ struct CaptionsPanel: View {
                     .padding(.vertical, 3)
                     .background(Theme.chat, in: Capsule())
             }
+            // Перезапуск субтитров, если распознавание подвисло.
+            Button {
+                voice.restartCaptions()
+            } label: {
+                Image(systemName: "arrow.clockwise")
+                    .font(.system(size: 12, weight: .bold))
+                    .foregroundStyle(Theme.link)
+                    .frame(width: 26, height: 26)
+                    .background(Theme.chat, in: Circle())
+            }
             Spacer()
             Button {
                 voice.captionTranslate.toggle()

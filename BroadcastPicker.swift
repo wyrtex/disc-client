@@ -28,7 +28,11 @@ struct BroadcastStartButton: UIViewRepresentable {
         }
 
         let picker = RPSystemBroadcastPickerView(frame: .zero)
-        picker.preferredExtension = "com.example.discclient.broadcast"
+        // ESign при переподписи может менять bundle id расширения, поэтому не хардкодим его,
+        // а находим настоящий .appex прямо в бандле — иначе система запускает не наше расширение.
+        let extID = Self.broadcastExtensionBundleID()
+        picker.preferredExtension = extID ?? "com.example.discclient.broadcast"
+        voice.add("[видео/демо] Расширение для трансляции: \(extID ?? "не найдено, беру дефолт com.example.discclient.broadcast")")
         picker.showsMicrophoneButton = false
         picker.translatesAutoresizingMaskIntoConstraints = false
         // Почти прозрачный, но живой и ПОВЕРХ всего — палец попадает в системную кнопку.
@@ -45,6 +49,22 @@ struct BroadcastStartButton: UIViewRepresentable {
     }
 
     func updateUIView(_ uiView: UIView, context: Context) {}
+
+    /// Находим bundle id встроенного broadcast-upload расширения (у него в Info.plist
+    /// NSExtensionPointIdentifier == com.apple.broadcast-services-upload).
+    static func broadcastExtensionBundleID() -> String? {
+        guard let plugins = Bundle.main.builtInPlugInsURL,
+              let items = try? FileManager.default.contentsOfDirectory(
+                at: plugins, includingPropertiesForKeys: nil) else { return nil }
+        for url in items where url.pathExtension == "appex" {
+            guard let b = Bundle(url: url),
+                  let ext = b.infoDictionary?["NSExtension"] as? [String: Any],
+                  let point = ext["NSExtensionPointIdentifier"] as? String,
+                  point == "com.apple.broadcast-services-upload" else { continue }
+            return b.bundleIdentifier
+        }
+        return nil
+    }
 
     final class TappableContainer: UIView {
         weak var picker: RPSystemBroadcastPickerView?

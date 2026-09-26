@@ -195,6 +195,7 @@ struct ChannelPanel: View {
     let onOpenVoice: () -> Void
 
     @State private var showServer = false
+    @State private var expandedVoice: String?
 
     private var guild: Guild? {
         store.guilds.first { $0.id == selection }
@@ -481,15 +482,67 @@ struct ChannelPanel: View {
         } else {
             VStack(alignment: .leading, spacing: 0) {
                 Button {
-                    store.voice.join(guildId: guildId, channel: ch)
-                    onOpenVoice()
+                    withAnimation(.easeOut(duration: 0.15)) {
+                        expandedVoice = (expandedVoice == ch.id) ? nil : ch.id
+                    }
                 } label: { rowLabel(ch, locked: false) }
                     .buttonStyle(.plain)
+                if expandedVoice == ch.id {
+                    voiceJoinPanel(ch, guildId: guildId)
+                }
                 ForEach(store.members(in: ch.id, guildId: guildId), id: \.userId) { m in
                     VoiceMemberRow(state: m)
                 }
             }
         }
+    }
+
+    /// Мини-окно при тапе на голосовой канал: микрофон, крупная кнопка входа и чат канала.
+    @ViewBuilder
+    private func voiceJoinPanel(_ ch: Channel, guildId: String) -> some View {
+        HStack(spacing: 10) {
+            // Положение микрофона (до входа)
+            Button {
+                store.voice.muted.toggle()
+            } label: {
+                Image(systemName: store.voice.muted ? "mic.slash.fill" : "mic.fill")
+                    .font(.system(size: 17, weight: .semibold))
+                    .foregroundStyle(store.voice.muted ? .red : Theme.text)
+                    .frame(width: 46, height: 46)
+                    .background(Theme.panel, in: Circle())
+            }
+            .buttonStyle(.plain)
+
+            // Большая зелёная — войти
+            Button {
+                store.voice.join(guildId: guildId, channel: ch)
+                onOpenVoice()
+                expandedVoice = nil
+            } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: "phone.fill")
+                    Text("Войти в войс")
+                }
+                .font(.system(size: 16, weight: .bold))
+                .foregroundStyle(.white)
+                .frame(maxWidth: .infinity)
+                .frame(height: 46)
+                .background(Theme.green, in: RoundedRectangle(cornerRadius: 12))
+            }
+            .buttonStyle(.plain)
+
+            // Чат голосового канала
+            NavigationLink(value: ch) {
+                Image(systemName: "text.bubble.fill")
+                    .font(.system(size: 17, weight: .semibold))
+                    .foregroundStyle(Theme.text)
+                    .frame(width: 46, height: 46)
+                    .background(Theme.panel, in: Circle())
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 8)
     }
 
     private func rowLabel(_ ch: Channel, locked: Bool) -> some View {
