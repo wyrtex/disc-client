@@ -667,6 +667,8 @@ final class VoiceSpike: ObservableObject {
     private var broadcastStoppedObserver: NSObjectProtocol?
     private var recordingReadyObserver: NSObjectProtocol?
     private var frameClock: UInt32 = 0
+    private var broadcastWatchdog: Timer?
+    private var broadcastFramesSeen = false
 
     // Просмотр чужой демонстрации экрана (Go Live): отдельное соединение со своим сервером.
     @Published var watchingStream: String?
@@ -1289,6 +1291,9 @@ final class VoiceSpike: ObservableObject {
         setupBroadcastListeners()
         startExtLogPolling()
         add("[видео/демо] Демонстрация подготовлена: качество \(quality.rawValue), звук \(streamAudio), блюр \(blur), запись \(record)")
+        // Регистрируем стрим у Discord сразу — чтобы иконка Live появилась и кнопка переключилась,
+        // не дожидаясь сигнала от расширения (оно под ESign не всегда достукивается до приложения).
+        registerStreamWithDiscord(reason: "нажата кнопка старта")
     }
 
     private func setupBroadcastListeners() {
@@ -1336,25 +1341,53 @@ final class VoiceSpike: ObservableObject {
         }
     }
 
-    /// Пришёл сигнал, что системная трансляция реально стартовала — регистрируем стрим у Discord.
+    /// Пришёл сигнал, что системная трансляция реально стартовала. Регистрация уже могла пройти
+    /// по нажатию кнопки — тогда здесь ничего не делаем (идемпотентно).
     private func onBroadcastStarted() {
-        guard isConnected, !broadcasting, let cid = activeChannelId, let gid = guildId else { return }
+        registerStreamWithDiscord(reason: "система начала запись экрана")
+    }
+
+    /// Регистрируем стрим у Discord (op 18 Stream Create). Идемпотентно: повторный вызов
+    /// (например, и по кнопке, и по сигналу расширения) отработает только один раз.
+    private func registerStreamWithDiscord(reason: String) {
+        guard !broadcasting else { return }
+        guard isConnected, let cid = activeChannelId, let gid = guildId else {
+            add("[видео/демо] Не могу начать стрим: нет активного голосового канала")
+            return
+        }
         broadcasting = true
+        broadcastFramesSeen = false
         broadcastStatus = "Запускаю демонстрацию…"
         broadcastKey = "guild:\(gid):\(cid):\(userId)"
-        add("[видео/демо] Система начала запись экрана, отправляю op 18 (Stream Create)")
+        add("[видео/демо] Отправляю op 18 (Stream Create) — \(reason)")
         _ = sendGateway?([
             "op": 18,
             "d": ["type": "guild", "guild_id": gid, "channel_id": cid, "preferred_region": NSNull()]
         ])
         // Снимаем возможную паузу.
         _ = sendGateway?(["op": 22, "d": ["stream_key": broadcastKey ?? "", "paused": false]])
+        startBroadcastWatchdog()
+    }
+
+    /// Если пользователь отменил системное окно трансляции, расширение не запустится и кадры не
+    /// пойдут. Через некоторое время сами свернём стрим, чтобы у Discord не висела пустая Live-иконка.
+    private func startBroadcastWatchdog() {
+        broadcastWatchdog?.invalidate()
+        broadcastWatchdog = Timer.scheduledTimer(withTimeInterval: 20, repeats: false) { [weak self] _ in
+            Task { @MainActor in
+                guard let self, self.broadcasting, !self.broadcastFramesSeen else { return }
+                self.add("[видео/демо] Кадры экрана так и не пошли за 20 с — останавливаю (окно трансляции отменено?)")
+                self.stopBroadcast(notify: true)
+            }
+        }
     }
 
     func stopBroadcast(notify: Bool) {
         guard broadcasting || broadcastGateway != nil else { return }
         // Просим само расширение (захват экрана iOS) завершиться — иначе система продолжит писать экран.
         BroadcastShared.post(BroadcastShared.notifyStopCommand)
+        broadcastWatchdog?.invalidate()
+        broadcastWatchdog = nil
         if notify, let key = broadcastKey {
             _ = sendGateway?(["op": 18, "d": ["stream_key": key, "active": false]])
         }
@@ -1410,6 +1443,12 @@ final class VoiceSpike: ObservableObject {
 
     /// Кадр экрана из расширения → в отправляющий шлюз демонстрации.
     private func forwardScreenFrame(_ annexb: Data) {
+        if !broadcastFramesSeen {
+            broadcastFramesSeen = true
+            broadcastWatchdog?.invalidate()
+            broadcastWatchdog = nil
+            add("[видео/демо] Пошли кадры экрана от расширения")
+        }
         guard let gw = broadcastGateway else { return }
         let nals = H264AnnexB.split(annexb)
         guard !nals.isEmpty else { return }
