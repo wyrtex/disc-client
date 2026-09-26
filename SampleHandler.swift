@@ -19,6 +19,7 @@ class SampleHandler: RPBroadcastSampleHandler {
     private var blurOn: NSObjectProtocol?
     private var blurOff: NSObjectProtocol?
     private var blurToggle: NSObjectProtocol?
+    private var stopCmd: NSObjectProtocol?
     private var firstFrameSent = false
 
     private var width = 0
@@ -56,6 +57,14 @@ class SampleHandler: RPBroadcastSampleHandler {
             guard let self else { return }
             self.setBlur(!self.blur)
         }
+        // Приложение просит завершить трансляцию — останавливаем захват экрана.
+        stopCmd = BroadcastShared.observe(BroadcastShared.notifyStopCommand) { [weak self] in
+            guard let self else { return }
+            BroadcastShared.extLog("получена команда 'остановить' из приложения — завершаю трансляцию")
+            let err = NSError(domain: "DiscClient", code: 0,
+                              userInfo: [NSLocalizedDescriptionKey: "Трансляция остановлена"])
+            self.finishBroadcastWithError(err)
+        }
         BroadcastShared.post(BroadcastShared.notifyStarted)
         BroadcastShared.extLog("послал сигнал 'начал' приложению")
     }
@@ -63,6 +72,7 @@ class SampleHandler: RPBroadcastSampleHandler {
     override func broadcastFinished() {
         BroadcastShared.extLog("broadcastFinished: система остановила расширение (это может быть из-за памяти)")
         BroadcastShared.post(BroadcastShared.notifyStopped)
+        stopCmd = nil   // токен снимает наблюдение в своём deinit
         if let e = encoder { VTCompressionSessionInvalidate(e) }
         encoder = nil
         socket?.close()

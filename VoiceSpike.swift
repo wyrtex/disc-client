@@ -1353,6 +1353,8 @@ final class VoiceSpike: ObservableObject {
 
     func stopBroadcast(notify: Bool) {
         guard broadcasting || broadcastGateway != nil else { return }
+        // Просим само расширение (захват экрана iOS) завершиться — иначе система продолжит писать экран.
+        BroadcastShared.post(BroadcastShared.notifyStopCommand)
         if notify, let key = broadcastKey {
             _ = sendGateway?(["op": 18, "d": ["stream_key": key, "active": false]])
         }

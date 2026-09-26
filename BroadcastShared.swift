@@ -21,6 +21,8 @@ enum BroadcastShared {
     // Расширение → приложение: трансляция началась/закончилась.
     static let notifyStarted = "com.example.discclient.broadcast.started"
     static let notifyStopped = "com.example.discclient.broadcast.stopped"
+    // Команда приложения расширению: заверши трансляцию (пользователь нажал «остановить» в приложении).
+    static let notifyStopCommand = "com.example.discclient.broadcast.stopCommand"
     static let notifyRecordingReady = "com.example.discclient.broadcast.recordingReady"
 
     static var defaults: UserDefaults? { UserDefaults(suiteName: appGroup) }

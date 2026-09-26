@@ -361,6 +361,7 @@ struct VoiceView: View {
     // MARK: Кнопки управления
 
     private var controls: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
         HStack(spacing: 8) {
             controlButton(
                 icon: (voice.muted || voice.deafened) ? "mic.slash.fill" : "mic.fill",
@@ -384,6 +385,16 @@ struct VoiceView: View {
                 controlButton(icon: voice.blurOn ? "eye.slash.fill" : "eye.fill", active: voice.blurOn) {
                     voice.toggleBlur()
                 }
+                // Идёт трансляция — эта кнопка её завершает
+                Button {
+                    voice.stopBroadcast(notify: true)
+                } label: {
+                    Image(systemName: "rectangle.slash.fill")
+                        .font(.system(size: 20))
+                        .foregroundStyle(.white)
+                        .frame(width: 54, height: 54)
+                        .background(Color.red, in: Circle())
+                }
             } else {
                 controlButton(icon: "rectangle.on.rectangle", active: false) {
                     showStreamSettings = true
@@ -402,6 +413,8 @@ struct VoiceView: View {
             }
         }
         .padding(.horizontal, 12)
+        .frame(minWidth: UIScreen.main.bounds.width)
+        }
         .padding(.top, 10)
         .padding(.bottom, 24)
         .frame(maxWidth: .infinity)
