@@ -493,6 +493,7 @@ struct ParticipantTile: View {
     @ObservedObject var voice: VoiceSpike
     let id: String
     @State private var showProfile = false
+    @State private var tileColor: Color?
 
     private var user: User? {
         voice.users[id] ?? store.voiceUsers[id] ?? (store.me?.id == id ? store.me : nil)
@@ -519,11 +520,18 @@ struct ParticipantTile: View {
             }
             .frame(maxWidth: .infinity)
             .frame(height: 150)
-            .background(Theme.panel, in: RoundedRectangle(cornerRadius: 14))
+            .background(tileColor ?? Theme.panel, in: RoundedRectangle(cornerRadius: 14))
             .overlay(
                 RoundedRectangle(cornerRadius: 14)
                     .stroke(speaking ? Theme.green : Color.clear, lineWidth: 3)
             )
+            .task(id: user?.avatarURL(size: 128)) {
+                if let url = user?.avatarURL(size: 128) {
+                    tileColor = await ImageLoader.shared.averageColor(for: url)
+                } else {
+                    tileColor = nil
+                }
+            }
             .overlay(alignment: .topTrailing) {
                 HStack(spacing: 4) {
                     if flag.stream { liveBadge }
@@ -625,6 +633,9 @@ struct CaptionsPanel: View {
     @EnvironmentObject var translator: Translator
     @ObservedObject var voice: VoiceSpike
     @State private var showLanguages = false
+    @State private var distanceFromBottom: CGFloat = 0
+    @AppStorage("captionPanelHeight") private var panelHeight: Double = 230
+    @State private var dragStartHeight: Double?
 
     private func user(_ id: String) -> User? {
         voice.users[id] ?? store.voiceUsers[id] ?? (store.me?.id == id ? store.me : nil)
@@ -637,6 +648,7 @@ struct CaptionsPanel: View {
 
     var body: some View {
         VStack(spacing: 0) {
+            grabber
             header
 
             if !voice.captionStatus.isEmpty {
@@ -677,18 +689,41 @@ struct CaptionsPanel: View {
                     .padding(.horizontal, 14)
                     .padding(.bottom, 8)
                 }
+                .onScrollGeometryChange(for: CGFloat.self) { geo in
+                    max(0, geo.contentSize.height - geo.containerSize.height - geo.contentOffset.y)
+                } action: { _, d in distanceFromBottom = d }
                 .onChange(of: voice.captionsVersion) { _, _ in
-                    if let last = voice.captions.last?.id {
-                        proxy.scrollTo(last, anchor: .bottom)
-                    }
+                    // Автопрокрутка вниз только если пользователь и так внизу; иначе не дёргаем.
+                    guard distanceFromBottom < 120, let last = voice.captions.last?.id else { return }
+                    proxy.scrollTo(last, anchor: .bottom)
                 }
             }
         }
-        .frame(height: 230)
+        .frame(height: CGFloat(panelHeight))
         .background(Theme.panel)
         .sheet(isPresented: $showLanguages) {
             CaptionLanguagesSheet(voice: voice)
         }
+    }
+
+    /// Полоска-ручка сверху: тянешь вверх/вниз — меняешь высоту окна субтитров.
+    private var grabber: some View {
+        Capsule()
+            .fill(Theme.muted.opacity(0.5))
+            .frame(width: 40, height: 5)
+            .frame(maxWidth: .infinity)
+            .frame(height: 22)
+            .contentShape(Rectangle())
+            .gesture(
+                DragGesture()
+                    .onChanged { v in
+                        if dragStartHeight == nil { dragStartHeight = panelHeight }
+                        // Тянем вверх (отрицательный y) — окно выше.
+                        let h = (dragStartHeight ?? panelHeight) - Double(v.translation.height)
+                        panelHeight = min(560, max(120, h))
+                    }
+                    .onEnded { _ in dragStartHeight = nil }
+            )
     }
 
     private var header: some View {

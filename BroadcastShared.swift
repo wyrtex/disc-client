@@ -6,6 +6,9 @@ enum BroadcastShared {
     static let appGroup = "group.com.example.discclient"
     /// Файл-сокет (Unix domain socket) в общей папке — по нему расширение шлёт кадры в приложение.
     static let socketName = "broadcast.sock"
+    /// Под ESign App Group недоступен, поэтому кадры гоним по локальному TCP на 127.0.0.1.
+    /// Порт из «динамического» диапазона, чтобы ни с чем не конфликтовать.
+    static let socketPort: UInt16 = 48291
 
     // Ключи настроек в общем UserDefaults
     static let keyQuality = "stream.quality"      // "default" | "high"

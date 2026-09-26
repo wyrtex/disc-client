@@ -703,13 +703,8 @@ final class VoiceSpike: ObservableObject {
         if let saved = UserDefaults.standard.stringArray(forKey: "captionLangs"), !saved.isEmpty {
             return saved
         }
-        var out = ["ru-RU", "en-US"]
-        // Язык системы тоже включаем, если он есть в списке.
-        let sys = Locale.preferredLanguages.first?.prefix(2) ?? ""
-        if let l = TranscriptLanguage.all.first(where: { $0.code.hasPrefix(String(sys)) }), !out.contains(l.code) {
-            out.append(l.code)
-        }
-        return out
+        // По умолчанию — испанский и английский.
+        return ["es-ES", "en-US"]
     }
     @Published var captionStatus = ""
     @Published var captions: [Caption] = []
@@ -842,6 +837,10 @@ final class VoiceSpike: ObservableObject {
         flags = [:]
         lastHeard = [:]
         captions = []
+        // Перезапускаем субтитры на новом канале, чтобы распознавание не осталось в старом состоянии.
+        if captionsEnabled {
+            transcriber.configure(enabled: true, locales: captionLangs)
+        }
         stageTopic = nil
         stageSuppressed = true
         handRaised = false
@@ -965,6 +964,8 @@ final class VoiceSpike: ObservableObject {
         }
     }
 
+    private var reconfigureWork: DispatchWorkItem?
+
     /// Включить или выключить язык распознавания (при включении модель скачивается).
     func toggleCaptionLanguage(_ code: String) {
         if captionLangs.contains(code) {
@@ -973,9 +974,20 @@ final class VoiceSpike: ObservableObject {
         } else {
             captionLangs.append(code)
         }
-        if captionsEnabled {
-            transcriber.configure(enabled: true, locales: captionLangs)
+        scheduleReconfigure()
+    }
+
+    /// Пересобираем распознавание с задержкой, чтобы несколько быстрых нажатий по языкам
+    /// не порождали кучу перезапусков подряд (из-за них субтитры и зависали).
+    private func scheduleReconfigure() {
+        guard captionsEnabled else { return }
+        reconfigureWork?.cancel()
+        let langs = captionLangs
+        let work = DispatchWorkItem { [weak self] in
+            self?.transcriber.configure(enabled: true, locales: langs)
         }
+        reconfigureWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6, execute: work)
     }
 
     func handleTranscript(_ u: VoiceTranscriber.Update) {
@@ -1299,7 +1311,11 @@ final class VoiceSpike: ObservableObject {
     private func setupBroadcastListeners() {
         socketServer.onConnect = { [weak self] in
             Task { @MainActor in
-                self?.add("[видео/демо] Расширение трансляции подключилось к приложению")
+                guard let self else { return }
+                self.add("[видео/демо] Расширение трансляции подключилось к приложению")
+                // App Group под ESign недоступен, поэтому исходное состояние блюра сообщаем
+                // расширению уведомлением сразу после подключения.
+                BroadcastShared.post(self.blurOn ? BroadcastShared.notifyBlurOn : BroadcastShared.notifyBlurOff)
             }
         }
         socketServer.onFrame = { [weak self] type, payload in
@@ -1389,7 +1405,9 @@ final class VoiceSpike: ObservableObject {
         broadcastWatchdog?.invalidate()
         broadcastWatchdog = nil
         if notify, let key = broadcastKey {
-            _ = sendGateway?(["op": 18, "d": ["stream_key": key, "active": false]])
+            // op 19 = Stream Delete (та же форма, что и «перестать смотреть»). op 18 с active:false
+            // Discord считал битым пакетом и рвал основной шлюз (код 4002) — из-за этого и кикало.
+            _ = sendGateway?(["op": 19, "d": ["stream_key": key]])
         }
         broadcastGateway?.stop()
         broadcastGateway = nil

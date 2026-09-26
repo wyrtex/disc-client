@@ -35,6 +35,7 @@ struct ChatView: View {
     @State private var showTranslate = false
     @State private var scrollTarget: String?
     @State private var scrollAnchor: UnitPoint = .bottom
+    @State private var chatDistanceFromBottom: CGFloat = 0
     @State private var flashId: String?
     @State private var mentionMap: [String: String] = [:]
     @State private var suggestions: [Suggestion] = []
@@ -328,8 +329,13 @@ struct ChatView: View {
             }
             .scrollDismissesKeyboard(.interactively)
             .defaultScrollAnchor(.bottom)
+            .onScrollGeometryChange(for: CGFloat.self) { geo in
+                max(0, geo.contentSize.height - geo.containerSize.height - geo.contentOffset.y)
+            } action: { _, d in chatDistanceFromBottom = d }
             .onChange(of: msgs.last?.id) { _, newValue in
-                if let newValue, !detached { proxy.scrollTo(newValue, anchor: .bottom) }
+                // Прыгаем к новому сообщению только когда пользователь и так внизу.
+                guard let newValue, !detached, chatDistanceFromBottom < 250 else { return }
+                proxy.scrollTo(newValue, anchor: .bottom)
             }
             .onChange(of: scrollTarget) { _, id in
                 guard let id else { return }

@@ -1,5 +1,6 @@
 import SwiftUI
 import ImageIO
+import CoreImage
 
 /// Ограничитель числа одновременных задач (чтобы аватарки не душили канал, по которому идёт голос).
 actor AsyncLimiter {
@@ -74,6 +75,29 @@ final class ImageLoader {
         inflight[url] = nil
         lock.unlock()
         return img
+    }
+
+    // Средний цвет аватарки — для фона плиток в голосовом канале.
+    private let colorCache = NSCache<NSURL, UIColor>()
+    private let ciContext = CIContext(options: [.workingColorSpace: NSNull()])
+
+    func averageColor(for url: URL) async -> Color? {
+        if let c = colorCache.object(forKey: url as NSURL) { return Color(uiColor: c) }
+        guard let img = await image(for: url), let cg = img.cgImage else { return nil }
+        let ci = CIImage(cgImage: cg)
+        let filter = CIFilter(name: "CIAreaAverage", parameters: [
+            kCIInputImageKey: ci,
+            kCIInputExtentKey: CIVector(cgRect: ci.extent)
+        ])
+        guard let out = filter?.outputImage else { return nil }
+        var bitmap = [UInt8](repeating: 0, count: 4)
+        ciContext.render(out, toBitmap: &bitmap, rowBytes: 4,
+                         bounds: CGRect(x: 0, y: 0, width: 1, height: 1),
+                         format: .RGBA8, colorSpace: nil)
+        let color = UIColor(red: CGFloat(bitmap[0]) / 255, green: CGFloat(bitmap[1]) / 255,
+                            blue: CGFloat(bitmap[2]) / 255, alpha: 1)
+        colorCache.setObject(color, forKey: url as NSURL)
+        return Color(uiColor: color)
     }
 
     private static func fetch(_ url: URL, session: URLSession) async -> UIImage? {
