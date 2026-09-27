@@ -2,15 +2,8 @@ import SwiftUI
 import ReplayKit
 import AVFoundation
 
-/// Кнопка запуска трансляции экрана.
-///
-/// Важный нюанс: на iOS 17+ системная кнопка внутри `RPSystemBroadcastPickerView` реагирует
-/// только на НАСТОЯЩЕЕ касание пальцем — синтетический `sendActions(.touchUpInside)` игнорируется,
-/// поэтому окно «Начать трансляцию» не появлялось и расширение не запускалось.
-///
-/// Решение: кладём настоящий `RPSystemBroadcastPickerView` поверх нашей кнопки (почти прозрачным),
-/// чтобы палец пользователя попадал прямо в системную кнопку. Параллельно распознаватель касаний
-/// (не отменяющий касание) готовит трансляцию — поднимает локальный сокет и шлёт op 18.
+/// Кнопка, которая вызывает системное окно «Общий экран» (как в официальном клиенте).
+/// Тап по нашей кнопке программно нажимает скрытую системную кнопку трансляции.
 struct BroadcastStartButton: UIViewRepresentable {
     let voice: VoiceSpike
     let quality: BroadcastShared.Quality
@@ -21,37 +14,35 @@ struct BroadcastStartButton: UIViewRepresentable {
 
     func makeUIView(context: Context) -> UIView {
         let container = TappableContainer()
-        container.onPrepare = {
-            voice.prepareBroadcast(quality: quality, streamAudio: streamAudio, blur: blur, record: record)
-            voice.add("[видео/демо] Открываю системное окно трансляции (нажми «Начать трансляцию»)")
-            onTapped()
-        }
-
-        let picker = RPSystemBroadcastPickerView(frame: .zero)
-        // ESign при переподписи может менять bundle id расширения, поэтому не хардкодим его,
-        // а находим настоящий .appex прямо в бандле — иначе система запускает не наше расширение.
+        let picker = RPSystemBroadcastPickerView(frame: CGRect(x: 0, y: 0, width: 60, height: 60))
+        // ESign при переподписи может менять bundle id расширения, поэтому находим его сами.
         let extID = Self.broadcastExtensionBundleID()
         picker.preferredExtension = extID ?? "com.example.discclient.broadcast"
-        voice.add("[видео/демо] Расширение для трансляции: \(extID ?? "не найдено, беру дефолт com.example.discclient.broadcast")")
         picker.showsMicrophoneButton = false
-        picker.translatesAutoresizingMaskIntoConstraints = false
-        // Почти прозрачный, но живой и ПОВЕРХ всего — палец попадает в системную кнопку.
         picker.alpha = 0.02
-        container.addSubview(picker)
+        picker.translatesAutoresizingMaskIntoConstraints = false
+        container.insertSubview(picker, at: 0)
         NSLayoutConstraint.activate([
-            picker.topAnchor.constraint(equalTo: container.topAnchor),
-            picker.bottomAnchor.constraint(equalTo: container.bottomAnchor),
-            picker.leadingAnchor.constraint(equalTo: container.leadingAnchor),
-            picker.trailingAnchor.constraint(equalTo: container.trailingAnchor)
+            picker.centerXAnchor.constraint(equalTo: container.centerXAnchor),
+            picker.centerYAnchor.constraint(equalTo: container.centerYAnchor),
+            picker.widthAnchor.constraint(equalTo: container.widthAnchor),
+            picker.heightAnchor.constraint(equalTo: container.heightAnchor)
         ])
         container.picker = picker
+        container.onTap = {
+            voice.add("[видео/демо] Расширение для трансляции: \(extID ?? "не найдено, дефолт com.example.discclient.broadcast")")
+            voice.prepareBroadcast(quality: quality, streamAudio: streamAudio, blur: blur, record: record)
+            onTapped()
+            if !container.triggerPicker() {
+                voice.add("[видео/демо] Не нашёл системную кнопку трансляции — окно «Начать трансляцию» не открылось")
+            }
+        }
         return container
     }
 
     func updateUIView(_ uiView: UIView, context: Context) {}
 
-    /// Находим bundle id встроенного broadcast-upload расширения (у него в Info.plist
-    /// NSExtensionPointIdentifier == com.apple.broadcast-services-upload).
+    /// Находим bundle id встроенного broadcast-upload расширения.
     static func broadcastExtensionBundleID() -> String? {
         guard let plugins = Bundle.main.builtInPlugInsURL,
               let items = try? FileManager.default.contentsOfDirectory(
@@ -68,7 +59,7 @@ struct BroadcastStartButton: UIViewRepresentable {
 
     final class TappableContainer: UIView {
         weak var picker: RPSystemBroadcastPickerView?
-        var onPrepare: (() -> Void)?
+        var onTap: (() -> Void)?
         private let label = UILabel()
 
         override init(frame: CGRect) {
@@ -86,17 +77,27 @@ struct BroadcastStartButton: UIViewRepresentable {
                 label.centerYAnchor.constraint(equalTo: centerYAnchor),
                 heightAnchor.constraint(equalToConstant: 52)
             ])
-            // Распознаватель готовит трансляцию, но НЕ отменяет касание — оно доходит до
-            // системной кнопки, и та показывает окно «Начать трансляцию».
-            let tap = UITapGestureRecognizer(target: self, action: #selector(prepareTapped))
-            tap.cancelsTouchesInView = false
-            tap.delaysTouchesBegan = false
-            tap.delaysTouchesEnded = false
-            addGestureRecognizer(tap)
+            addGestureRecognizer(UITapGestureRecognizer(target: self, action: #selector(tap)))
         }
 
         required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
-        @objc private func prepareTapped() { onPrepare?() }
+        @objc private func tap() { onTap?() }
+
+        /// Ищем системную кнопку трансляции рекурсивно и жмём её.
+        @discardableResult
+        func triggerPicker() -> Bool {
+            guard let picker = picker, let button = Self.findButton(in: picker) else { return false }
+            button.sendActions(for: .touchUpInside)
+            return true
+        }
+
+        private static func findButton(in view: UIView) -> UIButton? {
+            if let b = view as? UIButton { return b }
+            for sub in view.subviews {
+                if let b = findButton(in: sub) { return b }
+            }
+            return nil
+        }
     }
 }

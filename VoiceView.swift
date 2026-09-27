@@ -1311,9 +1311,7 @@ struct StreamSettingsSheet: View {
                     .multilineTextAlignment(.center)
 
                 BroadcastStartButton(voice: voice, quality: quality, streamAudio: streamAudio, blur: blur, record: false) {
-                    // Не закрываем лист сразу: системное окно трансляции показывается от живого
-                    // picker, а мгновенное закрытие уничтожало его и окно не появлялось.
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { dismiss() }
+                    dismiss()
                 }
             }
             .padding(16)

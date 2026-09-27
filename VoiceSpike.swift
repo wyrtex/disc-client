@@ -31,6 +31,7 @@ final class VoiceGateway {
     var onAudio: ((String) -> Void)?
     var onLocalSpeaking: ((Bool) -> Void)?
     var onMicLevel: ((Float) -> Void)?
+    var onKeyframeRequest: (() -> Void)?
     var vadThreshold: () -> Double = { -45 }
     var volumeForUser: ((String) -> Float)?
 
@@ -465,6 +466,7 @@ final class VoiceGateway {
                 let d: [String: Any] = ["speaking": on ? 1 : 0, "delay": 0, "ssrc": Int(self.ownSsrc)]
                 self.send(["op": 5, "d": d])
             }
+            m.onKeyframeRequest = { [weak self] in self?.onKeyframeRequest?() }
             for (ssrc, uid) in ssrcMap {
                 m.setSsrc(ssrc, user: uid)
                 audio.setVolume(volumeForUser?(uid) ?? 1, forUser: uid)
@@ -1533,6 +1535,13 @@ final class VoiceSpike: ObservableObject {
                 self.broadcastStatus = s.contains("E2EE") ? "В эфире" : s
             }
         }
+        // Discord просит опорный кадр демонстрации — просим расширение выдать keyframe.
+        vg.onKeyframeRequest = { [weak self] in
+            Task { @MainActor in
+                self?.add("[видео/демо] Discord запросил ключевой кадр демонстрации")
+                BroadcastShared.post(BroadcastShared.notifyForceKeyframe)
+            }
+        }
         broadcastGateway = vg
         vg.start()
     }
@@ -1670,6 +1679,13 @@ final class VoiceSpike: ObservableObject {
                 if self.micLevelDb > self.vadThreshold, !self.muted, !self.deafened {
                     self.markHeard(self.userId)
                 }
+            }
+        }
+        // Discord просит опорный кадр камеры — выдаём его немедленно.
+        vg.onKeyframeRequest = { [weak self] in
+            Task { @MainActor in
+                self?.add("[видео] Discord запросил ключевой кадр камеры")
+                self?.camera.requestKeyframe()
             }
         }
         gateway = vg

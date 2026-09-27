@@ -107,6 +107,8 @@ final class VoiceMedia {
     private var videoRtpSeq = UInt16.random(in: 0...UInt16.max)
     private var videoNonceCounter: UInt32 = 0
     private static let rtpMaxPayload = 1100 // с запасом под заголовок/шифр-тег/nonce, не бьёт MTU
+    /// Discord попросил ключевой кадр (PLI/FIR) — камера/расширение должны его выдать.
+    var onKeyframeRequest: (() -> Void)?
 
     private var muted = false
     private var speakingNow = false
@@ -278,8 +280,11 @@ final class VoiceMedia {
 
     private func handlePacket(_ packet: Data) {
         let bytes = [UInt8](packet)
-        // RTCP и служебные пакеты пропускаем
-        if bytes.count >= 2, bytes[1] >= 192, bytes[1] <= 223 { return }
+        // RTCP: разбираем запросы ключевого кадра (PLI/FIR), остальное пропускаем.
+        if bytes.count >= 2, bytes[1] >= 192, bytes[1] <= 223 {
+            parseRtcp(bytes)
+            return
+        }
 
         stats.received += 1
         guard let (packetSsrc, packetTs, payload) = openTransport(bytes) else {
@@ -447,6 +452,52 @@ final class VoiceMedia {
 
     func setVideoSsrc(_ s: UInt32) {
         queue.async { self.videoSsrc = s }
+    }
+
+    /// Discord (SFU/зритель) просит ключевой кадр через RTCP PLI (PT 206, FMT 1) или FIR
+    /// (PT 206, FMT 4). Без ответа на них зритель, подключившийся позже, не получает опорный
+    /// кадр и видит ошибку (2015). Разбираем составной RTCP и дёргаем колбэк.
+    private var lastKeyframeRequest = Date.distantPast
+    private func parseRtcp(_ bytes: [UInt8]) {
+        // RTCP может прийти как открытым, так и зашифрованным (aead_..._rtpsize: первые 8 байт —
+        // AAD, дальше шифр + 16 байт тега + 4 байта nonce). Пробуем оба варианта.
+        var want = scanForKeyframe(bytes)
+        if !want, bytes.count >= 8 + 16 + 4 {
+            let aad = Data(bytes[0..<8])
+            let tagStart = bytes.count - 4 - 16
+            if tagStart > 8 {
+                let cipher = Data(bytes[8..<tagStart])
+                let tag = Data(bytes[tagStart..<(bytes.count - 4)])
+                var nonceData = Data(bytes[(bytes.count - 4)...]); nonceData.append(Data(count: 8))
+                if let nonce = try? AES.GCM.Nonce(data: nonceData),
+                   let box = try? AES.GCM.SealedBox(nonce: nonce, ciphertext: cipher, tag: tag),
+                   let plain = try? AES.GCM.open(box, using: key, authenticating: aad) {
+                    var full = [UInt8](bytes[0..<8]); full.append(contentsOf: plain)
+                    want = scanForKeyframe(full)
+                }
+            }
+        }
+        guard want else { return }
+        let now = Date()
+        if now.timeIntervalSince(lastKeyframeRequest) > 0.3 {   // не душим кодек шквалом PLI
+            lastKeyframeRequest = now
+            onKeyframeRequest?()
+        }
+    }
+
+    /// Идём по составному RTCP: PLI = PT 206 / FMT 1, FIR = PT 206 / FMT 4.
+    private func scanForKeyframe(_ b: [UInt8]) -> Bool {
+        var i = 0
+        while i + 4 <= b.count {
+            let fmt = b[i] & 0x1F
+            let pt = b[i + 1]
+            let words = Int(b[i + 2]) << 8 | Int(b[i + 3])
+            if pt == 206, fmt == 1 || fmt == 4 { return true }
+            let pktLen = (words + 1) * 4
+            if pktLen <= 0 { break }
+            i += pktLen
+        }
+        return false
     }
 
     /// Отправить один кадр H264: каждый NAL-юнит отдельно, крупные — разбиваются на FU-A.

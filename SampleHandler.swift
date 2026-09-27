@@ -20,6 +20,7 @@ class SampleHandler: RPBroadcastSampleHandler {
     private var blurOff: NSObjectProtocol?
     private var blurToggle: NSObjectProtocol?
     private var stopCmd: NSObjectProtocol?
+    private var forceKeyframeObs: NSObjectProtocol?
     private var firstFrameSent = false
 
     private var width = 0
@@ -58,6 +59,10 @@ class SampleHandler: RPBroadcastSampleHandler {
         blurToggle = BroadcastShared.observe(BroadcastShared.notifyBlurToggle) { [weak self] in
             guard let self else { return }
             self.setBlur(!self.blur)
+        }
+        // Приложение просит ключевой кадр (Discord прислал PLI) — выдаём IDR со следующего кадра.
+        forceKeyframeObs = BroadcastShared.observe(BroadcastShared.notifyForceKeyframe) { [weak self] in
+            self?.forceKeyFrame = true
         }
         // Приложение просит завершить трансляцию — останавливаем захват экрана.
         stopCmd = BroadcastShared.observe(BroadcastShared.notifyStopCommand) { [weak self] in

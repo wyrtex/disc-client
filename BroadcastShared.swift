@@ -26,6 +26,8 @@ enum BroadcastShared {
     static let notifyStopped = "com.example.discclient.broadcast.stopped"
     // Команда приложения расширению: заверши трансляцию (пользователь нажал «остановить» в приложении).
     static let notifyStopCommand = "com.example.discclient.broadcast.stopCommand"
+    // Команда приложения расширению: выдай ключевой кадр (Discord прислал PLI/FIR).
+    static let notifyForceKeyframe = "com.example.discclient.broadcast.forceKeyframe"
     static let notifyRecordingReady = "com.example.discclient.broadcast.recordingReady"
     // Диагностические «маячки» расширения (Darwin работает без App Group): показывают, до какого
     // шага дошло расширение. Приложение их слушает и пишет в свой лог.

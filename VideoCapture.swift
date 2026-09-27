@@ -92,6 +92,11 @@ final class CameraSource: NSObject {
         }
     }
 
+    /// Немедленно выдать ключевой кадр (по запросу Discord PLI/FIR).
+    func requestKeyframe() {
+        forceKeyFrame = true
+    }
+
     private func startInternal(position: AVCaptureDevice.Position) {
         self.position = position
         session.beginConfiguration()
