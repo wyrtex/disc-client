@@ -468,17 +468,23 @@ final class VoiceMedia {
         if hasExtension {
             let n = extWords * 4
             guard payload.count >= n else { return nil }
-            if !loggedExt {
-                loggedExt = true
+            let pt = Int(bytes[1] & 0x7F)
+            // Логируем расширение отдельно для звука (pt 120) и для видео (иные pt, напр. 101),
+            // чтобы узнать точную карту ИД видео-расширений, которую ждёт Discord в UDP-режиме.
+            let isVideoPt = pt != 120
+            if (isVideoPt && !loggedVideoExt) || (!isVideoPt && !loggedAudioExt) {
+                if isVideoPt { loggedVideoExt = true } else { loggedAudioExt = true }
                 let hdr = bytes[(headerLen - 4)..<headerLen].map { String(format: "%02x", $0) }.joined()
                 let data = plain.prefix(n).map { String(format: "%02x", $0) }.joined()
-                log?("[видео-диагностика] RTP-расширение Discord: заголовок \(hdr), данные \(data) (\(extWords) слов, pt \(Int(bytes[1] & 0x7F)))")
+                let kind = isVideoPt ? "ВИДЕО" : "звук"
+                log?("[видео-диагностика] RTP-расширение Discord (\(kind)): заголовок \(hdr), данные \(data) (\(extWords) слов, pt \(pt))")
             }
             payload = Data(payload.dropFirst(n))
         }
         return (src, rtpTs, payload)
     }
-    private var loggedExt = false
+    private var loggedAudioExt = false
+    private var loggedVideoExt = false
 
     // MARK: Отправка
 
@@ -642,26 +648,19 @@ final class VoiceMedia {
         }
     }
 
-    private var transportCcSeq: UInt16 = 0
-
-    /// RTP-расширение заголовка (RFC 5285, one-byte), с ИД как у рабочего клиента (werift/dank074):
-    /// abs-send-time = ID 2, transport-wide-cc = ID 3. Раньше стояли 3 и 5 — SFU Discord неверно
-    /// читал congestion-control и не раздавал видео (пилюля без картинки → 2015).
+    /// RTP-расширение заголовка (RFC 5285, one-byte). ИД взяты из РЕАЛЬНОГО пакета Discord,
+    /// пойманного нашим же приёмом (openTransport): abs-send-time = ID 3 (3 байта). Именно так
+    /// Discord шлёт в UDP-режиме (aead_..._rtpsize), в отличие от WebRTC-SDP (там был бы ID 2).
     /// Данные расширения шифруются транспортным ключом (его сервер Discord знает и читает).
     private func buildVideoExtension() -> Data {
         var ext = Data()
-        // abs-send-time (ID 2): 24 бита, секунды в формате Q6.18 (обнуляется каждые 64 c).
+        // abs-send-time (ID 3): 24 бита, секунды в формате Q6.18 (обнуляется каждые 64 c).
         let t = Date().timeIntervalSince1970.truncatingRemainder(dividingBy: 64.0)
         let ast = UInt32(t * 262144.0) & 0xFFFFFF
-        ext.append(UInt8((2 << 4) | (3 - 1)))          // ID 2, длина 3
+        ext.append(UInt8((3 << 4) | (3 - 1)))          // ID 3, длина 3
         ext.append(UInt8((ast >> 16) & 0xFF))
         ext.append(UInt8((ast >> 8) & 0xFF))
         ext.append(UInt8(ast & 0xFF))
-        // transport-wide congestion control (ID 3): сквозной 16-битный счётчик.
-        ext.append(UInt8((3 << 4) | (2 - 1)))          // ID 3, длина 2
-        ext.append(UInt8(transportCcSeq >> 8))
-        ext.append(UInt8(transportCcSeq & 0xFF))
-        transportCcSeq = transportCcSeq &+ 1
         while ext.count % 4 != 0 { ext.append(0) }     // дополняем до слова
         return ext
     }

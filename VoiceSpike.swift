@@ -550,6 +550,9 @@ final class VoiceGateway {
             "active": true,
             "ssrc": Int(videoSsrc),
             "rtx_ssrc": Int(rtxSsrc),
+            // max_bitrate обязателен: рабочий клиент (dank074) всегда шлёт его в op 12.
+            // Без него SFU не заводит наш видео-поток как активный источник для раздачи.
+            "max_bitrate": 10_000_000,
             "max_framerate": 30,
             "max_resolution": ["type": "fixed", "width": 1280, "height": 720]
         ]
@@ -560,7 +563,11 @@ final class VoiceGateway {
             "streams": [stream]
         ]
         send(["op": 12, "d": d])
-        log("Камера: включена, ssrc \(videoSsrc), отправил op 12 (с разрешением)")
+        // КЛЮЧЕВОЕ: op 5 (Speaking) с битом видео (2) нужно послать СРАЗУ при включении камеры,
+        // не дожидаясь, пока заговорит микрофон. Иначе, если молчишь, Discord не помечает наш
+        // видео-ssrc активным источником и не раздаёт камеру зрителям (демка это уже делала явно).
+        send(["op": 5, "d": ["speaking": 2, "delay": 0, "ssrc": Int(ownSsrc)]])
+        log("Камера: включена, ssrc \(videoSsrc), отправил op 12 и op 5 (video flag)")
     }
 
     func stopVideo() {
@@ -575,6 +582,8 @@ final class VoiceGateway {
             "rtx_ssrc": Int(readyVideoRtxSsrc ?? (videoSsrc &+ 1)), "streams": [stream]
         ]
         send(["op": 12, "d": d])
+        // Снимаем видео-флаг в speaking (0), чтобы Discord корректно закрыл наш видео-источник.
+        send(["op": 5, "d": ["speaking": 0, "delay": 0, "ssrc": Int(ownSsrc)]])
         log("Камера: выключена")
     }
 
