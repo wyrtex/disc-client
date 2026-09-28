@@ -571,11 +571,36 @@ final class VoiceMedia {
         }
     }
 
+    private var transportCcSeq: UInt16 = 0
+
+    /// RTP-расширение заголовка (RFC 5285, one-byte), как у официального клиента Discord:
+    /// abs-send-time (ID 3, 3 байта) и transport-cc (ID 5, 2 байта). Без него SFU Discord не
+    /// раздаёт наше видео зрителям (камера/стрим показываются «пилюлей», но без картинки → 2015).
+    /// Данные расширения шифруются транспортным ключом (его сервер Discord знает и читает).
+    private func buildVideoExtension() -> Data {
+        var ext = Data()
+        // abs-send-time: 24 бита, секунды в формате Q6.18 (обнуляется каждые 64 c — этого хватает).
+        let t = Date().timeIntervalSince1970.truncatingRemainder(dividingBy: 64.0)
+        let ast = UInt32(t * 262144.0) & 0xFFFFFF
+        ext.append(UInt8((3 << 4) | (3 - 1)))          // ID 3, длина 3
+        ext.append(UInt8((ast >> 16) & 0xFF))
+        ext.append(UInt8((ast >> 8) & 0xFF))
+        ext.append(UInt8(ast & 0xFF))
+        // transport-wide congestion control: сквозной 16-битный счётчик.
+        ext.append(UInt8((5 << 4) | (2 - 1)))          // ID 5, длина 2
+        ext.append(UInt8(transportCcSeq >> 8))
+        ext.append(UInt8(transportCcSeq & 0xFF))
+        transportCcSeq = transportCcSeq &+ 1
+        while ext.count % 4 != 0 { ext.append(0) }     // дополняем до слова
+        return ext
+    }
+
     private func sendVideoPacket(_ payloadIn: Data, timestamp: UInt32, marker: Bool) {
-        let payload = payloadIn
+        let ext = buildVideoExtension()
+        let extWords = ext.count / 4
 
         var header = [UInt8](repeating: 0, count: 12)
-        header[0] = 0x80
+        header[0] = 0x90    // V=2, X=1 (есть расширение)
         header[1] = (marker ? 0x80 : 0x00) | (videoPayloadType & 0x7F)
         header[2] = UInt8(videoRtpSeq >> 8)
         header[3] = UInt8(videoRtpSeq & 0xFF)
@@ -589,6 +614,14 @@ final class VoiceMedia {
         header[11] = UInt8(videoSsrc & 0xFF)
         videoRtpSeq = videoRtpSeq &+ 1
 
+        // Заголовок расширения (bede + число слов) идёт открытым текстом и входит в AAD.
+        let extHeader: [UInt8] = [0xBE, 0xDE, UInt8((extWords >> 8) & 0xFF), UInt8(extWords & 0xFF)]
+        let aad = Data(header) + Data(extHeader)
+
+        // Шифруем: данные расширения + полезная нагрузка (как в rtpsize у Discord).
+        var plaintext = ext
+        plaintext.append(payloadIn)
+
         let counter = videoNonceCounter
         videoNonceCounter = videoNonceCounter &+ 1
         let nonce4: [UInt8] = [
@@ -599,9 +632,10 @@ final class VoiceMedia {
         nonceData.append(Data(count: 8))
 
         guard let nonce = try? AES.GCM.Nonce(data: nonceData),
-              let sealed = try? AES.GCM.seal(payload, using: key, nonce: nonce, authenticating: Data(header)) else { return }
+              let sealed = try? AES.GCM.seal(plaintext, using: key, nonce: nonce, authenticating: aad) else { return }
 
         var packet = Data(header)
+        packet.append(contentsOf: extHeader)
         packet.append(sealed.ciphertext)
         packet.append(sealed.tag)
         packet.append(contentsOf: nonce4)
