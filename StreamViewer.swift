@@ -39,6 +39,32 @@ enum H264AnnexB {
         }
         return d
     }
+
+    /// Строгое деление ТОЛЬКО по 4-байтовым стартовым кодам (00 00 00 01).
+    /// Нужно для отправки: приёмник собирает кадр обратно через join() с 4-байтовым кодом,
+    /// поэтому деление и сборка должны быть строго обратными. Обычный split() ловит и 3-байтовые
+    /// коды, а join() всегда пишет 4-байтовый — из-за этого в зашифрованном кадре, где попадаются
+    /// случайные 00 00 01, вставлялся лишний 0x00 и кадр у зрителя не расшифровывался.
+    static func splitStrict(_ data: Data) -> [Data] {
+        let b = [UInt8](data)
+        var starts: [Int] = []
+        var i = 0
+        while i + 3 < b.count {
+            if b[i] == 0, b[i + 1] == 0, b[i + 2] == 0, b[i + 3] == 1 {
+                starts.append(i)
+                i += 4
+            } else {
+                i += 1
+            }
+        }
+        var out: [Data] = []
+        for (k, s) in starts.enumerated() {
+            let nalStart = s + 4
+            let end = k + 1 < starts.count ? starts[k + 1] : b.count
+            if end > nalStart { out.append(Data(b[nalStart..<end])) }
+        }
+        return out
+    }
 }
 
 // MARK: - Экран, куда выводятся кадры демонстрации

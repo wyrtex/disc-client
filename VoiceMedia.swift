@@ -109,6 +109,11 @@ final class VoiceMedia {
     private static let rtpMaxPayload = 1100 // с запасом под заголовок/шифр-тег/nonce, не бьёт MTU
     /// Discord попросил ключевой кадр (PLI/FIR) — камера/расширение должны его выдать.
     var onKeyframeRequest: (() -> Void)?
+    // Диагностика видео-отправки: сколько видеопакетов ушло, сколько RTCP пришло и сколько из них
+    // запросов ключевого кадра. По ним видно, доходят ли PLI от Discord.
+    private var videoOut = 0
+    private var rtcpIn = 0
+    private var kfReqIn = 0
 
     private var muted = false
     private var speakingNow = false
@@ -272,6 +277,9 @@ final class VoiceMedia {
                 log?("Прочие RTP-пакеты (возможно, видео): \(text)")
             }
         }
+        if videoOut > 0 || rtcpIn > 0 {
+            log?("[видео-отпр] видеопакетов ушло \(videoOut), RTCP пришло \(rtcpIn), из них запросов ключевого кадра \(kfReqIn)")
+        }
         guard stats != lastReported else { return }
         lastReported = stats
         log?("Звук: принято \(stats.received), проиграно \(stats.played), отправлено \(stats.sent). Ошибки: транспорт \(stats.transportFail), SSRC \(stats.unknownSsrc), DAVE \(stats.daveFail), Opus \(stats.opusFail), шифрование \(stats.encryptFail)")
@@ -282,6 +290,7 @@ final class VoiceMedia {
         let bytes = [UInt8](packet)
         // RTCP: разбираем запросы ключевого кадра (PLI/FIR), остальное пропускаем.
         if bytes.count >= 2, bytes[1] >= 192, bytes[1] <= 223 {
+            rtcpIn += 1
             parseRtcp(bytes)
             return
         }
@@ -388,10 +397,17 @@ final class VoiceMedia {
         if hasExtension {
             let n = extWords * 4
             guard payload.count >= n else { return nil }
+            if !loggedExt {
+                loggedExt = true
+                let hdr = bytes[(headerLen - 4)..<headerLen].map { String(format: "%02x", $0) }.joined()
+                let data = plain.prefix(n).map { String(format: "%02x", $0) }.joined()
+                log?("[видео-диагностика] RTP-расширение Discord: заголовок \(hdr), данные \(data) (\(extWords) слов, pt \(Int(bytes[1] & 0x7F)))")
+            }
             payload = Data(payload.dropFirst(n))
         }
         return (src, rtpTs, payload)
     }
+    private var loggedExt = false
 
     // MARK: Отправка
 
@@ -478,6 +494,7 @@ final class VoiceMedia {
             }
         }
         guard want else { return }
+        kfReqIn += 1
         let now = Date()
         if now.timeIntervalSince(lastKeyframeRequest) > 0.3 {   // не душим кодек шквалом PLI
             lastKeyframeRequest = now
@@ -515,7 +532,9 @@ final class VoiceMedia {
                 }
                 frame = enc
             }
-            let units = H264AnnexB.split(frame)
+            // Строгое 4-байтовое деление: приёмник соберёт кадр обратно через join() (4 байта),
+            // поэтому деление должно быть строго обратным сборке.
+            let units = H264AnnexB.splitStrict(frame)
             for (i, nal) in units.enumerated() {
                 self.sendNAL(nal, timestamp: timestamp, markLast: i == units.count - 1)
             }
@@ -588,6 +607,7 @@ final class VoiceMedia {
         packet.append(contentsOf: nonce4)
         udpSend(packet)
         stats.sent += 1
+        videoOut += 1
     }
 
     private func sendFrame(_ pcm: [Float], timestamp: UInt32) {
