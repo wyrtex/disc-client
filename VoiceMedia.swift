@@ -105,7 +105,9 @@ final class VoiceMedia {
     private var videoSsrc: UInt32 = 0
     var videoPayloadType: UInt8 = 101
     private var videoRtpSeq = UInt16.random(in: 0...UInt16.max)
-    private var videoNonceCounter: UInt32 = 0
+    // ВАЖНО: nonce (4-байтный счётчик) един на всё транспортное соединение (звук + видео + RTCP),
+    // потому что транспортный ключ один. Отдельный счётчик для видео давал повтор nonce с 0,1,2…
+    // → защита от повторов на сервере Discord молча отбрасывала видеопакеты. Считаем всё через nonceCounter.
     private static let rtpMaxPayload = 1100 // с запасом под заголовок/шифр-тег/nonce, не бьёт MTU
     /// Discord попросил ключевой кадр (PLI/FIR) — камера/расширение должны его выдать.
     var onKeyframeRequest: (() -> Void)?
@@ -114,6 +116,7 @@ final class VoiceMedia {
     private var videoOut = 0
     private var rtcpIn = 0
     private var kfReqIn = 0
+    private var srOut = 0
 
     private var muted = false
     private var speakingNow = false
@@ -137,7 +140,11 @@ final class VoiceMedia {
     private var lastReported = Stats()
     private var timer: DispatchSourceTimer?
     private var keepaliveTimer: DispatchSourceTimer?
+    private var srTimer: DispatchSourceTimer?
     private var keepaliveCounter: UInt64 = 0
+    // Для RTCP Sender Report по видео: Discord ждёт его ~раз в 5 c, иначе SFU не раздаёт видео.
+    private var lastVideoTs: UInt32 = 0
+    private var videoOctets: UInt32 = 0
     private var otherPackets: [String: Int] = [:]
     private var otherBytes: [String: Int] = [:]
     private var seenVideoPayloadTypes = Set<Int>()
@@ -195,6 +202,68 @@ final class VoiceMedia {
         k.setEventHandler { [weak self] in self?.sendKeepalive() }
         k.resume()
         keepaliveTimer = k
+
+        // RTCP Sender Report по видео каждые 5 c. Без него SFU Discord считает видео-отправителя
+        // «не живым» и не раздаёт его поток зрителям (кадры доходят до сервера, но дальше не идут).
+        let sr = DispatchSource.makeTimerSource(queue: queue)
+        sr.schedule(deadline: .now() + 5, repeating: 5)
+        sr.setEventHandler { [weak self] in self?.sendSenderReport() }
+        sr.resume()
+        srTimer = sr
+    }
+
+    /// RTCP Sender Report для нашего видео-SSRC. Шифруется в стиле aead_aes256_gcm_rtpsize:
+    /// первые 8 байт (заголовок SR до NTP) — открытый текст и AAD, остальное шифруется.
+    private func sendSenderReport() {
+        guard videoSsrc != 0, videoOut > 0 else { return }
+
+        // NTP-время: секунды от 1900 + дробная часть (32.32).
+        let now = Date().timeIntervalSince1970
+        let ntpSeconds = UInt32(truncatingIfNeeded: Int64(now) + 2_208_988_800)
+        let frac = now - floor(now)
+        let ntpFraction = UInt32(truncatingIfNeeded: Int64(frac * 4_294_967_296.0))
+
+        var pkt = [UInt8]()
+        pkt.append(0x80)            // V=2, P=0, RC=0
+        pkt.append(200)             // PT = 200 (Sender Report)
+        pkt.append(0x00); pkt.append(0x06)   // длина = 6 (28 байт / 4 - 1)
+        appendBE32(&pkt, videoSsrc)          // SSRC отправителя
+        appendBE32(&pkt, ntpSeconds)         // NTP старшие 32
+        appendBE32(&pkt, ntpFraction)        // NTP младшие 32
+        appendBE32(&pkt, lastVideoTs)        // RTP timestamp
+        appendBE32(&pkt, UInt32(truncatingIfNeeded: videoOut))   // счётчик пакетов
+        appendBE32(&pkt, videoOctets)        // счётчик октетов
+
+        let plain = Data(pkt)
+        // rtpsize: первые 8 байт (заголовок + SSRC) — AAD; шифруется хвост с NTP и дальше.
+        let aad = plain.prefix(8)
+        let body = plain.suffix(from: 8)
+
+        let counter = nonceCounter
+        nonceCounter = nonceCounter &+ 1
+        let nonce4: [UInt8] = [
+            UInt8((counter >> 24) & 0xFF), UInt8((counter >> 16) & 0xFF),
+            UInt8((counter >> 8) & 0xFF), UInt8(counter & 0xFF)
+        ]
+        var nonceData = Data(nonce4)
+        nonceData.append(Data(count: 8))
+
+        guard let nonce = try? AES.GCM.Nonce(data: nonceData),
+              let sealed = try? AES.GCM.seal(body, using: key, nonce: nonce, authenticating: aad) else { return }
+
+        var packet = Data(aad)
+        packet.append(sealed.ciphertext)
+        packet.append(sealed.tag)
+        packet.append(contentsOf: nonce4)
+        udpSend(packet)
+        srOut += 1
+    }
+
+    private func appendBE32(_ arr: inout [UInt8], _ v: UInt32) {
+        arr.append(UInt8((v >> 24) & 0xFF))
+        arr.append(UInt8((v >> 16) & 0xFF))
+        arr.append(UInt8((v >> 8) & 0xFF))
+        arr.append(UInt8(v & 0xFF))
     }
 
     private func sendKeepalive() {
@@ -227,6 +296,8 @@ final class VoiceMedia {
         timer = nil
         keepaliveTimer?.cancel()
         keepaliveTimer = nil
+        srTimer?.cancel()
+        srTimer = nil
         audio.onMicFrame = nil
         audio.stop()
     }
@@ -278,7 +349,7 @@ final class VoiceMedia {
             }
         }
         if videoOut > 0 || rtcpIn > 0 {
-            log?("[видео-отпр] видеопакетов ушло \(videoOut), RTCP пришло \(rtcpIn), из них запросов ключевого кадра \(kfReqIn)")
+            log?("[видео-отпр] видеопакетов ушло \(videoOut), Sender Report ушло \(srOut), RTCP пришло \(rtcpIn), из них запросов ключевого кадра \(kfReqIn)")
         }
         guard stats != lastReported else { return }
         lastReported = stats
@@ -573,21 +644,21 @@ final class VoiceMedia {
 
     private var transportCcSeq: UInt16 = 0
 
-    /// RTP-расширение заголовка (RFC 5285, one-byte), как у официального клиента Discord:
-    /// abs-send-time (ID 3, 3 байта) и transport-cc (ID 5, 2 байта). Без него SFU Discord не
-    /// раздаёт наше видео зрителям (камера/стрим показываются «пилюлей», но без картинки → 2015).
+    /// RTP-расширение заголовка (RFC 5285, one-byte), с ИД как у рабочего клиента (werift/dank074):
+    /// abs-send-time = ID 2, transport-wide-cc = ID 3. Раньше стояли 3 и 5 — SFU Discord неверно
+    /// читал congestion-control и не раздавал видео (пилюля без картинки → 2015).
     /// Данные расширения шифруются транспортным ключом (его сервер Discord знает и читает).
     private func buildVideoExtension() -> Data {
         var ext = Data()
-        // abs-send-time: 24 бита, секунды в формате Q6.18 (обнуляется каждые 64 c — этого хватает).
+        // abs-send-time (ID 2): 24 бита, секунды в формате Q6.18 (обнуляется каждые 64 c).
         let t = Date().timeIntervalSince1970.truncatingRemainder(dividingBy: 64.0)
         let ast = UInt32(t * 262144.0) & 0xFFFFFF
-        ext.append(UInt8((3 << 4) | (3 - 1)))          // ID 3, длина 3
+        ext.append(UInt8((2 << 4) | (3 - 1)))          // ID 2, длина 3
         ext.append(UInt8((ast >> 16) & 0xFF))
         ext.append(UInt8((ast >> 8) & 0xFF))
         ext.append(UInt8(ast & 0xFF))
-        // transport-wide congestion control: сквозной 16-битный счётчик.
-        ext.append(UInt8((5 << 4) | (2 - 1)))          // ID 5, длина 2
+        // transport-wide congestion control (ID 3): сквозной 16-битный счётчик.
+        ext.append(UInt8((3 << 4) | (2 - 1)))          // ID 3, длина 2
         ext.append(UInt8(transportCcSeq >> 8))
         ext.append(UInt8(transportCcSeq & 0xFF))
         transportCcSeq = transportCcSeq &+ 1
@@ -622,8 +693,8 @@ final class VoiceMedia {
         var plaintext = ext
         plaintext.append(payloadIn)
 
-        let counter = videoNonceCounter
-        videoNonceCounter = videoNonceCounter &+ 1
+        let counter = nonceCounter
+        nonceCounter = nonceCounter &+ 1
         let nonce4: [UInt8] = [
             UInt8((counter >> 24) & 0xFF), UInt8((counter >> 16) & 0xFF),
             UInt8((counter >> 8) & 0xFF), UInt8(counter & 0xFF)
@@ -642,6 +713,9 @@ final class VoiceMedia {
         udpSend(packet)
         stats.sent += 1
         videoOut += 1
+        // Данные для RTCP Sender Report: последний timestamp и счётчик октетов полезной нагрузки.
+        lastVideoTs = timestamp
+        videoOctets = videoOctets &+ UInt32(truncatingIfNeeded: payloadIn.count)
     }
 
     private func sendFrame(_ pcm: [Float], timestamp: UInt32) {
