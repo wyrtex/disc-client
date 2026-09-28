@@ -43,6 +43,7 @@ final class VoiceGateway {
     var onFirstVideoFrame: (() -> Void)?
     /// true = это соединение отправляет НАШУ демонстрацию экрана.
     var broadcastSender = false
+    private var sendingVideo = false
     private var screenStarted = false
     private var streamRx: StreamVideoReceiver?
     private var knownVideo: [UInt32: (user: String, rtx: UInt32?)] = [:]
@@ -463,7 +464,11 @@ final class VoiceGateway {
             m.vadThresholdDb = { [weak self] in self?.vadThreshold() ?? -45 }
             m.sendSpeaking = { [weak self] on in
                 guard let self else { return }
-                let d: [String: Any] = ["speaking": on ? 1 : 0, "delay": 0, "ssrc": Int(self.ownSsrc)]
+                // Пока идёт видео, держим бит 2 (видео) — иначе VAD затирал его флагом 1,
+                // и SFU мог считать, что видео неактивно.
+                var flags = on ? 1 : 0
+                if self.sendingVideo { flags |= 2 }
+                let d: [String: Any] = ["speaking": flags, "delay": 0, "ssrc": Int(self.ownSsrc)]
                 self.send(["op": 5, "d": d])
             }
             m.onKeyframeRequest = { [weak self] in self?.onKeyframeRequest?() }
@@ -527,6 +532,7 @@ final class VoiceGateway {
     /// Включить свою камеру: придумываем ssrc (если Discord не выдал его заранее в Ready),
     /// регистрируем поток через op 12 и с этого момента пересылаем кадры в VoiceMedia.
     func startVideo() {
+        sendingVideo = true
         if videoSsrc == 0 {
             videoSsrc = readyVideoSsrc ?? (ownSsrc &+ 1)
         }
@@ -535,13 +541,17 @@ final class VoiceGateway {
         // Без этой привязки шифратор не знает про наш видео-ssrc и шифрование кадров с камеры
         // всегда проваливается — на телефоне видно было бы то же превью, но пусто у Discord.
         dave?.setSelfVideoSsrc(videoSsrc)
+        // Полное описание потока: как шлёт официальный клиент. Без max_framerate/max_resolution
+        // SFU Discord не начинал раздавать наше видео зрителям (плитка есть, картинки нет).
         let stream: [String: Any] = [
             "type": "video",
             "rid": "100",
             "quality": 100,
             "active": true,
             "ssrc": Int(videoSsrc),
-            "rtx_ssrc": Int(rtxSsrc)
+            "rtx_ssrc": Int(rtxSsrc),
+            "max_framerate": 30,
+            "max_resolution": ["type": "fixed", "width": 1280, "height": 720]
         ]
         let d: [String: Any] = [
             "audio_ssrc": Int(ownSsrc),
@@ -550,10 +560,11 @@ final class VoiceGateway {
             "streams": [stream]
         ]
         send(["op": 12, "d": d])
-        log("Камера: включена, ssrc \(videoSsrc), отправил op 12")
+        log("Камера: включена, ssrc \(videoSsrc), отправил op 12 (с разрешением)")
     }
 
     func stopVideo() {
+        sendingVideo = false
         guard videoSsrc != 0 else { return }
         let stream: [String: Any] = [
             "type": "video", "rid": "100", "quality": 100,
