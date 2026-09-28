@@ -160,7 +160,10 @@ final class CameraSource: NSObject {
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AllowFrameReordering, value: kCFBooleanFalse)
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: CameraSource.fps as CFNumber)
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AverageBitRate, value: CameraSource.bitrate as CFNumber)
-        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: (CameraSource.fps * 2) as CFNumber)
+        // Опорный кадр не реже раза в секунду — чтобы зритель, открывший камеру в любой момент,
+        // почти сразу получил кадр, с которого можно декодировать (не ждём запроса).
+        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: CameraSource.fps as CFNumber)
+        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, value: 1.0 as CFNumber)
         VTCompressionSessionPrepareToEncodeFrames(session)
         compressionSession = session
     }

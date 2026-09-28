@@ -193,7 +193,9 @@ class SampleHandler: RPBroadcastSampleHandler {
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AllowFrameReordering, value: kCFBooleanFalse)
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: q.fps as CFNumber)
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AverageBitRate, value: q.bitrate as CFNumber)
-        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: (q.fps * 2) as CFNumber)
+        // Опорный кадр не реже раза в секунду — чтобы зритель получал картинку сразу, без ожидания.
+        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: Int32(q.fps) as CFNumber)
+        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, value: 1.0 as CFNumber)
         VTCompressionSessionPrepareToEncodeFrames(session)
         encoder = session
         forceKeyFrame = true
