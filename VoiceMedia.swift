@@ -111,6 +111,8 @@ final class VoiceMedia {
     private static let rtpMaxPayload = 1100 // с запасом под заголовок/шифр-тег/nonce, не бьёт MTU
     /// Discord попросил ключевой кадр (PLI/FIR) — камера/расширение должны его выдать.
     var onKeyframeRequest: (() -> Void)?
+    /// Пришёл видео-пакет участника (pt 101/102). VoiceSpike направит его в приёмник нужного ssrc.
+    var onVideoPacket: ((Data) -> Void)?
     // Диагностика видео-отправки: сколько видеопакетов ушло, сколько RTCP пришло и сколько из них
     // запросов ключевого кадра. По ним видно, доходят ли PLI от Discord.
     private var videoOut = 0
@@ -364,6 +366,17 @@ final class VoiceMedia {
             rtcpIn += 1
             parseRtcp(bytes)
             return
+        }
+
+        // Видео участников (камера): pt 101 (H264) и 102 (RTX-повторы). Раньше эти пакеты падали
+        // в «Прочие RTP-пакеты» и не декодировались — поэтому камеры других не было видно.
+        // Отдаём их наружу (в StreamVideoReceiver каждого участника), сами не трогаем.
+        if bytes.count >= 2 {
+            let pt = Int(bytes[1] & 0x7F)
+            if pt == 101 || pt == 102 {
+                onVideoPacket?(packet)
+                return
+            }
         }
 
         stats.received += 1

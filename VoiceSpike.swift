@@ -47,6 +47,13 @@ final class VoiceGateway {
     private var screenStarted = false
     private var streamRx: StreamVideoReceiver?
     private var knownVideo: [UInt32: (user: String, rtx: UInt32?)] = [:]
+    // Приём камер участников в общем войсе: по одному приёмнику+экрану на активный видео-ssrc.
+    private var mainSecretKey: Data?
+    private var cameraReceivers: [UInt32: StreamVideoReceiver] = [:]   // ключ — primary video ssrc
+    private var cameraUserForSsrc: [UInt32: String] = [:]
+    private var cameraDisplays: [String: StreamDisplay] = [:]          // ключ — userId
+    /// Экраны камер участников обновились (userId -> куда рисовать). Вызывается на главном потоке.
+    var onCameraDisplays: (([String: StreamDisplay]) -> Void)?
     private let audio: VoiceAudio
     private let micAllowed: Bool
     private var ownSsrc: UInt32 = 0
@@ -116,6 +123,11 @@ final class VoiceGateway {
     func stop() {
         streamRx?.stop()
         streamRx = nil
+        for (_, rx) in cameraReceivers { rx.stop() }
+        cameraReceivers = [:]
+        cameraUserForSsrc = [:]
+        cameraDisplays = [:]
+        publishCameraDisplays()
         media?.stop()
         media = nil
         dave = nil
@@ -215,6 +227,8 @@ final class VoiceGateway {
                 dave?.userDisconnected(id)
                 userIds.remove(id)
                 media?.removeUser(id)
+                // Гасим камеру ушедшего участника.
+                for s in cameraUserForSsrc.filter({ $0.value == id }).map({ $0.key }) { teardownCamera(ssrc: s) }
                 onUsers?(Array(userIds))
             }
         case 12:
@@ -241,6 +255,23 @@ final class VoiceGateway {
                     for s in ssrcs { wants[String(s)] = 100 }
                     send(["op": 15, "d": wants])
                     log("Демонстрация: запросил видео ssrc \(ssrcs.map(String.init).joined(separator: ", ")) в максимальном качестве")
+                }
+                // Общий войс (не отдельное соединение просмотра демки): поднимаем/убираем приёмники
+                // камер участников и просим сервер присылать их видео.
+                if !viewer, !broadcastSender, uid != userId {
+                    // Ssrc'ы этого участника, которые больше не активны, — гасим.
+                    let stale = cameraUserForSsrc.filter { $0.value == uid && !ssrcs.contains($0.key) }.map { $0.key }
+                    for s in stale { teardownCamera(ssrc: s) }
+                    for s in ssrcs {
+                        let rtx = rtxFor[s] ?? (s &+ 1)
+                        ensureCameraReceiver(ssrc: s, user: uid, rtx: rtx)
+                    }
+                    if !ssrcs.isEmpty {
+                        var wants: [String: Any] = ["any": 100]
+                        for s in ssrcs { wants[String(s)] = 100 }
+                        send(["op": 15, "d": wants])
+                        log("[видео] Прошу камеру участника \(uid), ssrc \(ssrcs.map(String.init).joined(separator: ", "))")
+                    }
                 }
             }
         case 18, 20:
@@ -472,6 +503,9 @@ final class VoiceGateway {
                 self.send(["op": 5, "d": d])
             }
             m.onKeyframeRequest = { [weak self] in self?.onKeyframeRequest?() }
+            // Видео-пакеты участников (камеры) отдаём в приёмники камер.
+            m.onVideoPacket = { [weak self] data in self?.routeCameraPacket(data) }
+            mainSecretKey = Data(keyBytes)
             for (ssrc, uid) in ssrcMap {
                 m.setSsrc(ssrc, user: uid)
                 audio.setVolume(volumeForUser?(uid) ?? 1, forUser: uid)
@@ -591,6 +625,56 @@ final class VoiceGateway {
         media?.sendVideoFrame(nalUnits: nalUnits, timestamp: timestamp)
     }
 
+    // MARK: Камеры участников (приём в общем войсе)
+
+    /// Входящий видео-пакет (pt 101/102) — раздаём во все активные приёмники камер.
+    /// Каждый приёмник сам отбирает свой ssrc (и свой rtx), чужие игнорирует.
+    private func routeCameraPacket(_ data: Data) {
+        for (_, rx) in cameraReceivers { rx.feed(data) }
+    }
+
+    /// Создаёт приёмник+экран для камеры участника, если его ещё нет.
+    private func ensureCameraReceiver(ssrc: UInt32, user: String, rtx: UInt32?) {
+        if let rx = cameraReceivers[ssrc] {
+            rx.setVideo(ssrc: ssrc, user: user, rtx: rtx)
+            return
+        }
+        guard let conn = udp, let key = mainSecretKey else { return }
+        let display = cameraDisplays[user] ?? StreamDisplay()
+        cameraDisplays[user] = display
+        let rx = StreamVideoReceiver(
+            connection: conn,
+            secretKey: key,
+            dave: daveVersion > 0 ? dave : nil,
+            display: display,
+            ownSsrc: ownSsrc
+        )
+        rx.log = { [weak self] s in self?.log(s) }
+        cameraReceivers[ssrc] = rx
+        cameraUserForSsrc[ssrc] = user
+        rx.setVideo(ssrc: ssrc, user: user, rtx: rtx)
+        rx.startAttached()
+        log("[видео] Показ камеры участника \(user), ssrc \(ssrc)")
+        publishCameraDisplays()
+    }
+
+    private func teardownCamera(ssrc: UInt32) {
+        guard let rx = cameraReceivers.removeValue(forKey: ssrc) else { return }
+        rx.stop()
+        let user = cameraUserForSsrc.removeValue(forKey: ssrc)
+        // Экран участника убираем, только если у него не осталось других активных ssrc.
+        if let user, !cameraUserForSsrc.values.contains(user) {
+            cameraDisplays.removeValue(forKey: user)
+        }
+        log("[видео] Камера участника выключена, ssrc \(ssrc)")
+        publishCameraDisplays()
+    }
+
+    private func publishCameraDisplays() {
+        let snapshot = cameraDisplays
+        DispatchQueue.main.async { [weak self] in self?.onCameraDisplays?(snapshot) }
+    }
+
     /// Кадр экрана из расширения (уже H264). Пока не готов ключ шифрования — просто пропускаем.
     func sendScreenFrame(nalUnits: [Data], timestamp: UInt32) {
         guard screenStarted else { return }
@@ -697,6 +781,8 @@ final class VoiceSpike: ObservableObject {
     @Published var watchingStream: String?
     @Published var streamStatus = ""
     let streamDisplay = StreamDisplay()
+    /// Камеры участников: userId -> экран, куда рисуется их видео. Пусто, если никто не показывает камеру.
+    @Published var participantCameras: [String: StreamDisplay] = [:]
     private var streamKey: String?
     private var streamRtcServerId: String?
     private var streamEndpoint: String?
@@ -1707,6 +1793,10 @@ final class VoiceSpike: ObservableObject {
                 self?.add("[видео] Discord запросил ключевой кадр камеры")
                 self?.camera.requestKeyframe()
             }
+        }
+        // Камеры участников: экраны, куда рисовать видео каждого.
+        vg.onCameraDisplays = { [weak self] displays in
+            Task { @MainActor in self?.participantCameras = displays }
         }
         gateway = vg
         vg.start()

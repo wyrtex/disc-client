@@ -207,6 +207,37 @@ final class StreamVideoReceiver {
         }
     }
 
+    /// Присоединённый режим: приёмник НЕ владеет сокетом (его читает основной VoiceMedia),
+    /// пакеты приходят через feed(). Нужен для показа камер участников в общем войсе, где
+    /// сокет один на всех. Отправка (PLI/NACK) по этому же сокету безопасна.
+    private var attachedMode = false
+    func startAttached() {
+        attachedMode = true
+        let t = DispatchSource.makeTimerSource(queue: queue)
+        t.schedule(deadline: .now() + 3, repeating: 3)
+        t.setEventHandler { [weak self] in self?.report() }
+        t.resume()
+        timer = t
+
+        let tk = DispatchSource.makeTimerSource(queue: queue)
+        tk.schedule(deadline: .now() + 0.05, repeating: 0.05)
+        tk.setEventHandler { [weak self] in
+            guard let self else { return }
+            self.drainStale()
+            if self.waitingKeyframe, self.bufferSsrc != 0 { self.requestKeyframe(self.bufferSsrc, force: false) }
+        }
+        tk.resume()
+        tick = tk
+    }
+
+    /// Скормить входящий пакет (вызывает основной VoiceMedia для видео-пакетов участников).
+    func feed(_ data: Data) {
+        queue.async { [weak self] in
+            guard let self, !self.stopped else { return }
+            self.handlePacket(data)
+        }
+    }
+
     func start() {
         receiveLoop()
         let t = DispatchSource.makeTimerSource(queue: queue)

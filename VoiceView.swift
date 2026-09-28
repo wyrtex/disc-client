@@ -511,12 +511,25 @@ struct ParticipantTile: View {
         TimelineView(.periodic(from: .now, by: 0.25)) { ctx in
             let speaking = ctx.date.timeIntervalSince(voice.lastHeard[id] ?? .distantPast) < 0.6
             let flag = voice.flags[id] ?? rosterFlags
+            let camera = voice.participantCameras[id]
             VStack(spacing: 8) {
-                AvatarView(user: user, size: 76)
-                Text(name)
-                    .font(.system(size: 14, weight: .semibold))
-                    .foregroundStyle(Theme.text)
-                    .lineLimit(1)
+                if let camera {
+                    // Участник показывает камеру — рисуем его видео вместо аватара.
+                    StreamPlayerView(display: camera)
+                        .frame(height: 110)
+                        .frame(maxWidth: .infinity)
+                        .clipShape(RoundedRectangle(cornerRadius: 10))
+                    Text(name)
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(Theme.text)
+                        .lineLimit(1)
+                } else {
+                    AvatarView(user: user, size: 76)
+                    Text(name)
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(Theme.text)
+                        .lineLimit(1)
+                }
             }
             .frame(maxWidth: .infinity)
             .frame(height: 150)
