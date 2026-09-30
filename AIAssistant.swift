@@ -9,7 +9,7 @@ enum GeminiClient {
     private static var apiKey: String {
         ["AQ.Ab8RN6JXsR", "STSBPXN0WBU9y", "jWKBmdMLWL6lA", "FkS71XGy36ouSQ"].joined()
     }
-    private static let model = "gemini-2.5-flash"
+    private static let model = "gemini-3.8-flash"
 
     struct Result {
         let summary: String

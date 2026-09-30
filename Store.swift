@@ -47,6 +47,10 @@ struct VoiceMemberState: Equatable {
 @MainActor
 final class Store: ObservableObject {
     @Published var me: User?
+    /// Готов ли сетевой клиент (api). При старте кэш сразу отдаёт me+guilds, но api появляется
+    /// только после входа — без этого сигнала загрузка каналов срабатывала до готовности api
+    /// и молча ничего не грузила, пока вручную не переключишь сервер.
+    @Published var apiReady = false
     @Published var guilds: [Guild] = []
     @Published var dms: [Channel] = []
     @Published var guildChannels: [String: [Channel]] = [:]
@@ -168,6 +172,7 @@ final class Store: ObservableObject {
             DiskCache.save(gData, "guilds")
             DiskCache.save(dData, "dms")
             self.api = api
+            self.apiReady = true
             self.me = me
             self.guilds = Store.applySavedOrder(g)
             self.dms = d.sorted { (UInt64($0.last_message_id ?? "0") ?? 0) > (UInt64($1.last_message_id ?? "0") ?? 0) }
@@ -211,6 +216,7 @@ final class Store: ObservableObject {
         gateway?.stop()
         gateway = nil
         api = nil
+        apiReady = false
         me = nil
         guilds = []
         dms = []

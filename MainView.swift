@@ -227,11 +227,12 @@ struct ChannelPanel: View {
         ))
         .ignoresSafeArea(edges: .bottom)
         .simultaneousGesture(openLastChatSwipe)
-        // Ключ включает guild?.id: при холодном старте selection уже восстановлен, но список
-        // серверов ещё пуст (грузится из Gateway). Раньше задача отрабатывала с guild == nil и
-        // больше не запускалась — каналы не грузились, пока вручную не переключишь сервер.
-        // Теперь, когда сервер появляется (nil → id), ключ меняется и задача повторяется.
-        .task(id: "\(selection ?? "dm")|\(guild?.id ?? "-")") {
+        // Ключ включает guild?.id и store.apiReady. При холодном старте кэш сразу отдаёт список
+        // серверов, но сетевой клиент (api) готов только после входа. Раньше задача отрабатывала
+        // до готовности api (или до появления сервера) и молча ничего не грузила — каналы не
+        // появлялись, пока вручную не переключишь сервер. Теперь, как только api готов
+        // (false → true) или сервер появился, ключ меняется и задача повторяется.
+        .task(id: "\(selection ?? "dm")|\(guild?.id ?? "-")|\(store.apiReady)") {
             store.selectedGuildId = selection
             if let g = guild {
                 store.resolveVoiceUsers(guildId: g.id)
