@@ -10,12 +10,13 @@ enum GeminiClient {
         ["AQ.Ab8RN6JXsR", "STSBPXN0WBU9y", "jWKBmdMLWL6lA", "FkS71XGy36ouSQ"].joined()
     }
     // Перебираем модели по очереди: если одна недоступна (404) или перегружена (503),
-    // пробуем следующую. Первая рабочая используется.
+    // пробуем следующую. `-latest`-алиасы не дают 404, т.к. всегда указывают на текущую модель.
     private static let models = [
-        "gemini-3.8-flash",
         "gemini-flash-latest",
-        "gemini-2.0-flash",
-        "gemini-2.0-flash-001"
+        "gemini-3.8-flash",
+        "gemini-flash-lite-latest",
+        "gemini-3.8-flash-lite",
+        "gemini-pro-latest"
     ]
 
     struct Result {
@@ -40,6 +41,7 @@ enum GeminiClient {
     }
 
     /// Запрос с перебором моделей. Возвращает текст из parts[0].text первой ответившей модели.
+    /// На 503/UNAVAILABLE (временная перегрузка) повторяем ту же модель пару раз с паузой.
     private static func requestText(body: [String: Any]) async throws -> String {
         var lastError = ""
         for model in models {
@@ -50,26 +52,34 @@ enum GeminiClient {
             req.setValue(apiKey, forHTTPHeaderField: "x-goog-api-key")
             req.httpBody = try? JSONSerialization.data(withJSONObject: body)
 
-            do {
-                let (data, resp) = try await URLSession.shared.data(for: req)
-                if let http = resp as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
-                    let text = String(data: data, encoding: .utf8) ?? ""
-                    lastError = "модель \(model): \(http.statusCode) \(String(text.prefix(160)))"
-                    continue   // пробуем следующую модель
+            for attempt in 0..<3 {
+                do {
+                    let (data, resp) = try await URLSession.shared.data(for: req)
+                    let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+                    if code == 503 {   // перегрузка — подождём и повторим ту же модель
+                        lastError = "модель \(model): 503 (перегрузка)"
+                        try? await Task.sleep(nanoseconds: UInt64((attempt + 1)) * 1_500_000_000)
+                        continue
+                    }
+                    if !(200...299).contains(code) {
+                        let text = String(data: data, encoding: .utf8) ?? ""
+                        lastError = "модель \(model): \(code) \(String(text.prefix(160)))"
+                        break   // 404 и прочее — эта модель не подойдёт, к следующей
+                    }
+                    guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                          let candidates = root["candidates"] as? [[String: Any]],
+                          let first = candidates.first,
+                          let content = first["content"] as? [String: Any],
+                          let parts = content["parts"] as? [[String: Any]],
+                          let text = parts.first?["text"] as? String, !text.isEmpty else {
+                        lastError = "модель \(model): пустой ответ"
+                        break
+                    }
+                    return text
+                } catch {
+                    lastError = "модель \(model): \(error.localizedDescription)"
+                    break
                 }
-                guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                      let candidates = root["candidates"] as? [[String: Any]],
-                      let first = candidates.first,
-                      let content = first["content"] as? [String: Any],
-                      let parts = content["parts"] as? [[String: Any]],
-                      let text = parts.first?["text"] as? String, !text.isEmpty else {
-                    lastError = "модель \(model): пустой ответ"
-                    continue
-                }
-                return text
-            } catch {
-                lastError = "модель \(model): \(error.localizedDescription)"
-                continue
             }
         }
         throw GeminiError.allFailed(lastError)
