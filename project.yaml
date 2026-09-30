@@ -40,32 +40,38 @@ targets:
         MARKETING_VERSION: '0.1'
         CURRENT_PROJECT_VERSION: '1'
         TARGETED_DEVICE_FAMILY: '1'
-        GENERATE_INFOPLIST_FILE: true
-        INFOPLIST_KEY_CFBundleDisplayName: DiscClient
-        INFOPLIST_KEY_UILaunchScreen_Generation: true
-        INFOPLIST_KEY_UIApplicationSceneManifest_Generation: true
-        INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone: UIInterfaceOrientationPortrait
-          UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight
-        INFOPLIST_KEY_UIBackgroundModes: audio
-        INFOPLIST_KEY_NSSpeechRecognitionUsageDescription: Распознавание речи нужно
-          для субтитров голосового канала
-        INFOPLIST_KEY_NSPhotoLibraryAddUsageDescription: Сохранение фото, гифок и
-          видео из чатов в галерею
-        INFOPLIST_KEY_NSMicrophoneUsageDescription: Микрофон нужен для голосовых сообщений
-          и голосовых каналов
-        INFOPLIST_KEY_NSCameraUsageDescription: Камера нужна, чтобы показывать себя
-          в голосовых каналах
+        # Авто-генерацию Info.plist выключаем: из-за неё Xcode выкидывал кастомные ключи
+        # (ATS, URL-схема). Все ключи задаём явно ниже в info.properties.
+        GENERATE_INFOPLIST_FILE: false
         CODE_SIGN_ENTITLEMENTS: DiscClient.entitlements
     info:
       path: DiscClient-Info.plist
       properties:
+        CFBundleDisplayName: DiscClient
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        LSRequiresIPhoneOS: true
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations:
+        - UIInterfaceOrientationPortrait
+        - UIInterfaceOrientationLandscapeLeft
+        - UIInterfaceOrientationLandscapeRight
+        UIBackgroundModes:
+        - audio
+        NSSpeechRecognitionUsageDescription: Распознавание речи нужно для субтитров голосового канала
+        NSPhotoLibraryAddUsageDescription: Сохранение фото, гифок и видео из чатов в галерею
+        NSMicrophoneUsageDescription: Микрофон нужен для голосовых сообщений и голосовых каналов
+        NSCameraUsageDescription: Камера нужна, чтобы показывать себя в голосовых каналах
         CFBundleURLTypes:
         - CFBundleURLSchemes:
           - discclient
-        # Разрешаем обычный http:// — нужно, чтобы приложение достучалось до сервера
-        # скриптов по IP без HTTPS (iOS иначе блокирует по App Transport Security).
+        # Разрешаем обычный http:// — иначе iOS блокирует связь с сервером по IP без HTTPS.
         NSAppTransportSecurity:
           NSAllowsArbitraryLoads: true
+          NSExceptionDomains:
+            195.14.118.91:
+              NSExceptionAllowsInsecureHTTPLoads: true
+              NSIncludesSubdomains: true
   BroadcastExtension:
     type: app-extension
     platform: iOS
