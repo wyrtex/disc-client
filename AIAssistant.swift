@@ -9,7 +9,14 @@ enum GeminiClient {
     private static var apiKey: String {
         ["AQ.Ab8RN6JXsR", "STSBPXN0WBU9y", "jWKBmdMLWL6lA", "FkS71XGy36ouSQ"].joined()
     }
-    private static let model = "gemini-3.8-flash"
+    // Перебираем модели по очереди: если одна недоступна (404) или перегружена (503),
+    // пробуем следующую. Первая рабочая используется.
+    private static let models = [
+        "gemini-3.8-flash",
+        "gemini-flash-latest",
+        "gemini-2.0-flash",
+        "gemini-2.0-flash-001"
+    ]
 
     struct Result {
         let summary: String
@@ -20,23 +27,55 @@ enum GeminiClient {
         case http(Int, String)
         case empty
         case badJSON
+        case allFailed(String)
 
         var errorDescription: String? {
             switch self {
             case .http(let code, let body): return "Gemini вернул ошибку \(code). \(body)"
             case .empty: return "Gemini не вернул ответ."
             case .badJSON: return "Не удалось разобрать ответ Gemini."
+            case .allFailed(let last): return "Ни одна модель Gemini не ответила. \(last)"
             }
         }
     }
 
-    static func analyze(transcript: String) async throws -> Result {
-        let url = URL(string: "https://generativelanguage.googleapis.com/v1beta/models/\(model):generateContent")!
-        var req = URLRequest(url: url)
-        req.httpMethod = "POST"
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.setValue(apiKey, forHTTPHeaderField: "x-goog-api-key")
+    /// Запрос с перебором моделей. Возвращает текст из parts[0].text первой ответившей модели.
+    private static func requestText(body: [String: Any]) async throws -> String {
+        var lastError = ""
+        for model in models {
+            let url = URL(string: "https://generativelanguage.googleapis.com/v1beta/models/\(model):generateContent")!
+            var req = URLRequest(url: url)
+            req.httpMethod = "POST"
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            req.setValue(apiKey, forHTTPHeaderField: "x-goog-api-key")
+            req.httpBody = try? JSONSerialization.data(withJSONObject: body)
 
+            do {
+                let (data, resp) = try await URLSession.shared.data(for: req)
+                if let http = resp as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
+                    let text = String(data: data, encoding: .utf8) ?? ""
+                    lastError = "модель \(model): \(http.statusCode) \(String(text.prefix(160)))"
+                    continue   // пробуем следующую модель
+                }
+                guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      let candidates = root["candidates"] as? [[String: Any]],
+                      let first = candidates.first,
+                      let content = first["content"] as? [String: Any],
+                      let parts = content["parts"] as? [[String: Any]],
+                      let text = parts.first?["text"] as? String, !text.isEmpty else {
+                    lastError = "модель \(model): пустой ответ"
+                    continue
+                }
+                return text
+            } catch {
+                lastError = "модель \(model): \(error.localizedDescription)"
+                continue
+            }
+        }
+        throw GeminiError.allFailed(lastError)
+    }
+
+    static func analyze(transcript: String) async throws -> Result {
         let prompt = """
         Ты — помощник в переписке Discord. Ниже последние сообщения диалога (формат «Имя: текст»).
 
@@ -51,9 +90,7 @@ enum GeminiClient {
         """
 
         let body: [String: Any] = [
-            "contents": [
-                ["parts": [["text": prompt]]]
-            ],
+            "contents": [["parts": [["text": prompt]]]],
             "generationConfig": [
                 "responseMimeType": "application/json",
                 "responseSchema": [
@@ -67,32 +104,24 @@ enum GeminiClient {
                 "temperature": 0.9
             ]
         ]
-        req.httpBody = try JSONSerialization.data(withJSONObject: body)
 
-        let (data, resp) = try await URLSession.shared.data(for: req)
-        if let http = resp as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
-            let text = String(data: data, encoding: .utf8) ?? ""
-            throw GeminiError.http(http.statusCode, String(text.prefix(300)))
-        }
-
-        // Ответ: candidates[0].content.parts[0].text — это JSON-строка нашего формата.
-        guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let candidates = root["candidates"] as? [[String: Any]],
-              let first = candidates.first,
-              let content = first["content"] as? [String: Any],
-              let parts = content["parts"] as? [[String: Any]],
-              let text = parts.first?["text"] as? String else {
-            throw GeminiError.empty
-        }
-
+        let text = try await requestText(body: body)
         guard let inner = text.data(using: .utf8),
               let obj = try? JSONSerialization.jsonObject(with: inner) as? [String: Any],
               let summary = obj["summary"] as? String,
               let replies = obj["replies"] as? [String] else {
             throw GeminiError.badJSON
         }
-
         return Result(summary: summary, replies: Array(replies.prefix(5)))
+    }
+
+    /// Свободная генерация текста (для ИИ-бота). Возвращает обычный текст.
+    static func generateText(prompt: String, temperature: Double = 0.8) async throws -> String {
+        let body: [String: Any] = [
+            "contents": [["parts": [["text": prompt]]]],
+            "generationConfig": ["temperature": temperature]
+        ]
+        return try await requestText(body: body).trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }
 

@@ -103,10 +103,12 @@ final class Store: ObservableObject {
     @Published var mentionChannels: Set<String> = []
     private var lastRead: [String: String] = UserDefaults.standard.dictionary(forKey: "lastRead") as? [String: String] ?? [:]
     let voice = VoiceSpike()
+    let scripts = ScriptsEngine()
     private(set) var api: API?
     private var gateway: Gateway?
 
     init() {
+        scripts.store = self
         if let data = UserDefaults.standard.data(forKey: "proxy"),
            let p = try? JSONDecoder().decode(ProxySettings.self, from: data) {
             proxy = p
@@ -173,6 +175,7 @@ final class Store: ObservableObject {
             DiskCache.save(dData, "dms")
             self.api = api
             self.apiReady = true
+            self.scripts.start()
             self.me = me
             self.guilds = Store.applySavedOrder(g)
             self.dms = d.sorted { (UInt64($0.last_message_id ?? "0") ?? 0) > (UInt64($1.last_message_id ?? "0") ?? 0) }
@@ -253,6 +256,7 @@ final class Store: ObservableObject {
                 guard let self else { return }
                 self.noteDMMessage(msg)
                 self.noteIncomingForUnread(msg)
+                self.scripts.onMessage(msg)
                 guard self.messages[msg.channel_id] != nil else { return }
                 self.merge([msg], into: msg.channel_id)
             }
@@ -421,8 +425,11 @@ final class Store: ObservableObject {
         guard let gid = d["guild_id"] as? String, let uid = d["user_id"] as? String else { return }
         if let m = parseVoiceState(d) {
             var map = voiceRoster[gid] ?? [:]
+            let wasThere = map[uid] != nil
             map[uid] = m
             voiceRoster[gid] = map
+            // Кто-то зашёл в войс (появился новый участник) — сигнал для скрипта автосообщений.
+            if !wasThere { scripts.onVoiceActivity(guildId: gid, userId: uid, joined: true) }
         } else if voiceRoster[gid]?[uid] != nil {
             voiceRoster[gid]?[uid] = nil
         }
