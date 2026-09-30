@@ -227,7 +227,11 @@ struct ChannelPanel: View {
         ))
         .ignoresSafeArea(edges: .bottom)
         .simultaneousGesture(openLastChatSwipe)
-        .task(id: selection) {
+        // Ключ включает guild?.id: при холодном старте selection уже восстановлен, но список
+        // серверов ещё пуст (грузится из Gateway). Раньше задача отрабатывала с guild == nil и
+        // больше не запускалась — каналы не грузились, пока вручную не переключишь сервер.
+        // Теперь, когда сервер появляется (nil → id), ключ меняется и задача повторяется.
+        .task(id: "\(selection ?? "dm")|\(guild?.id ?? "-")") {
             store.selectedGuildId = selection
             if let g = guild {
                 store.resolveVoiceUsers(guildId: g.id)

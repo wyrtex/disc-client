@@ -185,6 +185,7 @@ final class StreamVideoReceiver {
     private var stats = Stats()
     private var lastStats = Stats()
     private var seenPayloadTypes = Set<Int>()
+    private var diagLogged = 0
     private var timer: DispatchSourceTimer?
     private var tick: DispatchSourceTimer?
     private var keepalive: DispatchSourceTimer?
@@ -333,6 +334,14 @@ final class StreamVideoReceiver {
         }
         guard let p = openTransport(bytes) else { return }
         stats.packets += 1
+        // Диагностика (первые 4 пакета): что реально в расшифрованной нагрузке — тип NAL, маркер.
+        // Позволяет сравнить камеру и демку и понять, почему у камеры не собираются кадры.
+        if diagLogged < 4 {
+            diagLogged += 1
+            let head = p.prefix(12).map { String(format: "%02x", $0) }.joined()
+            let nalType = p.first.map { Int($0 & 0x1F) } ?? -1
+            log?("[видео-диаг] ssrc \(ssrc) seq \(seq) marker \(marker) len \(p.count) nal \(nalType) head \(head)")
+        }
         insert(ssrc: ssrc, seq: seq, pkt: Pkt(payload: p, ts: ts, marker: marker))
     }
 

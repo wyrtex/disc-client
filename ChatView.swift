@@ -42,6 +42,8 @@ struct ChatView: View {
     @State private var suggestionTask: Task<Void, Never>?
     @State private var editing: Message?
     @State private var videoItem: ViewerItem?
+    @State private var showAI = false
+    @StateObject private var aiModel = AIAssistantModel()
 
     private struct Suggestion: Identifiable {
         let id: String
@@ -203,6 +205,26 @@ struct ChatView: View {
                         .lineLimit(1)
                 }
             }
+            ToolbarItem(placement: .topBarTrailing) {
+                Button {
+                    showAI = true
+                } label: {
+                    Image(systemName: "sparkles")
+                        .font(.system(size: 16, weight: .semibold))
+                        .foregroundStyle(Theme.link)
+                }
+            }
+        }
+        .sheet(isPresented: $showAI) {
+            ChatAISheet(
+                model: aiModel,
+                messages: store.messages[channel.id] ?? [],
+                nameFor: { m in store.guildNick(guildId: guildId, user: m.author, fallbackNick: m.member_nick) },
+                onSend: { reply in Task { _ = await store.send(reply, files: [], to: channel.id, replyTo: nil) } }
+            )
+            .presentationDetents([.medium, .large])
+            .presentationDragIndicator(.visible)
+            .presentationBackground(Theme.chat)
         }
     }
 
