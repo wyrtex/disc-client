@@ -108,13 +108,13 @@ final class Store: ObservableObject {
     private var gateway: Gateway?
 
     init() {
-        scripts.store = self
         if let data = UserDefaults.standard.data(forKey: "proxy"),
            let p = try? JSONDecoder().decode(ProxySettings.self, from: data) {
             proxy = p
         } else {
             proxy = ProxySettings()
         }
+        scripts.store = self
         if let saved = Keychain.load() {
             isRestoring = !restoreFromCache()
             Task { await autoLogin(saved) }
