@@ -494,6 +494,7 @@ struct ParticipantTile: View {
     let id: String
     @State private var showProfile = false
     @State private var tileColor: Color?
+    @State private var showCameraFull = false
 
     private var user: User? {
         voice.users[id] ?? store.voiceUsers[id] ?? (store.me?.id == id ? store.me : nil)
@@ -559,7 +560,11 @@ struct ParticipantTile: View {
             }
             .contentShape(RoundedRectangle(cornerRadius: 14))
             .onTapGesture {
-                if flag.stream && id != voice.userId { voice.watchStream(id) }
+                if voice.participantCameras[id] != nil {
+                    showCameraFull = true          // камера участника — на весь экран отдельным окном
+                } else if flag.stream && id != voice.userId {
+                    voice.watchStream(id)
+                }
             }
             .onLongPressGesture {
                 if user != nil { showProfile = true }
@@ -568,6 +573,37 @@ struct ParticipantTile: View {
         .sheet(isPresented: $showProfile) {
             if let user {
                 UserProfileSheet(user: user, guildId: voice.activeGuildId, voice: voice)
+            }
+        }
+        .fullScreenCover(isPresented: $showCameraFull) {
+            if let camera = voice.participantCameras[id] {
+                ZStack {
+                    Color.black.ignoresSafeArea()
+                    StreamPlayerView(display: camera).ignoresSafeArea()
+                    VStack {
+                        HStack {
+                            Text(name)
+                                .font(.system(size: 16, weight: .semibold))
+                                .foregroundStyle(.white)
+                                .padding(10)
+                                .background(.black.opacity(0.4), in: Capsule())
+                            Spacer()
+                            Button {
+                                showCameraFull = false
+                            } label: {
+                                Image(systemName: "xmark")
+                                    .font(.system(size: 16, weight: .bold))
+                                    .foregroundStyle(.white)
+                                    .frame(width: 40, height: 40)
+                                    .background(.black.opacity(0.4), in: Circle())
+                            }
+                        }
+                        .padding()
+                        Spacer()
+                    }
+                }
+            } else {
+                Color.black.ignoresSafeArea().onAppear { showCameraFull = false }
             }
         }
     }
