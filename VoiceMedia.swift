@@ -374,6 +374,7 @@ final class VoiceMedia {
         if bytes.count >= 2 {
             let pt = Int(bytes[1] & 0x7F)
             if pt == 101 || pt == 102 {
+                if mirrorInCount < 10 { dumpInboundVideo(bytes) }
                 onVideoPacket?(packet)
                 return
             }
@@ -498,6 +499,87 @@ final class VoiceMedia {
     }
     private var loggedAudioExt = false
     private var loggedVideoExt = false
+
+    // MARK: Зеркало видео (диагностика форвардинга)
+    // Снимаем первые пакеты ВХОДЯЩЕГО чужого видео (оно доходит идеально) и нашего ИСХОДЯЩЕГО
+    // в одинаковом формате, чтобы побайтово сравнить заголовок, RTP-расширения и начало NAL.
+    private var mirrorInCount = 0
+    private var mirrorOutCount = 0
+
+    /// Единый формат разбора одного видео-RTP: заголовок, все расширения, начало payload.
+    private func mirrorFormat(_ dir: String, header: [UInt8], extWords: Int, ext: Data, payload: Data) {
+        guard header.count >= 12 else { return }
+        let pt = header[1] & 0x7F
+        let marker = (header[1] & 0x80) != 0
+        let seq = Int(header[2]) << 8 | Int(header[3])
+        let ts = (UInt32(header[4]) << 24) | (UInt32(header[5]) << 16) | (UInt32(header[6]) << 8) | UInt32(header[7])
+        let ssrc = (UInt32(header[8]) << 24) | (UInt32(header[9]) << 16) | (UInt32(header[10]) << 8) | UInt32(header[11])
+
+        // Разбор one-byte RTP-расширений (RFC 5285): каждый элемент = (id<<4 | len-1) + len байт данных.
+        var exts: [String] = []
+        var i = ext.startIndex
+        while i < ext.endIndex {
+            let b = ext[i]
+            if b == 0 { i = ext.index(after: i); continue } // паддинг
+            let id = Int(b >> 4)
+            let len = Int(b & 0x0F) + 1
+            i = ext.index(after: i)
+            let end = ext.index(i, offsetBy: len, limitedBy: ext.endIndex) ?? ext.endIndex
+            let data = ext[i..<end].map { String(format: "%02x", $0) }.joined()
+            exts.append("id\(id)/len\(len)=\(data)")
+            i = end
+        }
+
+        let payHead = payload.prefix(14).map { String(format: "%02x", $0) }.joined()
+        var nal = "—"
+        if let f = payload.first {
+            let t = f & 0x1F
+            nal = "NAL \(t)" + (t == 28 ? "(FU-A)" : t == 24 ? "(STAP-A)" : t == 7 ? "(SPS)" : t == 8 ? "(PPS)" : t == 5 ? "(IDR)" : t == 1 ? "(срез)" : "")
+            if t == 28, payload.count > 1 {
+                let fu = payload[payload.index(after: payload.startIndex)]
+                nal += " [старт=\((fu & 0x80) != 0) конец=\((fu & 0x40) != 0) тип=\(fu & 0x1F)]"
+            }
+        }
+        log?("[зеркало/\(dir)] pt\(pt) m=\(marker) seq=\(seq) ts=\(ts) ssrc=\(ssrc) extСлов=\(extWords) ext={\(exts.joined(separator: " | "))} pay(\(payload.count))=\(payHead) → \(nal)")
+    }
+
+    /// Расшифровываем входящий видео-пакет нашим транспортным ключом и дампим его.
+    /// Для камеры участника в том же канале ключ совпадает; для просмотра стрима — ключ этого шлюза.
+    private func dumpInboundVideo(_ bytes: [UInt8]) {
+        defer { mirrorInCount += 1 }
+        guard bytes.count >= 12 else { return }
+        let b0 = bytes[0]
+        guard b0 >> 6 == 2 else { return }
+        let cc = Int(b0 & 0x0F)
+        let hasExt = (b0 & 0x10) != 0
+        var headerLen = 12 + cc * 4
+        var extWords = 0
+        if hasExt {
+            guard bytes.count >= headerLen + 4 else { return }
+            extWords = Int(bytes[headerLen + 2]) << 8 | Int(bytes[headerLen + 3])
+            headerLen += 4
+        }
+        guard bytes.count >= headerLen + 16 + 4 else { return }
+        let tagStart = bytes.count - 4 - 16
+        let cipher = Data(bytes[headerLen..<tagStart])
+        let tag = Data(bytes[tagStart..<(bytes.count - 4)])
+        var nonceData = Data(bytes[(bytes.count - 4)...])
+        nonceData.append(Data(count: 8))
+        let aad = Data(bytes[0..<headerLen])
+        guard let nonce = try? AES.GCM.Nonce(data: nonceData),
+              let box = try? AES.GCM.SealedBox(nonce: nonce, ciphertext: cipher, tag: tag),
+              let plain = try? AES.GCM.open(box, using: key, authenticating: aad) else {
+            if mirrorInCount == 0 {
+                let head = bytes.prefix(16).map { String(format: "%02x", $0) }.joined()
+                log?("[зеркало/ВХ] не расшифровалось нашим ключом (видимо отдельный шлюз/ключ стрима). Заголовок на проводе: \(head), extСлов=\(extWords)")
+            }
+            return
+        }
+        let n = extWords * 4
+        let ext = plain.prefix(n)
+        let payload = Data(plain.dropFirst(n))
+        mirrorFormat("ВХ", header: Array(bytes[0..<12]), extWords: extWords, ext: Data(ext), payload: payload)
+    }
 
     // MARK: Отправка
 
@@ -722,6 +804,12 @@ final class VoiceMedia {
         packet.append(sealed.ciphertext)
         packet.append(sealed.tag)
         packet.append(contentsOf: nonce4)
+        // Зеркало: дампим первые исходящие пакеты ровно в том же формате, что и входящие,
+        // чтобы сравнить ext/заголовок с эталоном рабочего отправителя.
+        if mirrorOutCount < 10 {
+            mirrorOutCount += 1
+            mirrorFormat("ИСХ", header: header, extWords: extWords, ext: ext, payload: payloadIn)
+        }
         udpSend(packet)
         stats.sent += 1
         videoOut += 1
