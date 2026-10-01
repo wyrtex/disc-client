@@ -1,95 +1,66 @@
 import ReplayKit
 import VideoToolbox
-import CoreImage
 import CoreMedia
 
-/// Расширение трансляции экрана. Живёт под жёстким лимитом памяти (~50 МБ), поэтому всё сделано
-/// «на диете»: блюр считается на уменьшенной копии кадра, буферы переиспользуются через пулы,
-/// лишние кадры отбрасываются. Логика простая: обычный кадр идёт как есть, при блюре — размытый,
-/// переключение живое (со следующего кадра).
+/// Расширение трансляции экрана. Жёсткий лимит памяти ~50 МБ, поэтому главное правило:
+/// НИКОГДА не кодируем кадр в полном разрешении экрана. Каждый кадр аппаратно уменьшается
+/// до 720p (VTPixelTransferSession) и только потом кодируется H264. Без блюра и записи —
+/// ради стабильности (их можно вернуть позже). Кадры уходят в приложение по localhost-сокету.
 class SampleHandler: RPBroadcastSampleHandler {
     private var encoder: VTCompressionSession?
+    private var transfer: VTPixelTransferSession?
+    private var scalePool: CVPixelBufferPool?
     private var socket: LocalSocketClient?
-    private let ciContext = CIContext(options: [
-        .useSoftwareRenderer: false,
-        .cacheIntermediates: false,           // не копим промежуточные буферы
-        .name: "blur"
-    ])
-    private var blur = false
-    private var blurOn: NSObjectProtocol?
-    private var blurOff: NSObjectProtocol?
-    private var blurToggle: NSObjectProtocol?
+
     private var stopCmd: NSObjectProtocol?
     private var forceKeyframeObs: NSObjectProtocol?
-    private var firstFrameSent = false
 
-    private var width = 0
-    private var height = 0
+    private var dstW = 0
+    private var dstH = 0
     private var startTime: CMTime?
     private var forceKeyFrame = false
     private var sps: Data?
     private var pps: Data?
+    private var firstFrameSent = false
 
-    // Пул уменьшенных буферов для блюра — создаётся один раз и переиспользуется.
-    private var blurPool: CVPixelBufferPool?
-    private var blurW = 0
-    private var blurH = 0
-
-    // Ограничение частоты: не обрабатываем больше, чем нужно, чтобы не копить память.
+    // Ограничение частоты кадров — не копим память очередью.
     private var lastEncodedPTS = CMTime.zero
     private var minFrameInterval: Double = 1.0 / 30.0
 
+    // Максимальная сторона кадра. Больше — риск вылета по памяти в расширении.
+    private static let maxSide = 1280
+
     override func broadcastStarted(withSetupInfo setupInfo: [String: NSObject]?) {
-        BroadcastShared.clearExtLog()
-        // Проверяем сразу, доступна ли общая папка — если нет, значит App Group не подписался.
-        if BroadcastShared.logURL() == nil {
-            BroadcastShared.extLog("СТАРТ, но общая папка App Group НЕдоступна — расширение подписано без группы")
-        } else {
-            BroadcastShared.extLog("broadcastStarted: расширение запущено, App Group доступна")
-        }
         BroadcastShared.post(BroadcastShared.beaconStarted)
-        blur = BroadcastShared.blur
         minFrameInterval = 1.0 / Double(max(15, BroadcastShared.quality.fps))
+
         socket = LocalSocketClient()
         socket?.onConnected = { BroadcastShared.post(BroadcastShared.beaconSocketOK) }
         socket?.connect()
-        BroadcastShared.extLog("сокет к приложению: попытка подключения")
-        blurOn = BroadcastShared.observe(BroadcastShared.notifyBlurOn) { [weak self] in self?.setBlur(true) }
-        blurOff = BroadcastShared.observe(BroadcastShared.notifyBlurOff) { [weak self] in self?.setBlur(false) }
-        blurToggle = BroadcastShared.observe(BroadcastShared.notifyBlurToggle) { [weak self] in
-            guard let self else { return }
-            self.setBlur(!self.blur)
-        }
-        // Приложение просит ключевой кадр (Discord прислал PLI) — выдаём IDR со следующего кадра.
+
         forceKeyframeObs = BroadcastShared.observe(BroadcastShared.notifyForceKeyframe) { [weak self] in
             self?.forceKeyFrame = true
         }
-        // Приложение просит завершить трансляцию — останавливаем захват экрана.
         stopCmd = BroadcastShared.observe(BroadcastShared.notifyStopCommand) { [weak self] in
             guard let self else { return }
-            BroadcastShared.extLog("получена команда 'остановить' из приложения — завершаю трансляцию")
             let err = NSError(domain: "DiscClient", code: 0,
                               userInfo: [NSLocalizedDescriptionKey: "Трансляция остановлена"])
             self.finishBroadcastWithError(err)
         }
         BroadcastShared.post(BroadcastShared.notifyStarted)
-        BroadcastShared.extLog("послал сигнал 'начал' приложению")
     }
 
     override func broadcastFinished() {
-        BroadcastShared.extLog("broadcastFinished: система остановила расширение (это может быть из-за памяти)")
         BroadcastShared.post(BroadcastShared.notifyStopped)
-        stopCmd = nil   // токен снимает наблюдение в своём deinit
+        stopCmd = nil
+        forceKeyframeObs = nil
         if let e = encoder { VTCompressionSessionInvalidate(e) }
         encoder = nil
+        if let t = transfer { VTPixelTransferSessionInvalidate(t) }
+        transfer = nil
+        scalePool = nil
         socket?.close()
         socket = nil
-    }
-
-    private func setBlur(_ on: Bool) {
-        blur = on
-        BroadcastShared.defaults?.set(on, forKey: BroadcastShared.keyBlur)
-        forceKeyFrame = true
     }
 
     override func processSampleBuffer(_ sampleBuffer: CMSampleBuffer, with sampleBufferType: RPSampleBufferType) {
@@ -99,24 +70,30 @@ class SampleHandler: RPBroadcastSampleHandler {
         if startTime == nil {
             startTime = pts
             BroadcastShared.post(BroadcastShared.beaconFirstVideo)
-            BroadcastShared.extLog("первый видеокадр получен: \(CVPixelBufferGetWidth(source))x\(CVPixelBufferGetHeight(source))")
         }
 
-        // Пропускаем лишние кадры, чтобы не переполнять память очередью.
+        // Пропуск лишних кадров.
         if lastEncodedPTS != .zero {
             let dt = CMTimeGetSeconds(CMTimeSubtract(pts, lastEncodedPTS))
             if dt < minFrameInterval * 0.9 { return }
         }
         lastEncodedPTS = pts
 
-        // autoreleasepool: временные объекты CoreImage освобождаются сразу после кадра.
         autoreleasepool {
-            var pixelBuffer = source
-            if blur, let blurred = makeBlurred(source) {
-                pixelBuffer = blurred
-            }
-            ensureEncoder(width: CVPixelBufferGetWidth(pixelBuffer), height: CVPixelBufferGetHeight(pixelBuffer))
-            guard let encoder else { return }
+            let srcW = CVPixelBufferGetWidth(source)
+            let srcH = CVPixelBufferGetHeight(source)
+            let (tw, th) = Self.fitSize(srcW, srcH)
+            guard tw > 0, th > 0 else { return }
+
+            ensureScaler(width: tw, height: th)
+            ensureEncoder(width: tw, height: th)
+            guard let transfer, let pool = scalePool, let encoder else { return }
+
+            // Берём буфер 720p из пула и аппаратно уменьшаем в него исходный кадр.
+            var scaled: CVPixelBuffer?
+            guard CVPixelBufferPoolCreatePixelBuffer(nil, pool, &scaled) == kCVReturnSuccess,
+                  let dst = scaled else { return }
+            guard VTPixelTransferSessionTransferImage(transfer, from: source, to: dst) == noErr else { return }
 
             var props: [String: Any]? = nil
             if forceKeyFrame {
@@ -124,7 +101,7 @@ class SampleHandler: RPBroadcastSampleHandler {
                 forceKeyFrame = false
             }
             VTCompressionSessionEncodeFrame(
-                encoder, imageBuffer: pixelBuffer, presentationTimeStamp: pts, duration: .invalid,
+                encoder, imageBuffer: dst, presentationTimeStamp: pts, duration: .invalid,
                 frameProperties: props as CFDictionary?, infoFlagsOut: nil,
                 outputHandler: { [weak self] status, _, sb in
                     guard status == noErr, let sb, let self else { return }
@@ -134,54 +111,48 @@ class SampleHandler: RPBroadcastSampleHandler {
         }
     }
 
-    // MARK: Блюр (на уменьшенной копии — визуально то же, а памяти в разы меньше)
-
-    private func makeBlurred(_ input: CVPixelBuffer) -> CVPixelBuffer? {
-        let w = CVPixelBufferGetWidth(input)
-        let h = CVPixelBufferGetHeight(input)
-        guard w > 0, h > 0 else { return nil }
-        // Блюр всё равно съедает детали, поэтому сначала уменьшаем кадр до ~360p — так буфер
-        // в разы меньше. При растягивании обратно размытие выглядит так же сильно.
-        let targetH = 360
-        let scale = min(1.0, Double(targetH) / Double(h))
-        let sw = max(16, Int(Double(w) * scale))
-        let sh = max(16, Int(Double(h) * scale))
-
-        if blurPool == nil || blurW != sw || blurH != sh {
-            blurW = sw; blurH = sh
-            let attrs: [String: Any] = [
-                kCVPixelBufferPixelFormatTypeKey as String: CVPixelBufferGetPixelFormatType(input),
-                kCVPixelBufferWidthKey as String: sw,
-                kCVPixelBufferHeightKey as String: sh,
-                kCVPixelBufferIOSurfacePropertiesKey as String: [:]
-            ]
-            var pool: CVPixelBufferPool?
-            let poolAttrs: [String: Any] = [kCVPixelBufferPoolMinimumBufferCountKey as String: 3]
-            CVPixelBufferPoolCreate(nil, poolAttrs as CFDictionary, attrs as CFDictionary, &pool)
-            blurPool = pool
-        }
-        guard let pool = blurPool else { return nil }
-        var out: CVPixelBuffer?
-        CVPixelBufferPoolCreatePixelBuffer(nil, pool, &out)
-        guard let out else { return nil }
-
-        let ci = CIImage(cvPixelBuffer: input)
-            .transformed(by: CGAffineTransform(scaleX: scale, y: scale))
-            .clampedToExtent()
-            .applyingFilter("CIGaussianBlur", parameters: [kCIInputRadiusKey: 14])
-            .cropped(to: CGRect(x: 0, y: 0, width: sw, height: sh))
-        ciContext.render(ci, to: out)
-        return out
+    /// Вписываем размер в maxSide, сохраняя пропорции; стороны чётные (требование H264).
+    private static func fitSize(_ w: Int, _ h: Int) -> (Int, Int) {
+        guard w > 0, h > 0 else { return (0, 0) }
+        let longest = max(w, h)
+        let scale = longest > maxSide ? Double(maxSide) / Double(longest) : 1.0
+        var tw = Int((Double(w) * scale).rounded())
+        var th = Int((Double(h) * scale).rounded())
+        tw -= tw % 2
+        th -= th % 2
+        return (max(2, tw), max(2, th))
     }
 
-    // MARK: Кодирование H264
+    private func ensureScaler(width: Int, height: Int) {
+        if transfer != nil, scalePool != nil, width == dstW, height == dstH { return }
+        dstW = width; dstH = height
+
+        if let t = transfer { VTPixelTransferSessionInvalidate(t) }
+        var ts: VTPixelTransferSession?
+        VTPixelTransferSessionCreate(allocator: nil, pixelTransferSessionOut: &ts)
+        if let ts {
+            // dst сохраняет пропорции источника, поэтому Normal = ровное масштабирование без искажений.
+            VTSessionSetProperty(ts, key: kVTPixelTransferPropertyKey_ScalingMode, value: kVTScalingMode_Normal)
+            transfer = ts
+        }
+
+        let attrs: [String: Any] = [
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+            kCVPixelBufferWidthKey as String: width,
+            kCVPixelBufferHeightKey as String: height,
+            kCVPixelBufferIOSurfacePropertiesKey as String: [:]
+        ]
+        let poolAttrs: [String: Any] = [kCVPixelBufferPoolMinimumBufferCountKey as String: 2]
+        var pool: CVPixelBufferPool?
+        CVPixelBufferPoolCreate(nil, poolAttrs as CFDictionary, attrs as CFDictionary, &pool)
+        scalePool = pool
+    }
 
     private func ensureEncoder(width: Int, height: Int) {
-        if encoder != nil, width == self.width, height == self.height { return }
+        if encoder != nil, width == dstW, height == dstH, encoderReady { return }
         if let e = encoder { VTCompressionSessionInvalidate(e) }
-        self.width = width
-        self.height = height
         let q = BroadcastShared.quality
+        let bitrate = min(q.bitrate, 3_000_000)   // держим поток разумным
         var session: VTCompressionSession?
         VTCompressionSessionCreate(allocator: nil, width: Int32(width), height: Int32(height),
                                    codecType: kCMVideoCodecType_H264, encoderSpecification: nil,
@@ -192,14 +163,15 @@ class SampleHandler: RPBroadcastSampleHandler {
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_RealTime, value: kCFBooleanTrue)
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AllowFrameReordering, value: kCFBooleanFalse)
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: q.fps as CFNumber)
-        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AverageBitRate, value: q.bitrate as CFNumber)
-        // Опорный кадр не реже раза в секунду — чтобы зритель получал картинку сразу, без ожидания.
+        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AverageBitRate, value: bitrate as CFNumber)
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: Int32(q.fps) as CFNumber)
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, value: 1.0 as CFNumber)
         VTCompressionSessionPrepareToEncodeFrames(session)
         encoder = session
+        encoderReady = true
         forceKeyFrame = true
     }
+    private var encoderReady = false
 
     private func emit(_ sb: CMSampleBuffer) {
         let isKey = !((CMSampleBufferGetSampleAttachmentsArray(sb, createIfNecessary: false) as? [[CFString: Any]])?
@@ -231,7 +203,6 @@ class SampleHandler: RPBroadcastSampleHandler {
         if !firstFrameSent {
             firstFrameSent = true
             BroadcastShared.post(BroadcastShared.beaconFirstSend)
-            BroadcastShared.extLog("первый кадр закодирован и отправлен в приложение (\(annexb.count) байт)")
         }
     }
 

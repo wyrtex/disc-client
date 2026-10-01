@@ -1429,6 +1429,7 @@ final class VoiceSpike: ObservableObject {
     /// Поднять слушатели заранее (сокет-сервер + наблюдатели/маячки), чтобы приложение было
     /// готово к моменту запуска расширения — даже если жест «подготовки» по кнопке не сработал.
     func armBroadcast() {
+        add("[видео/демо] armBroadcast: слушатели трансляции включены (сокет + Darwin-маячки)")
         setupBroadcastListeners()
         startExtLogPolling()
     }
@@ -1441,6 +1442,9 @@ final class VoiceSpike: ObservableObject {
                 // App Group под ESign недоступен, поэтому исходное состояние блюра сообщаем
                 // расширению уведомлением сразу после подключения.
                 BroadcastShared.post(self.blurOn ? BroadcastShared.notifyBlurOn : BroadcastShared.notifyBlurOff)
+                // Подключение расширения = стрим реально пошёл. Регистрируем у Discord
+                // (надёжнее, чем ждать Darwin-маячок, который мог не дойти). Идемпотентно.
+                self.onBroadcastStarted()
             }
         }
         socketServer.onFrame = { [weak self] type, payload in
