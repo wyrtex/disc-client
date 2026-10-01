@@ -1,5 +1,90 @@
 import SwiftUI
 import UIKit
+import Network
+
+// MARK: - HTTP через сокет (обход ATS)
+
+/// Минимальный HTTP-клиент поверх Network.framework. Нужен, чтобы ходить на сервер по http://
+/// без HTTPS: ATS в iOS действует только на URLSession, а на NWConnection — нет.
+enum RawHTTP {
+    struct Response { let status: Int; let body: Data }
+    enum RawError: LocalizedError {
+        case badURL, failed(String), timeout
+        var errorDescription: String? {
+            switch self {
+            case .badURL: return "неверный адрес"
+            case .failed(let s): return s
+            case .timeout: return "сервер не ответил (таймаут)"
+            }
+        }
+    }
+
+    static func request(method: String, urlString: String,
+                        headers: [String: String] = [:], body: Data? = nil,
+                        timeout: TimeInterval = 10) async throws -> Response {
+        guard let url = URL(string: urlString), let host = url.host else { throw RawError.badURL }
+        let port = UInt16(url.port ?? 80)
+        var path = url.path.isEmpty ? "/" : url.path
+        if let q = url.query { path += "?\(q)" }
+
+        var head = "\(method) \(path) HTTP/1.1\r\n"
+        head += "Host: \(host)\r\n"
+        head += "Connection: close\r\n"
+        for (k, v) in headers { head += "\(k): \(v)\r\n" }
+        if let body { head += "Content-Length: \(body.count)\r\n" }
+        head += "\r\n"
+        var packet = Data(head.utf8)
+        if let body { packet.append(body) }
+
+        let conn = NWConnection(host: NWEndpoint.Host(host),
+                                port: NWEndpoint.Port(rawValue: port) ?? 80,
+                                using: .tcp)
+
+        return try await withCheckedThrowingContinuation { cont in
+            var finished = false
+            var received = Data()
+            func finish(_ r: Result<Response, Error>) {
+                if finished { return }
+                finished = true
+                conn.cancel()
+                cont.resume(with: r)
+            }
+            func receiveLoop() {
+                conn.receive(minimumIncompleteLength: 1, maximumLength: 65536) { chunk, _, isComplete, err in
+                    if let chunk { received.append(chunk) }
+                    if let err { finish(.failure(RawError.failed("\(err)"))); return }
+                    if isComplete { finish(.success(parse(received))); return }
+                    receiveLoop()
+                }
+            }
+            conn.stateUpdateHandler = { state in
+                switch state {
+                case .ready:
+                    conn.send(content: packet, completion: .contentProcessed { sendErr in
+                        if let sendErr { finish(.failure(RawError.failed("\(sendErr)"))); return }
+                        receiveLoop()
+                    })
+                case .failed(let e): finish(.failure(RawError.failed("\(e)")))
+                case .waiting(let e): finish(.failure(RawError.failed("\(e)")))
+                default: break
+                }
+            }
+            DispatchQueue.global().asyncAfter(deadline: .now() + timeout) { finish(.failure(RawError.timeout)) }
+            conn.start(queue: .global())
+        }
+    }
+
+    private static func parse(_ data: Data) -> Response {
+        guard let r = data.range(of: Data("\r\n\r\n".utf8)) else { return Response(status: 0, body: data) }
+        let headerStr = String(data: data[..<r.lowerBound], encoding: .utf8) ?? ""
+        var status = 0
+        if let line = headerStr.split(separator: "\r\n").first {
+            let parts = line.split(separator: " ")
+            if parts.count >= 2 { status = Int(parts[1]) ?? 0 }
+        }
+        return Response(status: status, body: Data(data[r.upperBound...]))
+    }
+}
 
 // MARK: - Конфигурация скриптов (хранится в UserDefaults)
 
@@ -66,7 +151,6 @@ final class ScriptsEngine: ObservableObject {
     /// Отправляет текущий конфиг на сервер (он включает/выключает скрипты у себя).
     func pushToServer() {
         let base = config.serverURL.trimmingCharacters(in: CharacterSet(charactersIn: " /"))
-        guard let url = URL(string: "\(base)/config") else { serverStatus = "неверный адрес сервера"; return }
         let payload: [String: Any] = [
             "autoEnabled": config.autoEnabled,
             "autoChannelIds": config.autoChannelIds,
@@ -74,16 +158,15 @@ final class ScriptsEngine: ObservableObject {
             "aiEnabled": config.aiEnabled,
             "aiChannelIds": config.aiChannelIds
         ]
-        var req = URLRequest(url: url)
-        req.httpMethod = "POST"
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.setValue(config.serverSecret, forHTTPHeaderField: "X-Auth")
-        req.httpBody = try? JSONSerialization.data(withJSONObject: payload)
+        let body = try? JSONSerialization.data(withJSONObject: payload)
+        let secret = config.serverSecret
         Task { @MainActor in
             do {
-                let (_, resp) = try await URLSession.shared.data(for: req)
-                let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
-                serverStatus = code == 200 ? "конфиг отправлен на сервер ✓" : "сервер ответил \(code)"
+                let r = try await RawHTTP.request(
+                    method: "POST", urlString: "\(base)/config",
+                    headers: ["Content-Type": "application/json", "X-Auth": secret],
+                    body: body)
+                serverStatus = r.status == 200 ? "конфиг отправлен на сервер ✓" : "сервер ответил \(r.status)"
             } catch {
                 serverStatus = "нет связи с сервером: \(error.localizedDescription)"
             }
@@ -93,18 +176,18 @@ final class ScriptsEngine: ObservableObject {
     /// Проверка связи с сервером (GET /status).
     func checkServer() {
         let base = config.serverURL.trimmingCharacters(in: CharacterSet(charactersIn: " /"))
-        guard let url = URL(string: "\(base)/status") else { serverStatus = "неверный адрес сервера"; return }
-        var req = URLRequest(url: url)
-        req.setValue(config.serverSecret, forHTTPHeaderField: "X-Auth")
+        let secret = config.serverSecret
         Task { @MainActor in
             do {
-                let (data, resp) = try await URLSession.shared.data(for: req)
-                let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
-                if code == 200, let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-                    let user = obj["user"] as? String ?? "не залогинен"
+                let r = try await RawHTTP.request(
+                    method: "GET", urlString: "\(base)/status",
+                    headers: ["X-Auth": secret])
+                if r.status == 200,
+                   let obj = try? JSONSerialization.jsonObject(with: r.body) as? [String: Any] {
+                    let user = (obj["user"] as? String) ?? "не залогинен"
                     serverStatus = "сервер на связи, аккаунт: \(user)"
                 } else {
-                    serverStatus = "сервер ответил \(code)"
+                    serverStatus = "сервер ответил \(r.status)"
                 }
             } catch {
                 serverStatus = "нет связи с сервером: \(error.localizedDescription)"
