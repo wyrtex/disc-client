@@ -26,6 +26,8 @@ final class Gateway {
     var onReady: (() -> Void)?
     /// Голосовые состояния участников по серверам (из READY и GUILD_CREATE).
     var onGuildVoiceStates: (([(String, [[String: Any]])]) -> Void)?
+    /// Полный список каналов сервера из GUILD_CREATE (включая скрытые — REST их не отдаёт).
+    var onGuildChannels: ((String, [[String: Any]]) -> Void)?
     /// Идентификатор сессии (нужен для нажатий на кнопки ботов).
     var onSessionId: ((String) -> Void)?
 
@@ -164,6 +166,7 @@ final class Gateway {
                     resumeURL = d["resume_gateway_url"] as? String
                     if let guilds = d["guilds"] as? [[String: Any]] {
                         emitVoiceStates(guilds)
+                        emitChannels(guilds)
                     }
                 }
                 isReady = true
@@ -172,6 +175,7 @@ final class Gateway {
                 onReady?()
             } else if t == "GUILD_CREATE", let d = obj["d"] as? [String: Any] {
                 emitVoiceStates([d])
+                emitChannels([d])
             } else if t == "RESUMED" {
                 isReady = true
                 retryDelay = 3
@@ -204,6 +208,16 @@ final class Gateway {
             }
         }
         if !out.isEmpty { onGuildVoiceStates?(out) }
+    }
+
+    /// Полный список каналов каждого сервера (включая скрытые) — для показа в списке с замком.
+    private func emitChannels(_ guilds: [[String: Any]]) {
+        for g in guilds {
+            if let id = g["id"] as? String,
+               let chs = g["channels"] as? [[String: Any]], !chs.isEmpty {
+                onGuildChannels?(id, chs)
+            }
+        }
     }
 
     private func identify() {

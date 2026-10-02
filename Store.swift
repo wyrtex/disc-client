@@ -307,6 +307,9 @@ final class Store: ObservableObject {
         gw.onGuildVoiceStates = { [weak self] list in
             Task { @MainActor in self?.setGuildVoiceStates(list) }
         }
+        gw.onGuildChannels = { [weak self] gid, raw in
+            Task { @MainActor in self?.applyGatewayChannels(gid, raw) }
+        }
         gw.onDispatchName = { [weak self] t in
             Task { @MainActor in self?.voice.noteEvent(t) }
         }
@@ -342,18 +345,23 @@ final class Store: ObservableObject {
         guard let api, let me else { return }
         if guildChannels[guild.id] != nil { return }
         do {
-            let all: [Channel] = try await api.get("/guilds/\(guild.id)/channels")
+            let rest: [Channel] = try await api.get("/guilds/\(guild.id)/channels")
+            var roles: Set<String> = memberRoles[guild.id] ?? []
             if let member: GuildMember = try? await api.get("/users/@me/guilds/\(guild.id)/member") {
-                memberRoles[guild.id] = Set(member.roles)
+                roles = Set(member.roles)
+                memberRoles[guild.id] = roles
                 if let until = member.communication_disabled_until, let date = Store.parseISO(until) {
                     memberTimeout[guild.id] = date
                 }
-                if let ids = Store.viewableIDs(all, guild: guild, roles: Set(member.roles), meId: me.id) {
-                    viewable[guild.id] = ids
-                }
             }
-            guildChannels[guild.id] = all
-            for ch in all {
+            // REST для пользовательского токена отдаёт только доступные каналы. Скрытые берём из
+            // GUILD_CREATE (шлюз) и дополняем ими список — чтобы они были видны (замком/приглушённо).
+            let full = mergeGuildChannels(rest: rest, guildId: guild.id)
+            if let ids = Store.viewableIDs(full, guild: guild, roles: roles, meId: me.id) {
+                viewable[guild.id] = ids
+            }
+            guildChannels[guild.id] = full
+            for ch in full {
                 guard let last = ch.last_message_id else { continue }
                 if let known = lastRead[ch.id], known != last {
                     unreadChannels.insert(ch.id)
@@ -362,6 +370,38 @@ final class Store: ObservableObject {
         } catch {
             self.error = error.localizedDescription
         }
+    }
+
+    /// Сырые каналы серверов из GUILD_CREATE (полный набор, включая скрытые).
+    private var gatewayChannelsRaw: [String: [[String: Any]]] = [:]
+
+    private func decodeChannels(_ raw: [[String: Any]]) -> [Channel] {
+        guard let data = try? JSONSerialization.data(withJSONObject: raw) else { return [] }
+        return (try? JSONDecoder().decode([Channel].self, from: data)) ?? []
+    }
+
+    /// Объединяем REST-список (только доступные) со скрытыми каналами из шлюза, по id.
+    private func mergeGuildChannels(rest: [Channel], guildId: String) -> [Channel] {
+        let gw = decodeChannels(gatewayChannelsRaw[guildId] ?? [])
+        guard !gw.isEmpty else { return rest }
+        var byId: [String: Channel] = [:]
+        for c in gw { byId[c.id] = c }
+        for c in rest { byId[c.id] = c }   // у REST объекты свежее — пусть перекрывают
+        return Array(byId.values)
+    }
+
+    /// Пришёл полный список каналов сервера из шлюза. Сохраняем; если сервер уже открыт —
+    /// пересобираем список, чтобы скрытые каналы появились без перезахода.
+    func applyGatewayChannels(_ gid: String, _ raw: [[String: Any]]) {
+        gatewayChannelsRaw[gid] = raw
+        guard guildChannels[gid] != nil,
+              let guild = guilds.first(where: { $0.id == gid }), let me else { return }
+        let full = mergeGuildChannels(rest: guildChannels[gid] ?? [], guildId: gid)
+        if let roles = memberRoles[gid],
+           let ids = Store.viewableIDs(full, guild: guild, roles: roles, meId: me.id) {
+            viewable[gid] = ids
+        }
+        guildChannels[gid] = full
     }
 
     /// nil означает «все каналы доступны» (владелец, админ или права неизвестны).

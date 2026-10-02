@@ -139,6 +139,22 @@ struct GuildMemberInfo: Decodable {
     let roles: [String]?
     let joined_at: String?
     let nick: String?
+    let avatar: String?   // серверный аватар (хэш)
+    let banner: String?   // серверный баннер (хэш)
+
+    /// Серверный аватар участника (отдельный от глобального).
+    func avatarURL(guildId: String, userId: String, size: Int = 256) -> URL? {
+        guard let avatar, !avatar.isEmpty else { return nil }
+        let ext = avatar.hasPrefix("a_") ? "gif" : "png"
+        return URL(string: "https://cdn.discordapp.com/guilds/\(guildId)/users/\(userId)/avatars/\(avatar).\(ext)?size=\(size)")
+    }
+
+    /// Серверный баннер участника.
+    func bannerURL(guildId: String, userId: String, size: Int = 600) -> URL? {
+        guard let banner, !banner.isEmpty else { return nil }
+        let ext = banner.hasPrefix("a_") ? "gif" : "png"
+        return URL(string: "https://cdn.discordapp.com/guilds/\(guildId)/users/\(userId)/banners/\(banner).\(ext)?size=\(size)")
+    }
 
     var joinedDate: Date? {
         guard let joined_at else { return nil }
@@ -150,16 +166,25 @@ struct GuildMemberInfo: Decodable {
     }
 }
 
+/// Серверный профиль участника (своя биография/местоимения/баннер на конкретном сервере).
+struct GuildMemberProfile: Decodable {
+    let bio: String?
+    let pronouns: String?
+    let banner: String?
+    let accent_color: Int?
+}
+
 struct ProfileResponse: Decodable {
     let user: User?
     let user_profile: UserProfileInfo?
     let mutual_guilds: [MutualGuild]?
     let guild_member: GuildMemberInfo?
+    let guild_member_profile: GuildMemberProfile?
     let badges: [ProfileBadge]?
     let mutual_friends_count: Int?
 
     enum CodingKeys: String, CodingKey {
-        case user, user_profile, mutual_guilds, guild_member, badges, mutual_friends_count
+        case user, user_profile, mutual_guilds, guild_member, guild_member_profile, badges, mutual_friends_count
     }
 
     init(from decoder: Decoder) throws {
@@ -168,6 +193,7 @@ struct ProfileResponse: Decodable {
         user_profile = try? c.decode(UserProfileInfo.self, forKey: .user_profile)
         mutual_guilds = try? c.decode([MutualGuild].self, forKey: .mutual_guilds)
         guild_member = try? c.decode(GuildMemberInfo.self, forKey: .guild_member)
+        guild_member_profile = try? c.decode(GuildMemberProfile.self, forKey: .guild_member_profile)
         badges = try? c.decode([ProfileBadge].self, forKey: .badges)
         mutual_friends_count = try? c.decode(Int.self, forKey: .mutual_friends_count)
     }

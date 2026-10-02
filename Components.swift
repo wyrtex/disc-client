@@ -203,9 +203,11 @@ struct RemoteImage<Placeholder: View>: View {
 struct AvatarView: View {
     let user: User?
     var size: CGFloat = 40
+    /// Переопределённый адрес (например, серверный аватар участника).
+    var overrideURL: URL? = nil
 
     var body: some View {
-        RemoteImage(url: user?.avatarURL(size: size > 48 ? 256 : 128)) {
+        RemoteImage(url: overrideURL ?? user?.avatarURL(size: size > 48 ? 256 : 128)) {
             Circle().fill(Theme.blurple)
         }
         .frame(width: size, height: size)

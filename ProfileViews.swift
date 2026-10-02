@@ -22,6 +22,30 @@ struct UserProfileSheet: View {
         return shown.displayName
     }
 
+    /// Серверный аватар участника (если задан именно для этого сервера), иначе глобальный.
+    private var serverAvatarURL: URL? {
+        guard let guildId else { return nil }
+        return profile?.guild_member?.avatarURL(guildId: guildId, userId: user.id)
+    }
+
+    /// Серверный баннер участника, иначе глобальный.
+    private var serverBannerURL: URL? {
+        guard let guildId else { return shown.bannerURL() }
+        return profile?.guild_member?.bannerURL(guildId: guildId, userId: user.id) ?? shown.bannerURL()
+    }
+
+    private var effectiveBio: String? {
+        let server = profile?.guild_member_profile?.bio
+        if let server, !server.isEmpty { return server }
+        return profile?.user_profile?.bio
+    }
+
+    private var effectivePronouns: String? {
+        let server = profile?.guild_member_profile?.pronouns
+        if let server, !server.isEmpty { return server }
+        return profile?.user_profile?.pronouns
+    }
+
     private var nameColor: Color {
         store.roleColor(guildId: guildId, userId: user.id, fallbackRoles: memberRoleIds) ?? Theme.text
     }
@@ -109,13 +133,13 @@ struct UserProfileSheet: View {
 
     private var header: some View {
         ZStack(alignment: .bottomLeading) {
-            RemoteImage(url: shown.bannerURL()) {
+            RemoteImage(url: serverBannerURL) {
                 bannerColor
             }
             .frame(maxWidth: .infinity)
             .frame(height: 130)
             .clipped()
-            AvatarView(user: shown, size: 92)
+            AvatarView(user: shown, size: 92, overrideURL: serverAvatarURL)
                 .overlay(Circle().stroke(Theme.chat, lineWidth: 6))
                 .offset(x: 14, y: 46)
         }
@@ -146,7 +170,7 @@ struct UserProfileSheet: View {
                 Text(shown.username)
                     .font(.system(size: 15))
                     .foregroundStyle(Theme.muted)
-                if let p = profile?.user_profile?.pronouns, !p.isEmpty {
+                if let p = effectivePronouns, !p.isEmpty {
                     Text("•").foregroundStyle(Theme.muted)
                     Text(p)
                         .font(.system(size: 15))
@@ -264,7 +288,7 @@ struct UserProfileSheet: View {
 
     @ViewBuilder
     private var biography: some View {
-        if let bio = profile?.user_profile?.bio, !bio.isEmpty {
+        if let bio = effectiveBio, !bio.isEmpty {
             VStack(alignment: .leading, spacing: 8) {
                 sectionTitle("Биография")
                 Text(DiscordText.attributed(bio, mentions: []))

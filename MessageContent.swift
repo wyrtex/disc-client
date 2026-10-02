@@ -328,12 +328,22 @@ struct VideoViewer: View {
     let url: URL
     let onClose: () -> Void
     @State private var player = AVPlayer()
+    @State private var scale: CGFloat = 1
+    @State private var lastScale: CGFloat = 1
+    @State private var pan: CGSize = .zero
+    @State private var lastPan: CGSize = .zero
+
+    private var zoomed: Bool { scale > 1.01 }
 
     var body: some View {
         ZStack(alignment: .topTrailing) {
             Color.black.ignoresSafeArea()
             VideoPlayer(player: player)
                 .ignoresSafeArea()
+                .scaleEffect(scale)
+                .offset(pan)
+                .gesture(magnify.simultaneously(with: panDrag))
+                .onTapGesture(count: 2) { toggleZoom() }
             HStack(spacing: 14) {
                 SaveMediaButton(url: url, isVideo: true)
                 Button(action: onClose) {
@@ -353,6 +363,35 @@ struct VideoViewer: View {
             player.play()
         }
         .onDisappear { player.pause() }
+    }
+
+    private var magnify: some Gesture {
+        MagnificationGesture()
+            .onChanged { v in scale = min(5, max(0.6, lastScale * v)) }
+            .onEnded { _ in
+                if scale < 1 {
+                    withAnimation(.spring(response: 0.3, dampingFraction: 0.85)) { scale = 1; pan = .zero }
+                    lastScale = 1; lastPan = .zero
+                } else { lastScale = scale; lastPan = pan }
+            }
+    }
+
+    // Перетаскивание только когда приближено — иначе не мешаем управлению плеером.
+    private var panDrag: some Gesture {
+        DragGesture()
+            .onChanged { v in
+                guard zoomed else { return }
+                pan = CGSize(width: lastPan.width + v.translation.width,
+                             height: lastPan.height + v.translation.height)
+            }
+            .onEnded { _ in if zoomed { lastPan = pan } }
+    }
+
+    private func toggleZoom() {
+        withAnimation(.spring(response: 0.3, dampingFraction: 0.85)) {
+            if zoomed { scale = 1; pan = .zero; lastScale = 1; lastPan = .zero }
+            else { scale = 2.5; lastScale = 2.5 }
+        }
     }
 }
 
