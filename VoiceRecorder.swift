@@ -93,6 +93,8 @@ final class VoiceRecorder: NSObject, ObservableObject {
         isRecording = false
         elapsed = 0
         levels = []
+        // Запись голосового закончилась — возвращаем фоновый режим (музыка пользователя продолжит).
+        AudioHub.ensureMixing()
     }
 
     /// До 256 значений 0...255, base64. Так Discord рисует волну голосового сообщения.

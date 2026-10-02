@@ -9,6 +9,8 @@ struct DiscApp: App {
     init() {
         // Кэш картинок на диске: аватарки и иконки не скачиваются заново при каждом запуске.
         URLCache.shared = URLCache(memoryCapacity: 30 * 1024 * 1024, diskCapacity: 300 * 1024 * 1024)
+        // Фоновый режим аудио: музыка пользователя продолжает играть, немые гифки её не паузят.
+        AudioHub.ensureMixing()
     }
 
     var body: some Scene {

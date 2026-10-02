@@ -303,6 +303,8 @@ struct LoopingVideoView: UIViewRepresentable {
     func makeUIView(context: Context) -> PlayerContainerView {
         let v = PlayerContainerView()
         v.playerLayer.videoGravity = .resizeAspectFill
+        // Немая зацикленная гифка не должна паузить музыку пользователя — держим подмешивающий режим.
+        AudioHub.ensureMixing()
         let player = AVQueuePlayer()
         player.isMuted = true
         player.preventsDisplaySleepDuringVideoPlayback = false
@@ -355,14 +357,15 @@ struct VideoViewer: View {
             .padding()
         }
         .onAppear {
-            if !store.voice.isConnected {
-                try? AVAudioSession.sharedInstance().setCategory(.playback)
-                try? AVAudioSession.sharedInstance().setActive(true)
-            }
+            // Полноэкранное видео со звуком: забираем вывод (паузим музыку), если не в войсе.
+            AudioHub.beginPlayback()
             player.replaceCurrentItem(with: AVPlayerItem(url: url))
             player.play()
         }
-        .onDisappear { player.pause() }
+        .onDisappear {
+            player.pause()
+            AudioHub.endPlayback()
+        }
     }
 
     private var magnify: some Gesture {

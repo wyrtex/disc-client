@@ -29,9 +29,8 @@ final class VoicePlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
         defer { loadingID = nil }
         do {
             let file = try await localFile(a)
-            let session = AVAudioSession.sharedInstance()
-            try session.setCategory(.playback, mode: .default)
-            try session.setActive(true)
+            // Голосовое сообщение со звуком — забираем вывод (если не в войсе), музыку вернём после.
+            AudioHub.beginPlayback()
             let p = try AVAudioPlayer(contentsOf: file)
             p.delegate = self
             guard p.play() else { return }
@@ -54,6 +53,7 @@ final class VoicePlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
         player = nil
         playingID = nil
         progress = 0
+        AudioHub.endPlayback()
     }
 
     private func tick() {

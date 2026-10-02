@@ -145,12 +145,15 @@ final class VoiceAudio {
         teardown()
         do {
             let session = AVAudioSession.sharedInstance()
+            // .mixWithOthers: звук другого приложения (TikTok, видео в браузере) НЕ прерывает нашу
+            // сессию и не выкидывает из войса — вместо прерывания аудио просто подмешивается.
             try session.setCategory(
                 .playAndRecord,
                 mode: voiceChat ? .voiceChat : .default,
-                options: [.allowBluetooth, .allowBluetoothA2DP]
+                options: [.allowBluetooth, .allowBluetoothA2DP, .mixWithOthers]
             )
             try session.setActive(true)
+            AudioHub.enterVoice()
 
             let e = AVAudioEngine()
             if mic {
@@ -194,9 +197,24 @@ final class VoiceAudio {
             self?.control.async { self?.restartIfNeeded() }
         }
         let obsInterrupt = center.addObserver(forName: AVAudioSession.interruptionNotification, object: nil, queue: nil) { [weak self] note in
-            guard let raw = note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
-                  AVAudioSession.InterruptionType(rawValue: raw) == .ended else { return }
-            self?.control.async { self?.restartIfNeeded() }
+            guard let self,
+                  let raw = note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
+                  let type = AVAudioSession.InterruptionType(rawValue: raw) else { return }
+            switch type {
+            case .began:
+                // Телефонный звонок/другой источник прервал аудио. Войс НЕ покидаем — ждём конца.
+                self.log?("Аудио: прервано внешним источником — остаёмся в войсе")
+            case .ended:
+                self.control.async {
+                    let s = AVAudioSession.sharedInstance()
+                    try? s.setCategory(.playAndRecord, mode: .voiceChat,
+                                       options: [.allowBluetooth, .allowBluetoothA2DP, .mixWithOthers])
+                    try? s.setActive(true)
+                    self.restartIfNeeded()
+                }
+            @unknown default:
+                break
+            }
         }
         stateLock.lock()
         observers = [obsConfig, obsInterrupt]
@@ -258,6 +276,8 @@ final class VoiceAudio {
         teardown()
         micQueue.async { self.accumulator = [] }
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+        // Войс закончился — возвращаем фоновый подмешивающий режим (музыка пользователя продолжит).
+        AudioHub.exitVoice()
     }
 
     func setDeafened(_ d: Bool) {
