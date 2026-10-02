@@ -51,6 +51,10 @@ final class Store: ObservableObject {
     /// только после входа — без этого сигнала загрузка каналов срабатывала до готовности api
     /// и молча ничего не грузила, пока вручную не переключишь сервер.
     @Published var apiReady = false
+    /// Токен умер во время работы: показываем веб-вход поверх интерфейса для молчаливого
+    /// переполучения токена (куки-сессия Discord сохранена, поэтому пароль обычно не нужен).
+    @Published var needsReauth = false
+    private var reauthInFlight = false
     @Published var guilds: [Guild] = []
     @Published var dms: [Channel] = []
     @Published var guildChannels: [String: [Channel]] = [:]
@@ -141,10 +145,10 @@ final class Store: ObservableObject {
             await login(token: token, silent: true)
             if me != nil { return }
             if let code = loginStatus, code == 401 || code == 403 {
-                // Токен больше не действует: возвращаемся на экран входа.
-                logout()
-                error = lastLoginError
+                // Сохранённый токен умер: вместо экрана входа — молчаливое переполучение через веб.
+                // Куки-сессия Discord сохранена, поэтому чаще всего пароль вводить не придётся.
                 isRestoring = false
+                handleUnauthorized()
                 return
             }
             try? await Task.sleep(nanoseconds: UInt64(2 + attempt) * 1_000_000_000)
@@ -173,8 +177,13 @@ final class Store: ObservableObject {
             DiskCache.save(meData, "me")
             DiskCache.save(gData, "guilds")
             DiskCache.save(dData, "dms")
+            api.onUnauthorized = { [weak self] in Task { @MainActor in self?.handleUnauthorized() } }
             self.api = api
             self.apiReady = true
+            // Удачный вход — снимаем режим переавторизации.
+            self.needsReauth = false
+            self.reauthInFlight = false
+            self.loginStatus = nil
             self.scripts.start()
             self.me = me
             self.guilds = Store.applySavedOrder(g)
@@ -210,11 +219,29 @@ final class Store: ObservableObject {
         } catch {
             lastLoginError = error.localizedDescription
             if case APIError.http(let code, _) = error { loginStatus = code } else { loginStatus = nil }
+            // Переполучение не удалось — разрешаем веб-входу открыться снова при следующем 401.
+            reauthInFlight = false
             if !silent { self.error = error.localizedDescription }
         }
     }
 
+    /// Любой запрос вернул 401 (или шлюз отверг токен) во время работы. Не выкидываем на экран
+    /// входа — показываем веб-вход поверх интерфейса для молчаливого переполучения токена.
+    func handleUnauthorized() {
+        guard !reauthInFlight, !needsReauth else { return }
+        reauthInFlight = true
+        voice.addGateway("Токен недействителен — открываю веб-вход для переполучения")
+        needsReauth = true
+    }
+
+    /// Получили свежий токен из веб-входа при переавторизации.
+    func reauthenticate(token: String) {
+        Task { await login(token: token) }
+    }
+
     func logout() {
+        needsReauth = false
+        reauthInFlight = false
         voice.leave(silent: true)
         gateway?.stop()
         gateway = nil

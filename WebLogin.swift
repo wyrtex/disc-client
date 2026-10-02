@@ -11,7 +11,9 @@ struct WebLoginView: UIViewRepresentable {
 
     func makeUIView(context: Context) -> WKWebView {
         let cfg = WKWebViewConfiguration()
-        cfg.websiteDataStore = .nonPersistent()
+        // ПОСТОЯННОЕ хранилище: куки-сессия Discord переживает перезапуск. Благодаря этому при
+        // смерти токена повторный веб-вход уже залогинен и свежий токен ловится молча, без пароля.
+        cfg.websiteDataStore = .default()
         cfg.defaultWebpagePreferences.preferredContentMode = .desktop
 
         // Самый надёжный способ достать токен: перехватываем заголовок Authorization у всех

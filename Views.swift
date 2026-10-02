@@ -13,6 +13,57 @@ struct RootView: View {
                 LoginView()
             }
         }
+        // Токен умер во время работы — поверх всего открываем веб-вход и молча ловим новый токен.
+        .fullScreenCover(isPresented: $store.needsReauth) {
+            ReauthView()
+        }
+    }
+}
+
+/// Экран автоматического переполучения токена. Веб-сессия Discord сохранена, поэтому обычно
+/// токен перехватывается за пару секунд без ввода пароля. Если нет — можно войти вручную.
+struct ReauthView: View {
+    @EnvironmentObject var store: Store
+    @State private var stuck = false
+
+    var body: some View {
+        ZStack(alignment: .bottom) {
+            WebLoginView(
+                onToken: { t in
+                    store.needsReauth = false
+                    store.reauthenticate(token: t)
+                },
+                onStuck: { stuck = true }
+            )
+            .ignoresSafeArea()
+
+            VStack(spacing: 10) {
+                if !stuck {
+                    HStack(spacing: 8) {
+                        ProgressView().tint(.white)
+                        Text("Токен устарел — обновляю вход…")
+                            .font(.system(size: 14, weight: .semibold))
+                            .foregroundStyle(.white)
+                    }
+                } else {
+                    Text("Нужно войти заново")
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(.white)
+                    Text("Войди на странице как обычно — новый токен подхватится сам.")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.white.opacity(0.85))
+                        .multilineTextAlignment(.center)
+                }
+                Button("Отмена") { store.needsReauth = false }
+                    .font(.system(size: 13, weight: .semibold))
+                    .padding(.horizontal, 14).padding(.vertical, 8)
+                    .background(Theme.blurple, in: Capsule())
+                    .foregroundStyle(.white)
+            }
+            .padding(16)
+            .frame(maxWidth: .infinity)
+            .background(.black.opacity(0.85))
+        }
     }
 }
 

@@ -36,8 +36,39 @@ final class API {
     let token: String
     let session: URLSession
 
-    private static let userAgent =
-        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+    /// Вызывается один раз, когда любой запрос получает 401 (токен умер) — чтобы Store
+    /// автоматически запустил переполучение токена через веб-вход.
+    var onUnauthorized: (() -> Void)?
+    private var unauthorizedFired = false
+
+    // UA настоящего десктоп-браузера. Discord к токену без согласованных заголовков клиента
+    // относится как к «боту» и быстрее его аннулирует — поэтому выдаём себя за веб-клиент Chrome.
+    private static let browserUA =
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+    private static let userAgent = browserUA
+
+    /// X-Super-Properties: base64(JSON) с описанием клиента. Официальный веб-клиент шлёт его в
+    /// КАЖДОМ запросе; без него сессия выглядит подозрительно и живёт недолго.
+    private static let superProps: String = {
+        let props: [String: Any] = [
+            "os": "Mac OS X",
+            "browser": "Chrome",
+            "device": "",
+            "system_locale": "en-US",
+            "browser_user_agent": browserUA,
+            "browser_version": "128.0.0.0",
+            "os_version": "10.15.7",
+            "referrer": "",
+            "referring_domain": "",
+            "referrer_current": "",
+            "referring_domain_current": "",
+            "release_channel": "stable",
+            "client_build_number": 9999999,
+            "client_event_source": NSNull()
+        ]
+        let data = (try? JSONSerialization.data(withJSONObject: props)) ?? Data()
+        return data.base64EncodedString()
+    }()
 
     init(token: String, proxy: ProxySettings) {
         self.token = token
@@ -67,12 +98,24 @@ final class API {
         req.setValue(token, forHTTPHeaderField: "Authorization")
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.setValue(API.userAgent, forHTTPHeaderField: "User-Agent")
+        // Заголовки настоящего веб-клиента — чтобы Discord не считал сессию ботом и не убивал токен.
+        req.setValue(API.superProps, forHTTPHeaderField: "X-Super-Properties")
+        req.setValue("en-US", forHTTPHeaderField: "X-Discord-Locale")
+        req.setValue("bugReporterEnabled", forHTTPHeaderField: "X-Debug-Options")
+        req.setValue("https://discord.com", forHTTPHeaderField: "Origin")
+        req.setValue("https://discord.com/channels/@me", forHTTPHeaderField: "Referer")
         return req
     }
 
     private func check(_ data: Data, _ resp: URLResponse) throws {
         guard let http = resp as? HTTPURLResponse else { throw APIError.badResponse }
         guard (200..<300).contains(http.statusCode) else {
+            // 401 = токен недействителен. Сообщаем наверх ровно один раз, чтобы запустить
+            // авто-переполучение, и не спамим при каждом последующем запросе.
+            if http.statusCode == 401, !unauthorizedFired {
+                unauthorizedFired = true
+                onUnauthorized?()
+            }
             throw APIError.http(http.statusCode, String(data: data, encoding: .utf8) ?? "")
         }
     }

@@ -207,12 +207,33 @@ final class Gateway {
     }
 
     private func identify() {
+        // Свойства должны совпадать с заголовками REST (X-Super-Properties) — иначе сессия
+        // выглядит рассогласованной и Discord быстрее аннулирует токен. Выдаём веб-клиент Chrome.
+        let props: [String: Any] = [
+            "os": "Mac OS X",
+            "browser": "Chrome",
+            "device": "",
+            "system_locale": "en-US",
+            "browser_user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+            "browser_version": "128.0.0.0",
+            "os_version": "10.15.7",
+            "referrer": "",
+            "referring_domain": "",
+            "referrer_current": "",
+            "referring_domain_current": "",
+            "release_channel": "stable",
+            "client_build_number": 9999999,
+            "client_event_source": NSNull()
+        ]
         send([
             "op": 2,
             "d": [
                 "token": token,
-                "properties": ["os": "iOS", "browser": "Discord iOS", "device": "iPhone"],
-                "presence": ["status": "online", "afk": false]
+                "capabilities": 16381,
+                "properties": props,
+                "presence": ["status": "online", "afk": false],
+                "compress": false,
+                "client_state": ["guild_versions": [:]]
             ] as [String: Any]
         ])
     }
