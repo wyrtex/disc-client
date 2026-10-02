@@ -39,30 +39,10 @@ struct ForumView: View {
             }
         }
         .background(Theme.chat)
-        .navigationBarTitleDisplayMode(.inline)
-        .toolbarBackground(Theme.chat, for: .navigationBar)
-        .toolbarBackground(.visible, for: .navigationBar)
-        .toolbarColorScheme(.dark, for: .navigationBar)
-        .toolbar {
-            ToolbarItem(placement: .principal) {
-                HStack(spacing: 6) {
-                    Image(systemName: "bubble.left.and.bubble.right.fill")
-                        .font(.system(size: 13))
-                        .foregroundStyle(Theme.muted)
-                    Text(channel.title)
-                        .font(.system(size: 16, weight: .bold))
-                        .foregroundStyle(.white)
-                        .lineLimit(1)
-                }
-            }
-            ToolbarItem(placement: .topBarTrailing) {
-                Button {
-                    showNew = true
-                } label: {
-                    Image(systemName: "square.and.pencil")
-                }
-            }
-        }
+        .safeAreaInset(edge: .top, spacing: 0) { forumHeader }
+        .background(Theme.chat.ignoresSafeArea())
+        .navigationBarBackButtonHidden(true)
+        .toolbar(.hidden, for: .navigationBar)
         .simultaneousGesture(backSwipe)
         .sheet(isPresented: $showNew) {
             NewPostSheet(forum: channel)
@@ -85,6 +65,38 @@ struct ForumView: View {
                     dismiss()
                 }
             }
+    }
+
+    /// Плоская шапка форума в стиле Discord.
+    private var forumHeader: some View {
+        HStack(spacing: 10) {
+            Button { dismiss() } label: {
+                Image(systemName: "chevron.left")
+                    .font(.system(size: 20, weight: .semibold))
+                    .foregroundStyle(.white)
+                    .contentShape(Rectangle())
+            }
+            Image(systemName: "bubble.left.and.bubble.right.fill")
+                .font(.system(size: 14))
+                .foregroundStyle(Theme.muted)
+            Text(channel.title)
+                .font(.system(size: 17, weight: .bold))
+                .foregroundStyle(.white)
+                .lineLimit(1)
+            Spacer(minLength: 8)
+            Button { showNew = true } label: {
+                Image(systemName: "square.and.pencil")
+                    .font(.system(size: 18, weight: .semibold))
+                    .foregroundStyle(Theme.link)
+                    .contentShape(Rectangle())
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .background(Theme.chat)
+        .overlay(alignment: .bottom) {
+            Rectangle().fill(Color.white.opacity(0.06)).frame(height: 1)
+        }
     }
 }
 

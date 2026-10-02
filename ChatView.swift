@@ -172,6 +172,7 @@ struct ChatView: View {
 
     private func chatCore(_ msgs: [Message]) -> some View {
         VStack(spacing: 0) {
+            chatHeader
             translateBanner
             messageList(msgs)
             if !suggestions.isEmpty { suggestionList }
@@ -187,34 +188,11 @@ struct ChatView: View {
             }
         }
         .background(Theme.chat)
+        .background(Theme.chat.ignoresSafeArea())
         .environment(\.currentGuildId, guildId)
         .simultaneousGesture(backSwipe)
-        .navigationBarTitleDisplayMode(.inline)
-        .toolbarBackground(Theme.chat, for: .navigationBar)
-        .toolbarBackground(.visible, for: .navigationBar)
-        .toolbarColorScheme(.dark, for: .navigationBar)
-        .toolbar {
-            ToolbarItem(placement: .principal) {
-                HStack(spacing: 6) {
-                    Image(systemName: channel.icon)
-                        .font(.system(size: 14, weight: .semibold))
-                        .foregroundStyle(Theme.muted)
-                    Text(channel.title)
-                        .font(.system(size: 16, weight: .bold))
-                        .foregroundStyle(.white)
-                        .lineLimit(1)
-                }
-            }
-            ToolbarItem(placement: .topBarTrailing) {
-                Button {
-                    showAI = true
-                } label: {
-                    Image(systemName: "sparkles")
-                        .font(.system(size: 16, weight: .semibold))
-                        .foregroundStyle(Theme.link)
-                }
-            }
-        }
+        .navigationBarBackButtonHidden(true)
+        .toolbar(.hidden, for: .navigationBar)
         .sheet(isPresented: $showAI) {
             ChatAISheet(
                 model: aiModel,
@@ -225,6 +203,38 @@ struct ChatView: View {
             .presentationDetents([.medium, .large])
             .presentationDragIndicator(.visible)
             .presentationBackground(Theme.chat)
+        }
+    }
+
+    /// Плоская шапка в стиле Discord (без «liquid glass» системной панели).
+    private var chatHeader: some View {
+        HStack(spacing: 10) {
+            Button { dismiss() } label: {
+                Image(systemName: "chevron.left")
+                    .font(.system(size: 20, weight: .semibold))
+                    .foregroundStyle(.white)
+                    .contentShape(Rectangle())
+            }
+            Image(systemName: channel.icon)
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(Theme.muted)
+            Text(channel.title)
+                .font(.system(size: 17, weight: .bold))
+                .foregroundStyle(.white)
+                .lineLimit(1)
+            Spacer(minLength: 8)
+            Button { showAI = true } label: {
+                Image(systemName: "sparkles")
+                    .font(.system(size: 18, weight: .semibold))
+                    .foregroundStyle(Theme.link)
+                    .contentShape(Rectangle())
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .background(Theme.chat)
+        .overlay(alignment: .bottom) {
+            Rectangle().fill(Color.white.opacity(0.06)).frame(height: 1)
         }
     }
 
