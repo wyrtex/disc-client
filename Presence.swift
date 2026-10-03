@@ -44,6 +44,26 @@ struct PresenceActivity: Codable {
     }
 }
 
+// MARK: - Игра из списка Discord
+
+struct DetectableGame: Decodable, Identifiable {
+    let id: String
+    let name: String
+    let icon_hash: String?
+    let cover_image_hash: String?
+
+    var iconURL: URL? {
+        guard let h = icon_hash else { return nil }
+        return URL(string: "https://cdn.discordapp.com/app-icons/\(id)/\(h).png?size=128")
+    }
+    /// Картинка для presence (обложка, если есть, иначе иконка).
+    var assetImageURL: String? {
+        if let c = cover_image_hash { return "https://cdn.discordapp.com/app-icons/\(id)/\(c).png?size=512" }
+        if let i = icon_hash { return "https://cdn.discordapp.com/app-icons/\(id)/\(i).png?size=512" }
+        return nil
+    }
+}
+
 // MARK: - Менеджер presence
 
 @MainActor
@@ -53,6 +73,10 @@ final class PresenceManager: ObservableObject {
     @Published var status = "online"       // online / idle / dnd / invisible
     @Published var working = false
     @Published var note = ""
+
+    /// Список игр, которые Discord умеет показывать (с иконками/обложками).
+    @Published var games: [DetectableGame] = []
+    @Published var loadingGames = false
 
     /// Отправка в гейтвей (op 3). Ставится из Store при подключении.
     var send: (([String: Any]) -> Bool)?
@@ -207,6 +231,37 @@ final class PresenceManager: ObservableObject {
         } catch { note = "Не удалось получить данные видео" }
     }
 
+    // MARK: Игры Discord
+
+    /// Загружаем список игр Discord один раз (с иконками/обложками).
+    func loadGames() async {
+        guard games.isEmpty, !loadingGames else { return }
+        loadingGames = true
+        defer { loadingGames = false }
+        guard let url = URL(string: "https://discord.com/api/v9/applications/detectable") else { return }
+        do {
+            let (data, _) = try await session.data(from: url)
+            let list = try JSONDecoder().decode([DetectableGame].self, from: data)
+            games = list.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+        } catch {
+            note = "Не удалось загрузить список игр"
+        }
+    }
+
+    /// Выбрали игру из списка — заполняем активность (обложка + название + таймер).
+    func pickGame(_ g: DetectableGame) {
+        activity.kind = .game
+        activity.name = g.name
+        activity.applicationId = g.id
+        activity.largeImageURL = g.assetImageURL ?? ""
+        activity.largeText = g.name
+        activity.details = ""
+        activity.state = ""
+        activity.showTimer = true
+        activity.hasProgress = false
+        note = "Выбрана игра: \(g.name). Нажми «Применить»."
+    }
+
     // MARK: helpers
 
     private func extractID(_ link: String, marker: String) -> String? {
@@ -292,6 +347,16 @@ struct PresenceView: View {
                             .textInputAutocapitalization(.never).autocorrectionDisabled()
                         Button("Загрузить видео") { Task { await presence.fetchYouTube(link) } }
                             .disabled(link.isEmpty || presence.working)
+                    }
+                }
+                if presence.activity.kind == .game {
+                    Section("Игра из Discord") {
+                        NavigationLink {
+                            GamePickerView(presence: presence)
+                        } label: {
+                            Label(presence.activity.name.isEmpty ? "Выбрать игру из списка" : presence.activity.name,
+                                  systemImage: "gamecontroller.fill")
+                        }
                     }
                 }
 
@@ -384,6 +449,48 @@ struct PresenceView: View {
         case .watching: return "YouTube"
         case .custom: return "Название"
         }
+    }
+}
+
+// MARK: - Выбор игры из списка Discord
+
+struct GamePickerView: View {
+    @ObservedObject var presence: PresenceManager
+    @Environment(\.dismiss) private var dismiss
+    @State private var query = ""
+
+    private var filtered: [DetectableGame] {
+        guard !query.isEmpty else { return presence.games }
+        return presence.games.filter { $0.name.localizedCaseInsensitiveContains(query) }
+    }
+
+    var body: some View {
+        List {
+            if presence.loadingGames {
+                HStack(spacing: 10) { ProgressView(); Text("Загружаю список игр…").foregroundStyle(Theme.muted) }
+            }
+            ForEach(filtered.prefix(400)) { g in
+                Button {
+                    presence.pickGame(g)
+                    dismiss()
+                } label: {
+                    HStack(spacing: 12) {
+                        RemoteImage(url: g.iconURL) { Color.white.opacity(0.08) }
+                            .frame(width: 36, height: 36)
+                            .clipShape(RoundedRectangle(cornerRadius: 8))
+                        Text(g.name).foregroundStyle(Theme.text)
+                        Spacer()
+                    }
+                    .contentShape(Rectangle())
+                }
+            }
+        }
+        .scrollContentBackground(.hidden)
+        .background(Theme.chat)
+        .navigationTitle("Выбор игры")
+        .navigationBarTitleDisplayMode(.inline)
+        .searchable(text: $query, prompt: "Поиск игры")
+        .task { await presence.loadGames() }
     }
 }
 
