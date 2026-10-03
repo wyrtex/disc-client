@@ -108,6 +108,7 @@ final class Store: ObservableObject {
     private var lastRead: [String: String] = UserDefaults.standard.dictionary(forKey: "lastRead") as? [String: String] ?? [:]
     let voice = VoiceSpike()
     let scripts = ScriptsEngine()
+    let presence = PresenceManager()
     private(set) var api: API?
     private var gateway: Gateway?
 
@@ -215,7 +216,13 @@ final class Store: ObservableObject {
             }
             Keychain.save(clean)
             isRestoring = false
+            // Presence (кастомные активности): отправка через гейтвей + внешние картинки через REST.
+            presence.send = { [weak self] obj in self?.gateway?.sendRaw(obj) ?? false }
+            presence.resolveAsset = { [weak self] appId, url in await self?.api?.externalAssets(appId: appId, url: url) ?? nil }
+            presence.session = api.session
+            presence.userId = me.id
             startGateway(token: clean, session: api.session)
+            presence.restoreIfNeeded()
         } catch {
             lastLoginError = error.localizedDescription
             if case APIError.http(let code, _) = error { loginStatus = code } else { loginStatus = nil }
@@ -242,6 +249,7 @@ final class Store: ObservableObject {
     func logout() {
         needsReauth = false
         reauthInFlight = false
+        AudioHub.setKeepAlive(false)
         voice.leave(silent: true)
         gateway?.stop()
         gateway = nil
@@ -317,7 +325,10 @@ final class Store: ObservableObject {
             Task { @MainActor in self?.voice.addGateway(s) }
         }
         gw.onReady = { [weak self] in
-            Task { @MainActor in self?.voice.gatewayReady() }
+            Task { @MainActor in
+                self?.voice.gatewayReady()
+                self?.presence.resend()
+            }
         }
         voice.sendGateway = { [weak gw] obj in gw?.sendRaw(obj) ?? false }
         voice.ensureGateway = { [weak gw] in gw?.ensureConnected() }

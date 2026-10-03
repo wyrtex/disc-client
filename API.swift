@@ -160,6 +160,13 @@ final class API {
         try await send("POST", path, body: body)
     }
 
+    /// Превращает ссылку на картинку во внешний ассет Discord ("mp:…") — для Rich Presence.
+    func externalAssets(appId: String, url: String) async -> String? {
+        struct R: Decodable { let external_asset_path: String }
+        guard let list: [R] = try? await post("/applications/\(appId)/external-assets", body: ["urls": [url]]) else { return nil }
+        return list.first.map { "mp:" + $0.external_asset_path }
+    }
+
     private func nonce() -> String {
         String(Int(Date().timeIntervalSince1970 * 1000))
     }

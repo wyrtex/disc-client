@@ -11,6 +11,7 @@ struct MainView: View {
     @State private var showVoice = false
     @State private var showLab = false
     @State private var showScripts = false
+    @State private var showPresence = false
 
     var body: some View {
         NavigationStack(path: $store.path) {
@@ -62,12 +63,17 @@ struct MainView: View {
         }
         .confirmationDialog("Аккаунт", isPresented: $confirmLogout, titleVisibility: .hidden) {
             Button("Скрипты") { showScripts = true }
+            Button("Активность") { showPresence = true }
             Button("Голосовая лаборатория") { showLab = true }
             Button("Выйти из аккаунта", role: .destructive) { store.logout() }
             Button("Отмена", role: .cancel) {}
         }
         .sheet(isPresented: $showScripts) {
             ScriptsView(engine: store.scripts)
+                .environmentObject(store)
+        }
+        .sheet(isPresented: $showPresence) {
+            PresenceView(presence: store.presence)
                 .environmentObject(store)
         }
         .alert("Ошибка", isPresented: Binding(
