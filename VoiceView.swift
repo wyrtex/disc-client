@@ -395,6 +395,16 @@ struct VoiceView: View {
                         .frame(width: 54, height: 54)
                         .background(Color.red, in: Circle())
                 }
+            } else if voice.broadcastArming {
+                // Ждём, пока система подтвердит начало трансляции. Тап — отменить ожидание.
+                Button {
+                    voice.cancelArming()
+                } label: {
+                    ZStack {
+                        Circle().fill(Theme.panel).frame(width: 54, height: 54)
+                        ProgressView().tint(.white)
+                    }
+                }
             } else {
                 controlButton(icon: "rectangle.on.rectangle", active: false) {
                     showStreamSettings = true

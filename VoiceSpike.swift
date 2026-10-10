@@ -762,6 +762,9 @@ final class VoiceSpike: ObservableObject {
     // Своя демонстрация экрана (Go Live через расширение трансляции).
     @Published var broadcasting = false
     @Published var broadcastStatus = ""
+    /// Нажали «Начать стрим», ждём, пока система подтвердит запуск захвата экрана
+    /// (пока пользователь не выбрал приложение и не нажал «Начать вещание»).
+    @Published var broadcastArming = false
     @Published var blurOn = BroadcastShared.blur
     private let socketServer = LocalSocketServer()
     private var broadcastGateway: VoiceGateway?
@@ -775,6 +778,7 @@ final class VoiceSpike: ObservableObject {
     private var beaconObservers: [NSObjectProtocol] = []
     private var frameClock: UInt32 = 0
     private var broadcastWatchdog: Timer?
+    private var broadcastArmWatchdog: Timer?
     private var broadcastFramesSeen = false
 
     // Просмотр чужой демонстрации экрана (Go Live): отдельное соединение со своим сервером.
@@ -1421,9 +1425,13 @@ final class VoiceSpike: ObservableObject {
         setupBroadcastListeners()
         startExtLogPolling()
         add("[видео/демо] Демонстрация подготовлена: качество \(quality.rawValue), звук \(streamAudio), блюр \(blur), запись \(record)")
-        // Стрим у Discord регистрируем НЕ здесь: сначала пользователь подтверждает системное окно,
-        // расширение реально стартует и присылает сигнал — тогда и шлём op 18. Иначе Discord
-        // получал стрим без картинки ещё до старта захвата (та самая гонка).
+        // Входим в режим ожидания системного окна. Пилюлю и op 18 НЕ делаем сейчас — только когда
+        // расширение реально стартует (пользователь нажал «Начать вещание»). armWatchdog снимет
+        // ожидание, если пользователь закрыл окно, так и не начав трансляцию.
+        broadcastArming = true
+        broadcastStatus = "Жду разрешение системы…"
+        add("[видео/демо] Жду, пока система начнёт запись экрана (нажми «Начать вещание»)…")
+        startArmWatchdog()
     }
 
     /// Поднять слушатели заранее (сокет-сервер + наблюдатели/маячки), чтобы приложение было
@@ -1521,6 +1529,9 @@ final class VoiceSpike: ObservableObject {
             return
         }
         broadcasting = true
+        broadcastArming = false
+        broadcastArmWatchdog?.invalidate()
+        broadcastArmWatchdog = nil
         broadcastFramesSeen = false
         broadcastStatus = "Запускаю демонстрацию…"
         broadcastKey = "guild:\(gid):\(cid):\(userId)"
@@ -1531,20 +1542,32 @@ final class VoiceSpike: ObservableObject {
         ])
         // Снимаем возможную паузу.
         _ = sendGateway?(["op": 22, "d": ["stream_key": broadcastKey ?? "", "paused": false]])
-        startBroadcastWatchdog()
+        // Авто-выключение по таймеру убрано: стрим живёт, пока ты сам его не остановишь или
+        // система не завершит захват экрана (notifyStopped). Так показ не гаснет «через секунду».
     }
 
-    /// Если пользователь отменил системное окно трансляции, расширение не запустится и кадры не
-    /// пойдут. Через некоторое время сами свернём стрим, чтобы у Discord не висела пустая Live-иконка.
-    private func startBroadcastWatchdog() {
-        broadcastWatchdog?.invalidate()
-        broadcastWatchdog = Timer.scheduledTimer(withTimeInterval: 20, repeats: false) { [weak self] _ in
+    /// Ожидание системного окна трансляции. Если за 90 с расширение так и не стартовало —
+    /// считаем, что окно закрыли, и снимаем состояние ожидания. Активный стрим это НЕ трогает.
+    private func startArmWatchdog() {
+        broadcastArmWatchdog?.invalidate()
+        broadcastArmWatchdog = Timer.scheduledTimer(withTimeInterval: 90, repeats: false) { [weak self] _ in
             Task { @MainActor in
-                guard let self, self.broadcasting, !self.broadcastFramesSeen else { return }
-                self.add("[видео/демо] Кадры экрана так и не пошли за 20 с — останавливаю (окно трансляции отменено?)")
-                self.stopBroadcast(notify: true)
+                guard let self, self.broadcastArming, !self.broadcasting else { return }
+                self.broadcastArming = false
+                self.broadcastStatus = ""
+                self.add("[видео/демо] Трансляция так и не началась — окно закрыто или расширение не запустилось")
             }
         }
+    }
+
+    /// Отменить ожидание (пользователь передумал до старта системной трансляции).
+    func cancelArming() {
+        guard broadcastArming, !broadcasting else { return }
+        broadcastArming = false
+        broadcastStatus = ""
+        broadcastArmWatchdog?.invalidate()
+        broadcastArmWatchdog = nil
+        add("[видео/демо] Ожидание трансляции отменено")
     }
 
     func stopBroadcast(notify: Bool) {
@@ -1553,6 +1576,9 @@ final class VoiceSpike: ObservableObject {
         BroadcastShared.post(BroadcastShared.notifyStopCommand)
         broadcastWatchdog?.invalidate()
         broadcastWatchdog = nil
+        broadcastArmWatchdog?.invalidate()
+        broadcastArmWatchdog = nil
+        broadcastArming = false
         if notify, let key = broadcastKey {
             // op 19 = Stream Delete (та же форма, что и «перестать смотреть»). op 18 с active:false
             // Discord считал битым пакетом и рвал основной шлюз (код 4002) — из-за этого и кикало.

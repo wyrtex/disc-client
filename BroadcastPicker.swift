@@ -33,7 +33,9 @@ struct BroadcastStartButton: UIViewRepresentable {
             voice.add("[видео/демо] Расширение для трансляции: \(extID ?? "не найдено, дефолт com.example.discclient.broadcast")")
             voice.prepareBroadcast(quality: quality, streamAudio: streamAudio, blur: blur, record: record)
             onTapped()
-            if !container.triggerPicker() {
+            if container.triggerPicker() {
+                voice.add("[видео/демо] Открыл системное окно трансляции — выбери DiscClient и нажми «Начать вещание»")
+            } else {
                 voice.add("[видео/демо] Не нашёл системную кнопку трансляции — окно «Начать трансляцию» не открылось")
             }
         }
