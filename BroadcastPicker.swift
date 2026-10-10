@@ -20,6 +20,10 @@ struct BroadcastStartButton: UIViewRepresentable {
         picker.preferredExtension = extID ?? "com.example.discclient.broadcast"
         picker.showsMicrophoneButton = false
         picker.alpha = 0.02
+        // КЛЮЧЕВОЕ: отключаем перехват касаний самим пикером. Иначе он (растянутый на всю кнопку)
+        // съедал тап на себя, и наш обработчик не вызывался — кнопка «Начать стрим» не работала.
+        // Системную кнопку внутри пикера мы всё равно жмём программно (sendActions), без хит-теста.
+        picker.isUserInteractionEnabled = false
         picker.translatesAutoresizingMaskIntoConstraints = false
         container.insertSubview(picker, at: 0)
         NSLayoutConstraint.activate([
@@ -89,15 +93,16 @@ struct BroadcastStartButton: UIViewRepresentable {
         /// Ищем системную кнопку трансляции рекурсивно и жмём её.
         @discardableResult
         func triggerPicker() -> Bool {
-            guard let picker = picker, let button = Self.findButton(in: picker) else { return false }
-            button.sendActions(for: .touchUpInside)
+            guard let picker = picker, let control = Self.findControl(in: picker) else { return false }
+            control.sendActions(for: .touchUpInside)
+            control.sendActions(for: .primaryActionTriggered)
             return true
         }
 
-        private static func findButton(in view: UIView) -> UIButton? {
-            if let b = view as? UIButton { return b }
+        private static func findControl(in view: UIView) -> UIControl? {
+            if let c = view as? UIControl { return c }
             for sub in view.subviews {
-                if let b = findButton(in: sub) { return b }
+                if let c = findControl(in: sub) { return c }
             }
             return nil
         }
