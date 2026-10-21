@@ -23,3 +23,30 @@ enum Theme {
     static let green = Color(hex: 0x23A55A)
     static let link = Color(hex: 0x00A8FC)
 }
+
+// MARK: - Адаптация под крупные экраны (iPad)
+
+/// На iPad (regular-ширина) ограничиваем контент телефонной шириной и центрируем на тёмном фоне,
+/// чтобы интерфейс не растягивался на весь огромный экран. На iPhone — без изменений.
+struct AdaptiveColumn: ViewModifier {
+    @Environment(\.horizontalSizeClass) private var hSize
+    var maxWidth: CGFloat = 760
+
+    func body(content: Content) -> some View {
+        if hSize == .regular {
+            content
+                .frame(maxWidth: maxWidth)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(Theme.rail.ignoresSafeArea())
+        } else {
+            content
+        }
+    }
+}
+
+extension View {
+    /// Телефонная ширина с центрированием на iPad.
+    func phoneWidth(_ maxWidth: CGFloat = 760) -> some View {
+        modifier(AdaptiveColumn(maxWidth: maxWidth))
+    }
+}

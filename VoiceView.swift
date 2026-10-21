@@ -49,6 +49,7 @@ struct VoiceView: View {
                 if voice.isStage { stageControls } else { controls }
             }
         }
+        .phoneWidth()
         .sheet(isPresented: $showAudio) {
             AudioSettingsSheet(voice: voice)
         }
@@ -423,7 +424,7 @@ struct VoiceView: View {
             }
         }
         .padding(.horizontal, 12)
-        .frame(minWidth: UIScreen.main.bounds.width)
+        .containerRelativeFrame(.horizontal)
         }
         .padding(.top, 10)
         .padding(.bottom, 24)
