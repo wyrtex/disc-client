@@ -1079,13 +1079,13 @@ final class VoiceSpike: ObservableObject {
 
     private var reconfigureWork: DispatchWorkItem?
 
-    /// Ручной перезапуск распознавания субтитров (кнопка «обновить») — когда движок подвис.
+    /// Кнопка «обновить» субтитры: НЕ пересобираем движок (пересборка под iOS 26 всё ломала),
+    /// а просто завершаем текущие реплики и продолжаем слушать тем же распознаванием.
     func restartCaptions() {
         guard captionsEnabled else { return }
         reconfigureWork?.cancel()
-        add("[субтитры] перезапуск распознавания")
+        add("[субтитры] сброс текущих реплик — слушаю дальше")
         transcriber.reset()
-        transcriber.configure(enabled: true, locales: captionLangs)
     }
 
     /// Включить или выключить язык распознавания (при включении модель скачивается).
