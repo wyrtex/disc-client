@@ -10,10 +10,9 @@ struct RootView: View {
             } else if store.isRestoring {
                 SplashView()
             } else {
-                LoginView()
+                LoginView().phoneWidth()
             }
         }
-        .phoneWidth()
         // Токен умер во время работы — поверх всего открываем веб-вход и молча ловим новый токен.
         .fullScreenCover(isPresented: $store.needsReauth) {
             ReauthView()

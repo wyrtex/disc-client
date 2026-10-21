@@ -4,6 +4,8 @@ struct ForumView: View {
     @EnvironmentObject var store: Store
     @Environment(\.dismiss) private var dismiss
     let channel: Channel
+    /// На iPad форум встроен в правую панель (без кнопки «назад»).
+    var embedded = false
 
     @State private var showNew = false
     @State private var loading = true
@@ -70,11 +72,13 @@ struct ForumView: View {
     /// Плоская шапка форума в стиле Discord.
     private var forumHeader: some View {
         HStack(spacing: 10) {
-            Button { dismiss() } label: {
-                Image(systemName: "chevron.left")
-                    .font(.system(size: 20, weight: .semibold))
-                    .foregroundStyle(.white)
-                    .contentShape(Rectangle())
+            if !embedded {
+                Button { dismiss() } label: {
+                    Image(systemName: "chevron.left")
+                        .font(.system(size: 20, weight: .semibold))
+                        .foregroundStyle(.white)
+                        .contentShape(Rectangle())
+                }
             }
             Image(systemName: "bubble.left.and.bubble.right.fill")
                 .font(.system(size: 14))

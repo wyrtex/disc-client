@@ -18,6 +18,8 @@ struct ChatView: View {
     @Environment(\.dismiss) private var dismiss
     @EnvironmentObject var translator: Translator
     let channel: Channel
+    /// На iPad чат встроен в правую панель (без кнопки «назад» и без свайпа-возврата).
+    var embedded = false
 
     @State private var text = ""
     @State private var pending: [PendingFile] = []
@@ -209,11 +211,13 @@ struct ChatView: View {
     /// Плоская шапка в стиле Discord (без «liquid glass» системной панели).
     private var chatHeader: some View {
         HStack(spacing: 10) {
-            Button { dismiss() } label: {
-                Image(systemName: "chevron.left")
-                    .font(.system(size: 20, weight: .semibold))
-                    .foregroundStyle(.white)
-                    .contentShape(Rectangle())
+            if !embedded {
+                Button { dismiss() } label: {
+                    Image(systemName: "chevron.left")
+                        .font(.system(size: 20, weight: .semibold))
+                        .foregroundStyle(.white)
+                        .contentShape(Rectangle())
+                }
             }
             Image(systemName: channel.icon)
                 .font(.system(size: 15, weight: .semibold))

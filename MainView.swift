@@ -12,8 +12,80 @@ struct MainView: View {
     @State private var showLab = false
     @State private var showScripts = false
     @State private var showPresence = false
+    @Environment(\.horizontalSizeClass) private var hSize
+    /// Канал, открытый в правой панели на iPad.
+    @State private var ipadChannel: Channel?
 
     var body: some View {
+        Group {
+            if hSize == .regular {
+                ipadLayout
+            } else {
+                phoneLayout
+            }
+        }
+        // Пока открыт экран голоса, перевод обслуживает он сам: иначе системное окно скачивания
+        // языков окажется под ним.
+        .translationTask(showVoice ? nil : translator.configuration) { session in
+            await translator.run(session)
+        }
+        .fullScreenCover(isPresented: $showVoice) {
+            VoiceView(voice: store.voice) { showVoice = false }
+                .environmentObject(store)
+                .environmentObject(translator)
+                .translationTask(translator.configuration) { session in
+                    await translator.run(session)
+                }
+        }
+        .onChange(of: selection) { _, new in
+            UserDefaults.standard.set(new, forKey: "lastSelection")
+            // Сменили сервер — старый выбранный канал больше не подходит.
+            ipadChannel = nil
+        }
+        .task(id: store.guilds.count) {
+            if let s = selection, !store.guilds.isEmpty, !store.guilds.contains(where: { $0.id == s }) {
+                selection = nil
+            }
+        }
+        .sheet(isPresented: $showLab) {
+            VoiceLabView()
+                .environmentObject(store)
+                .presentationDetents([.large])
+                .presentationDragIndicator(.visible)
+        }
+        .confirmationDialog("Аккаунт", isPresented: $confirmLogout, titleVisibility: .hidden) {
+            Button("Скрипты") { showScripts = true }
+            Button("Активность") { showPresence = true }
+            Button("Голосовая лаборатория") { showLab = true }
+            Button("Выйти из аккаунта", role: .destructive) { store.logout() }
+            Button("Отмена", role: .cancel) {}
+        }
+        .sheet(isPresented: $showScripts) {
+            ScriptsView(engine: store.scripts)
+                .environmentObject(store)
+                .presentationDetents([.large])
+                .presentationDragIndicator(.visible)
+        }
+        .sheet(isPresented: $showPresence) {
+            PresenceView(presence: store.presence)
+                .environmentObject(store)
+                .presentationDetents([.large])
+                .presentationDragIndicator(.visible)
+        }
+        .alert("Ошибка", isPresented: Binding(
+            get: { store.error != nil },
+            set: { if !$0 { store.error = nil } }
+        )) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(store.error ?? "")
+        }
+    }
+
+    // MARK: Раскладки
+
+    /// iPhone: список каналов + push чата (как раньше).
+    private var phoneLayout: some View {
         NavigationStack(path: $store.path) {
             ZStack {
                 Theme.rail.ignoresSafeArea()
@@ -36,53 +108,51 @@ struct MainView: View {
             }
             .toolbar(.hidden, for: .navigationBar)
         }
-        // Пока открыт экран голоса, перевод обслуживает он сам: иначе системное окно скачивания
-        // языков окажется под ним.
-        .translationTask(showVoice ? nil : translator.configuration) { session in
-            await translator.run(session)
+    }
+
+    /// iPad: десктопная раскладка — серверы, список каналов и чат рядом.
+    private var ipadLayout: some View {
+        HStack(spacing: 0) {
+            ServerRail(selection: $selection)
+            ChannelPanel(
+                selection: selection,
+                collapsed: $collapsed,
+                onUserTap: { confirmLogout = true },
+                onOpenVoice: { showVoice = true },
+                onPickChannel: { ipadChannel = $0 },
+                selectedChannelId: ipadChannel?.id
+            )
+            .frame(width: 340)
+            Rectangle().fill(Color.black.opacity(0.25)).frame(width: 1).ignoresSafeArea()
+            detailPane
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
-        .fullScreenCover(isPresented: $showVoice) {
-            VoiceView(voice: store.voice) { showVoice = false }
-                .environmentObject(store)
-                .environmentObject(translator)
-                .translationTask(translator.configuration) { session in
-                    await translator.run(session)
+        .background(Theme.rail.ignoresSafeArea())
+    }
+
+    @ViewBuilder
+    private var detailPane: some View {
+        if let ch = ipadChannel {
+            Group {
+                if ch.type == 15 {
+                    ForumView(channel: ch, embedded: true)
+                } else {
+                    ChatView(channel: ch, embedded: true)
                 }
-        }
-        .onChange(of: selection) { _, new in
-            UserDefaults.standard.set(new, forKey: "lastSelection")
-        }
-        .task(id: store.guilds.count) {
-            if let s = selection, !store.guilds.isEmpty, !store.guilds.contains(where: { $0.id == s }) {
-                selection = nil
             }
-        }
-        .sheet(isPresented: $showLab) {
-            VoiceLabView()
-                .environmentObject(store)
-        }
-        .confirmationDialog("Аккаунт", isPresented: $confirmLogout, titleVisibility: .hidden) {
-            Button("Скрипты") { showScripts = true }
-            Button("Активность") { showPresence = true }
-            Button("Голосовая лаборатория") { showLab = true }
-            Button("Выйти из аккаунта", role: .destructive) { store.logout() }
-            Button("Отмена", role: .cancel) {}
-        }
-        .sheet(isPresented: $showScripts) {
-            ScriptsView(engine: store.scripts)
-                .environmentObject(store)
-        }
-        .sheet(isPresented: $showPresence) {
-            PresenceView(presence: store.presence)
-                .environmentObject(store)
-        }
-        .alert("Ошибка", isPresented: Binding(
-            get: { store.error != nil },
-            set: { if !$0 { store.error = nil } }
-        )) {
-            Button("OK", role: .cancel) {}
-        } message: {
-            Text(store.error ?? "")
+            .id(ch.id)
+        } else {
+            ZStack {
+                Theme.chat.ignoresSafeArea()
+                VStack(spacing: 10) {
+                    Image(systemName: "bubble.left.and.bubble.right")
+                        .font(.system(size: 46))
+                        .foregroundStyle(Theme.muted)
+                    Text("Выбери канал слева")
+                        .font(.system(size: 16))
+                        .foregroundStyle(Theme.muted)
+                }
+            }
         }
     }
 }
@@ -205,6 +275,9 @@ struct ChannelPanel: View {
     @Binding var collapsed: Set<String>
     let onUserTap: () -> Void
     let onOpenVoice: () -> Void
+    /// На iPad: тап по каналу открывает его в правой панели (вместо push-навигации).
+    var onPickChannel: ((Channel) -> Void)? = nil
+    var selectedChannelId: String? = nil
 
     @State private var showServer = false
     @State private var expandedVoice: String?
@@ -256,6 +329,8 @@ struct ChannelPanel: View {
             if let g = guild {
                 ServerProfileSheet(guild: g)
                     .environmentObject(store)
+                    .presentationDetents([.large])
+                    .presentationDragIndicator(.visible)
             }
         }
 
@@ -267,9 +342,12 @@ struct ChannelPanel: View {
             .onEnded { v in
                 if v.translation.width < -90,
                    abs(v.translation.height) < 70,
-                   store.path.isEmpty,
                    let last = store.lastChannel {
-                    store.path.append(last)
+                    if let onPick = onPickChannel {
+                        onPick(last)               // iPad: открыть в правой панели
+                    } else if store.path.isEmpty {
+                        store.path.append(last)    // iPhone: push
+                    }
                 }
             }
     }
@@ -394,41 +472,49 @@ struct ChannelPanel: View {
     private var dmContent: some View {
         LazyVStack(spacing: 2) {
             ForEach(store.dms) { ch in
-                NavigationLink(value: ch) {
-                    HStack(spacing: 12) {
-                        AvatarView(user: ch.recipients?.first, size: 44)
-                        VStack(alignment: .leading, spacing: 2) {
-                            HStack(alignment: .firstTextBaseline) {
-                                Text(ch.title)
-                                    .font(.system(size: 16, weight: .semibold))
-                                    .foregroundStyle(Theme.text)
-                                    .lineLimit(1)
-                                Spacer(minLength: 6)
-                                if let d = store.dmPreviews[ch.id]?.date {
-                                    Text(shortTime(d))
-                                        .font(.system(size: 12))
-                                        .foregroundStyle(Theme.muted)
-                                }
-                            }
-                            if let p = store.dmPreviews[ch.id] {
-                                Text(store.previewText(p))
-                                    .font(.system(size: 14))
-                                    .foregroundStyle(Theme.muted)
-                                    .lineLimit(1)
-                            }
-                        }
+                Group {
+                    if let onPick = onPickChannel {
+                        Button { onPick(ch) } label: { dmRowLabel(ch) }.buttonStyle(.plain)
+                    } else {
+                        NavigationLink(value: ch) { dmRowLabel(ch) }.buttonStyle(.plain)
                     }
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 6)
-                    .contentShape(Rectangle())
                 }
-                .buttonStyle(.plain)
                 .task(id: ch.last_message_id) {
                     await store.loadDMPreview(ch)
                 }
             }
         }
         .padding(.top, 8)
+    }
+
+    private func dmRowLabel(_ ch: Channel) -> some View {
+        HStack(spacing: 12) {
+            AvatarView(user: ch.recipients?.first, size: 44)
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(alignment: .firstTextBaseline) {
+                    Text(ch.title)
+                        .font(.system(size: 16, weight: .semibold))
+                        .foregroundStyle(Theme.text)
+                        .lineLimit(1)
+                    Spacer(minLength: 6)
+                    if let d = store.dmPreviews[ch.id]?.date {
+                        Text(shortTime(d))
+                            .font(.system(size: 12))
+                            .foregroundStyle(Theme.muted)
+                    }
+                }
+                if let p = store.dmPreviews[ch.id] {
+                    Text(store.previewText(p))
+                        .font(.system(size: 14))
+                        .foregroundStyle(Theme.muted)
+                        .lineLimit(1)
+                }
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 6)
+        .background((ch.id == selectedChannelId) ? Color.white.opacity(0.08) : Color.clear)
+        .contentShape(Rectangle())
     }
 
     private func shortTime(_ d: Date) -> String {
@@ -494,8 +580,13 @@ struct ChannelPanel: View {
         if locked {
             rowLabel(ch, locked: true).opacity(0.4)
         } else if ch.type == 0 || ch.type == 5 || ch.type == 15 {
-            NavigationLink(value: ch) { rowLabel(ch, locked: false) }
-                .buttonStyle(.plain)
+            if let onPick = onPickChannel {
+                Button { onPick(ch) } label: { rowLabel(ch, locked: false, selected: ch.id == selectedChannelId) }
+                    .buttonStyle(.plain)
+            } else {
+                NavigationLink(value: ch) { rowLabel(ch, locked: false) }
+                    .buttonStyle(.plain)
+            }
         } else {
             VStack(alignment: .leading, spacing: 0) {
                 Button {
@@ -549,20 +640,31 @@ struct ChannelPanel: View {
             .buttonStyle(.plain)
 
             // Чат голосового канала
-            NavigationLink(value: ch) {
-                Image(systemName: "text.bubble.fill")
-                    .font(.system(size: 17, weight: .semibold))
-                    .foregroundStyle(Theme.text)
-                    .frame(width: 46, height: 46)
-                    .background(Theme.panel, in: Circle())
+            if let onPick = onPickChannel {
+                Button { onPick(ch) } label: {
+                    Image(systemName: "text.bubble.fill")
+                        .font(.system(size: 17, weight: .semibold))
+                        .foregroundStyle(Theme.text)
+                        .frame(width: 46, height: 46)
+                        .background(Theme.panel, in: Circle())
+                }
+                .buttonStyle(.plain)
+            } else {
+                NavigationLink(value: ch) {
+                    Image(systemName: "text.bubble.fill")
+                        .font(.system(size: 17, weight: .semibold))
+                        .foregroundStyle(Theme.text)
+                        .frame(width: 46, height: 46)
+                        .background(Theme.panel, in: Circle())
+                }
+                .buttonStyle(.plain)
             }
-            .buttonStyle(.plain)
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 8)
     }
 
-    private func rowLabel(_ ch: Channel, locked: Bool) -> some View {
+    private func rowLabel(_ ch: Channel, locked: Bool, selected: Bool = false) -> some View {
         let mentioned = store.mentionChannels.contains(ch.id)
         let unread = mentioned || store.unreadChannels.contains(ch.id)
         return HStack(spacing: 8) {
@@ -579,10 +681,11 @@ struct ChannelPanel: View {
                 .lineLimit(1)
             Spacer()
         }
-        .foregroundStyle(unread ? Theme.text : Theme.muted)
+        .foregroundStyle(selected ? Theme.text : (unread ? Theme.text : Theme.muted))
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
         .padding(.horizontal, 8)
+        .background(selected ? Color.white.opacity(0.08) : Color.clear, in: RoundedRectangle(cornerRadius: 8))
         .contentShape(Rectangle())
     }
 }

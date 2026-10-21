@@ -49,7 +49,6 @@ struct VoiceView: View {
                 if voice.isStage { stageControls } else { controls }
             }
         }
-        .phoneWidth()
         .sheet(isPresented: $showAudio) {
             AudioSettingsSheet(voice: voice)
         }
@@ -64,6 +63,8 @@ struct VoiceView: View {
                 NavigationStack {
                     ChatView(channel: ch)
                 }
+                .presentationDetents([.large])
+                .presentationDragIndicator(.visible)
             }
         }
         .sheet(item: $volumeUser) { u in
