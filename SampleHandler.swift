@@ -6,6 +6,11 @@ import CoreMedia
 /// НИКОГДА не кодируем кадр в полном разрешении экрана. Каждый кадр аппаратно уменьшается
 /// до 720p (VTPixelTransferSession) и только потом кодируется H264. Без блюра и записи —
 /// ради стабильности (их можно вернуть позже). Кадры уходят в приложение по localhost-сокету.
+///
+/// @objc(SampleHandler): точное имя класса в рантайме Objective-C. Без него у Swift-класса имя —
+/// `BroadcastExtension.SampleHandler`, оно не совпадает с NSExtensionPrincipalClass в Info.plist,
+/// и iOS не может создать расширение — отсчёт идёт, но broadcastStarted не вызывается.
+@objc(SampleHandler)
 class SampleHandler: RPBroadcastSampleHandler {
     private var encoder: VTCompressionSession?
     private var transfer: VTPixelTransferSession?
