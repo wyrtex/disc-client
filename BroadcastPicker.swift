@@ -34,6 +34,7 @@ struct BroadcastStartButton: UIViewRepresentable {
         ])
         container.picker = picker
         container.onTap = {
+            voice.add("[видео/демо] Встроенные расширения: \(Self.broadcastExtensionDiag())")
             voice.add("[видео/демо] Расширение для трансляции: \(extID ?? "не найдено, дефолт com.example.discclient.broadcast")")
             voice.prepareBroadcast(quality: quality, streamAudio: streamAudio, blur: blur, record: record)
             onTapped()
@@ -61,6 +62,25 @@ struct BroadcastStartButton: UIViewRepresentable {
             return b.bundleIdentifier
         }
         return nil
+    }
+
+    /// Диагностика: какие расширения (.appex) реально встроены в приложение. Нужно, чтобы понять,
+    /// установлено ли broadcast-расширение на устройстве (на iPad его могло не быть).
+    static func broadcastExtensionDiag() -> String {
+        guard let plugins = Bundle.main.builtInPlugInsURL,
+              let items = try? FileManager.default.contentsOfDirectory(
+                at: plugins, includingPropertiesForKeys: nil) else {
+            return "папки PlugIns нет — расширений не встроено"
+        }
+        let appex = items.filter { $0.pathExtension == "appex" }
+        guard !appex.isEmpty else { return "в PlugIns нет ни одного .appex (расширение не встроено)" }
+        var parts: [String] = []
+        for url in appex {
+            let b = Bundle(url: url)
+            let point = (b?.infoDictionary?["NSExtension"] as? [String: Any])?["NSExtensionPointIdentifier"] as? String ?? "?"
+            parts.append("\(b?.bundleIdentifier ?? url.lastPathComponent) [\(point)]")
+        }
+        return parts.joined(separator: "; ")
     }
 
     final class TappableContainer: UIView {
