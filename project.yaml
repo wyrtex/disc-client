@@ -39,7 +39,7 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.example.discclient
         MARKETING_VERSION: '0.1'
         CURRENT_PROJECT_VERSION: '1'
-        TARGETED_DEVICE_FAMILY: '1'
+        TARGETED_DEVICE_FAMILY: '1,2'
         # Авто-генерацию Info.plist выключаем: из-за неё Xcode выкидывал кастомные ключи
         # (ATS, URL-схема). Все ключи задаём явно ниже в info.properties.
         GENERATE_INFOPLIST_FILE: false
@@ -85,7 +85,7 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.example.discclient.broadcast
         MARKETING_VERSION: '0.1'
         CURRENT_PROJECT_VERSION: '1'
-        TARGETED_DEVICE_FAMILY: '1'
+        TARGETED_DEVICE_FAMILY: '1,2'
         GENERATE_INFOPLIST_FILE: 'YES'
         CODE_SIGN_ENTITLEMENTS: BroadcastExtension.entitlements
         INFOPLIST_KEY_CFBundleDisplayName: DiscClient Stream
