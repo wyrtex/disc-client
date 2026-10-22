@@ -238,6 +238,8 @@ struct Channel: Decodable, Identifiable, Hashable {
     let owner_id: String?
     let message_count: Int?
     let permission_overwrites: [Overwrite]?
+    /// Медленный режим: минимальный интервал между сообщениями, секунд.
+    let rate_limit_per_user: Int?
 
     static func == (l: Channel, r: Channel) -> Bool { l.id == r.id }
     func hash(into hasher: inout Hasher) { hasher.combine(id) }

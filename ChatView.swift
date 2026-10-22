@@ -22,6 +22,7 @@ struct ChatView: View {
     var embedded = false
 
     @State private var text = ""
+    @State private var lastSentAt: Date?
     @State private var pending: [PendingFile] = []
     @State private var replyTo: Message?
     @State private var showAttachMenu = false
@@ -181,6 +182,7 @@ struct ChatView: View {
             if let e = editing { editBar(e) }
             if let r = replyTo { replyBar(r) }
             if !pending.isEmpty { pendingStrip }
+            slowModeBar
             typingBar
             if recorder.isRecording {
                 recordingBar
@@ -474,6 +476,32 @@ struct ChatView: View {
     }
 
     // MARK: - Ответ и вложения перед отправкой
+
+    @ViewBuilder
+    private var slowModeBar: some View {
+        let limit = channel.rate_limit_per_user ?? 0
+        if limit > 0, lastSentAt != nil {
+            TimelineView(.periodic(from: .now, by: 0.5)) { ctx in
+                let remaining = remainingSlow(limit, now: ctx.date)
+                if remaining > 0 {
+                    HStack(spacing: 6) {
+                        Image(systemName: "timer").font(.system(size: 12)).foregroundStyle(Theme.muted)
+                        Text("Медленный режим: ещё \(remaining) с")
+                            .font(.system(size: 12)).foregroundStyle(Theme.muted)
+                        Spacer()
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 16).padding(.vertical, 3)
+                    .background(Theme.chat)
+                }
+            }
+        }
+    }
+
+    private func remainingSlow(_ limit: Int, now: Date) -> Int {
+        guard let last = lastSentAt else { return 0 }
+        return max(0, Int(ceil(Double(limit) - now.timeIntervalSince(last))))
+    }
 
     @ViewBuilder
     private var typingBar: some View {
@@ -816,6 +844,7 @@ struct ChatView: View {
                 replyTo = nil
                 mentionMap = [:]
                 suggestions = []
+                lastSentAt = Date()   // старт обратного отсчёта медленного режима
             }
         }
     }
