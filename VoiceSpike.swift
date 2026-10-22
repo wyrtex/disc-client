@@ -991,11 +991,34 @@ final class VoiceSpike: ObservableObject {
         }
     }
 
+    private var keyframeBurst: Task<Void, Never>?
+
+    /// Первые секунды после включения камеры гоним опорные кадры часто.
+    /// Зритель, открывший нашу камеру в любой момент (даже сразу), получает кадр
+    /// для декодирования почти мгновенно и не висит на «бесконечной загрузке» —
+    /// не ждём ни запроса SFU (PLI), ни того, что кто-то зайдёт смотреть.
+    private func startKeyframeBurst() {
+        keyframeBurst?.cancel()
+        keyframeBurst = Task { [weak self] in
+            for _ in 0..<16 {
+                if Task.isCancelled { return }
+                self?.camera.requestKeyframe()
+                try? await Task.sleep(nanoseconds: 300_000_000)
+            }
+        }
+    }
+
+    private func stopKeyframeBurst() {
+        keyframeBurst?.cancel()
+        keyframeBurst = nil
+    }
+
         func leave(silent: Bool = false) {
         if broadcasting { stopBroadcast(notify: true) }
         if watchingStream != nil { stopWatching() }
         if videoOn {
             videoOn = false
+            stopKeyframeBurst()
             camera.stop()
         }
         gateway?.stop()
@@ -1160,6 +1183,7 @@ final class VoiceSpike: ObservableObject {
         guard isConnected else { return }
         if videoOn {
             videoOn = false
+            stopKeyframeBurst()
             camera.stop()
             gateway?.stopVideo()
             _ = sendGateway?(voiceStatePacket(guildId: guildId, channelId: activeChannelId))
@@ -1174,6 +1198,7 @@ final class VoiceSpike: ObservableObject {
             self.videoOn = true
             self.camera.start()
             self.gateway?.startVideo()
+            self.startKeyframeBurst()
             _ = self.sendGateway?(self.voiceStatePacket(guildId: self.guildId, channelId: self.activeChannelId))
         }
     }
