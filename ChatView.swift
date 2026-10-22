@@ -181,6 +181,7 @@ struct ChatView: View {
             if let e = editing { editBar(e) }
             if let r = replyTo { replyBar(r) }
             if !pending.isEmpty { pendingStrip }
+            typingBar
             if recorder.isRecording {
                 recordingBar
             } else if canWrite {
@@ -192,6 +193,9 @@ struct ChatView: View {
         .background(Theme.chat)
         .background(Theme.chat.ignoresSafeArea())
         .environment(\.currentGuildId, guildId)
+        .onChange(of: text) { _, new in
+            if !new.isEmpty { store.sendTyping(in: channel.id) }
+        }
         .simultaneousGesture(backSwipe)
         .navigationBarBackButtonHidden(true)
         .toolbar(.hidden, for: .navigationBar)
@@ -471,11 +475,47 @@ struct ChatView: View {
 
     // MARK: - Ответ и вложения перед отправкой
 
+    @ViewBuilder
+    private var typingBar: some View {
+        let names = store.typingNames(in: channel.id)
+        if !names.isEmpty {
+            HStack(spacing: 7) {
+                TypingDots()
+                Text(typingText(names))
+                    .font(.system(size: 13))
+                    .foregroundStyle(Theme.muted)
+                    .lineLimit(1)
+                Spacer(minLength: 4)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 16)
+            .padding(.top, 2)
+            .padding(.bottom, 4)
+            .background(Theme.chat)
+        }
+    }
+
+    private func typingText(_ names: [String]) -> String {
+        switch names.count {
+        case 1: return "\(names[0]) печатает…"
+        case 2: return "\(names[0]) и \(names[1]) печатают…"
+        case 3: return "\(names[0]), \(names[1]) и \(names[2]) печатают…"
+        default: return "Несколько человек печатают…"
+        }
+    }
+
     private var noWriteBar: some View {
         HStack(spacing: 8) {
             Image(systemName: "lock.fill")
             Text("У вас нет разрешения отправлять сообщения в этом канале")
                 .multilineTextAlignment(.leading)
+            Spacer(minLength: 8)
+            // Перевод доступен даже там, где нельзя писать.
+            Button { showTranslate = true } label: {
+                Image(systemName: "character.bubble")
+                    .font(.system(size: 20))
+                    .foregroundStyle(tset.incomingEnabled || tset.outgoingEnabled ? Theme.blurple : Theme.muted)
+            }
         }
         .font(.system(size: 14))
         .foregroundStyle(Theme.muted)
@@ -1235,5 +1275,23 @@ struct AttachmentView: View {
                 .overlay(RoundedRectangle(cornerRadius: 8).stroke(Theme.rail, lineWidth: 1))
             }
         }
+    }
+}
+
+/// Три пульсирующие точки для индикатора «печатает».
+private struct TypingDots: View {
+    @State private var phase = 0
+    private let timer = Timer.publish(every: 0.35, on: .main, in: .common).autoconnect()
+
+    var body: some View {
+        HStack(spacing: 3) {
+            ForEach(0..<3, id: \.self) { i in
+                Circle()
+                    .fill(Theme.muted)
+                    .frame(width: 5, height: 5)
+                    .opacity(phase == i ? 1 : 0.35)
+            }
+        }
+        .onReceive(timer) { _ in phase = (phase + 1) % 3 }
     }
 }

@@ -63,6 +63,10 @@ final class Store: ObservableObject {
     @Published var guildRoles: [String: [GuildRole]] = [:]
     @Published var guildEmojis: [String: [GuildEmoji]] = [:]
     @Published var messages: [String: [Message]] = [:]
+    /// Кто сейчас печатает: channelId -> (userId -> когда истекает «печатает»).
+    @Published var typing: [String: [String: Date]] = [:]
+    private var typingPruneTimer: Timer?
+    private var lastTypingSent: [String: Date] = [:]
     @Published var forumThreads: [String: [Channel]] = [:]
     @Published var forumPreviews: [String: Message] = [:]
     @Published var forumHasMore: [String: Bool] = [:]
@@ -289,6 +293,7 @@ final class Store: ObservableObject {
         gw.onMessage = { [weak self] msg in
             Task { @MainActor in
                 guard let self else { return }
+                self.clearTyping(user: msg.author.id, in: msg.channel_id)
                 self.noteDMMessage(msg)
                 self.noteIncomingForUnread(msg)
                 self.scripts.onMessage(msg)
@@ -303,6 +308,7 @@ final class Store: ObservableObject {
                 case "MESSAGE_UPDATE": self.applyMessageUpdate(d)
                 case "MESSAGE_DELETE": self.applyMessageDelete(d)
                 case "GUILD_MEMBERS_CHUNK": self.applyMembersChunk(d)
+                case "TYPING_START": self.applyTypingStart(d)
                 default:
                     self.voice.handle(t, d)
                     if t == "VOICE_STATE_UPDATE" { self.applyVoiceStateUpdate(d) }
@@ -957,6 +963,63 @@ final class Store: ObservableObject {
         if let guildId, let nick = guildMembers[guildId]?[user.id]?.nick, !nick.isEmpty { return nick }
         if let nick = fallbackNick, !nick.isEmpty { return nick }
         return user.displayName
+    }
+
+    // MARK: - Индикатор «печатает»
+
+    func applyTypingStart(_ d: [String: Any]) {
+        guard let cid = d["channel_id"] as? String,
+              let uid = d["user_id"] as? String, uid != me?.id else { return }
+        // В гильдиях событие несёт member.user — кэшируем, чтобы знать имя.
+        if voiceUsers[uid] == nil,
+           let member = d["member"] as? [String: Any], let u = member["user"] as? [String: Any],
+           let raw = try? JSONSerialization.data(withJSONObject: u),
+           let user = try? JSONDecoder().decode(User.self, from: raw) {
+            voiceUsers[uid] = user
+        }
+        var map = typing[cid] ?? [:]
+        map[uid] = Date().addingTimeInterval(9)   // Discord: «печатает» живёт ~8–10 c
+        typing[cid] = map
+        startTypingPrune()
+    }
+
+    /// Имена тех, кто сейчас печатает в канале (не истёкшие).
+    func typingNames(in channelId: String) -> [String] {
+        let now = Date()
+        let ids = (typing[channelId] ?? [:]).filter { $0.value > now }.keys
+        return ids.map { uid in voiceUsers[uid]?.displayName ?? "кто-то" }
+    }
+
+    private func startTypingPrune() {
+        guard typingPruneTimer == nil else { return }
+        typingPruneTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                guard let self else { return }
+                let now = Date()
+                for (cid, map) in self.typing {
+                    let kept = map.filter { $0.value > now }
+                    if kept.count != map.count { self.typing[cid] = kept.isEmpty ? nil : kept }
+                }
+                if self.typing.isEmpty {
+                    self.typingPruneTimer?.invalidate()
+                    self.typingPruneTimer = nil
+                }
+            }
+        }
+    }
+
+    /// Пользователь печатает — сообщаем Discord не чаще раза в 8 c.
+    func sendTyping(in channelId: String) {
+        let now = Date()
+        if let last = lastTypingSent[channelId], now.timeIntervalSince(last) < 8 { return }
+        lastTypingSent[channelId] = now
+        Task { [weak self] in try? await self?.api?.noContent("POST", "/channels/\(channelId)/typing") }
+    }
+
+    func clearTyping(user: String, in channelId: String) {
+        guard typing[channelId]?[user] != nil else { return }
+        typing[channelId]?[user] = nil
+        if typing[channelId]?.isEmpty == true { typing[channelId] = nil }
     }
 
     // MARK: - Личные сообщения: последнее сообщение и порядок
