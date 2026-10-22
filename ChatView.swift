@@ -363,7 +363,7 @@ struct ChatView: View {
                             onReact: { ref in Task { await store.toggleReaction(ref, on: m) } },
                             onJump: { id in jump(to: id) }
                         )
-                        .padding(.top, header ? 14 : 2)
+                        .padding(.top, header ? 17 : 2)
                         .id(m.id)
                     }
                 }
@@ -1209,7 +1209,7 @@ struct MessageRow: View {
                     .background(Theme.blurple, in: RoundedRectangle(cornerRadius: 4))
             }
             Text(message.timeText)
-                .font(.system(size: 11))
+                .font(.system(size: 12))
                 .foregroundStyle(Theme.muted)
         }
     }
