@@ -748,7 +748,15 @@ final class VoiceSpike: ObservableObject {
     @Published var activeChannelId: String?
     @Published var activeChannel: Channel?
     @Published var gwLog: [String] = []
-    @Published var daveVersion = 1
+    // DAVE E2EE по умолчанию ВЫКЛЮЧЕН (версия 0). Причина: при E2EE наше видео/звук
+    // зашифрованы MLS-ключом, и зритель должен быть в нашей MLS-группе, чтобы расшифровать.
+    // Наша группа держит не всех участников канала → чужой клиент не выводит наш ключ,
+    // получает нерасшифровываемые кадры и показывает «Не удалось включить камеру, Ошибка 2015»
+    // с вечной загрузкой (и не шлёт PLI — ему не кадр нужен, а ключ; поэтому «запросов кадра 0»).
+    // С версией 0 весь канал работает без E2EE, только под транспортным шифрованием, которое
+    // SFU и любой клиент читают без MLS — камера/стрим видны всем всегда, даже без обмена ключами.
+    // Переключатель DAVE в настройках голоса остаётся — можно вернуть v1 для эксперимента.
+    @Published var daveVersion = 0
     @Published var participantIds: [String] = []
     @Published var users: [String: User] = [:]
     @Published var flags: [String: VoiceFlags] = [:]
