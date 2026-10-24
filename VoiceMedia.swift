@@ -694,16 +694,13 @@ final class VoiceMedia {
     func sendVideoFrame(nalUnits: [Data], timestamp: UInt32) {
         queue.async { [weak self] in
             guard let self, self.videoSsrc != 0 else { return }
-            // DAVE шифрует кадр целиком (в формате Annex-B, со стартовыми кодами), а не каждый
-            // NAL или RTP-пакет отдельно. Потом кадр снова делим на NAL-юниты и пакуем в RTP.
-            var frame = H264AnnexB.join(nalUnits)
-            if let dave = self.dave {
-                guard let enc = dave.encryptVideo(frame: frame, ssrc: self.videoSsrc) else {
-                    self.stats.encryptFail += 1
-                    return
-                }
-                frame = enc
-            }
+            // ВИДЕО ШЛЁМ БЕЗ DAVE E2EE (passthrough), даже когда DAVE активен для звука.
+            // Сервер требует согласовать протокол DAVE (иначе close 4017), но сами кадры камеры
+            // отправляем только под транспортным шифрованием: у кадра нет метки E2EE (магии DAVE),
+            // поэтому клиент-получатель трактует его как passthrough и декодирует напрямую —
+            // не завися от того, попал ли он в нашу MLS-группу и вывелся ли наш sender-ключ.
+            // Это убирает «Ошибку 2015»/вечную загрузку. Звук при этом остаётся E2EE (см. sendPacket).
+            let frame = H264AnnexB.join(nalUnits)
             // Строгое 4-байтовое деление: приёмник соберёт кадр обратно через join() (4 байта),
             // поэтому деление должно быть строго обратным сборке.
             let units = H264AnnexB.splitStrict(frame)
